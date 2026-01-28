@@ -1,0 +1,110 @@
+---
+description: Domain-specific rules for the MLB Fantasy Roster Optimizer
+globs: ["*.py"]
+alwaysApply: true
+---
+
+# MLB Fantasy Roster Optimizer - Project Rules
+
+## Strict No-OOP Policy
+- **Never use classes.** All code must be module-level functions.
+- Use only: dicts, lists, numpy arrays, pandas DataFrames.
+- No methods, no inheritance, no class-based patterns whatsoever.
+
+## Strict Error Handling
+- **Never write try/except blocks** - not even for I/O.
+- **Never write fallback logic** - crash with clear messages instead.
+- Every `assert` must have a descriptive error message.
+
+## File Structure
+- `optimizer/roster_optimizer.py`: All optimization logic (~500 lines)
+- `optimizer/visualizations.py`: All plotting functions (~350 lines)
+- `notebook.py`: Marimo notebook at project root
+
+## Data Handling
+
+### Player Names
+- Names must match exactly between roster CSVs and FanGraphs projections.
+- Crash with a helpful message listing ALL unmatched names if validation fails.
+
+### Two-Way Players
+- Ohtani appears separately in hitter and pitcher files—this is correct.
+- Assert no duplicate names WITHIN each player_type.
+- Same name CAN appear once as hitter and once as pitcher.
+
+### Ratio Stats - Never Sum Directly
+```python
+# CORRECT - weighted average
+team_ops = (hitters['PA'] * hitters['OPS']).sum() / hitters['PA'].sum()
+team_era = (pitchers['IP'] * pitchers['ERA']).sum() / pitchers['IP'].sum()
+
+# WRONG - never sum ratio stats
+team_ops = hitters['OPS'].sum()
+```
+
+### Column Conventions
+- OPS column exists in FanGraphs CSV—use directly, do NOT recompute.
+- Rename `SO` → `K` during pitcher load.
+- Pitcher position: `'SP' if GS >= 3 else 'RP'`
+- Hitter positions from database via MLBAMID; default to `'DH'` if not found.
+
+## MILP Implementation
+
+### Player Type Filtering
+- Hitting constraints (R, HR, RBI, SB, OPS): sum only over hitters (`I_H`)
+- Pitching constraints (W, SV, K, ERA, WHIP): sum only over pitchers (`I_P`)
+
+### Ratio Stat Linearization - Sign Conventions
+```python
+# OPS (higher is better)
+coefficient = PA[i] * (OPS[i] - opponent_OPS)
+
+# ERA (lower is better) - note flipped order!
+coefficient = IP[i] * (opponent_ERA - ERA[i])
+
+# WHIP (lower is better) - note flipped order!
+coefficient = IP[i] * (opponent_WHIP - WHIP[i])
+```
+
+### Big-M and Epsilon Constants
+```python
+# Counting stats (R, HR, RBI, SB, W, SV, K)
+BIG_M_COUNTING = 10000
+EPSILON_COUNTING = 0.5
+
+# Ratio stats (OPS, ERA, WHIP)
+BIG_M_RATIO = 5000
+EPSILON_RATIO = 0.001
+```
+
+### PuLP Variable Naming
+- Use only alphanumeric characters and underscores.
+- Never put player names in variable names—use integer indices.
+
+```python
+# GOOD
+x = {i: pulp.LpVariable(f"x_{i}", cat='Binary') for i in range(n)}
+
+# BAD - player names can have special characters
+x = {name: pulp.LpVariable(f"x_{name}", cat='Binary') for name in names}
+```
+
+### Solver Status
+- Assert `status == pulp.LpStatusOptimal`.
+- If infeasible, error message must identify which position slot is problematic.
+
+## Required Validations
+- `sum(PA) > 0` for all teams before computing OPS
+- `sum(IP) > 0` for all teams before computing ERA/WHIP
+- All player names from rosters found in projections
+- Enough candidates eligible for each position slot before solving
+
+## Visualization
+- All functions return `plt.Figure` objects.
+- **Never call `plt.show()`**—marimo handles display.
+
+## Running the Project
+```bash
+uv sync              # Install dependencies
+marimo edit notebook.py  # Run the notebook
+```
