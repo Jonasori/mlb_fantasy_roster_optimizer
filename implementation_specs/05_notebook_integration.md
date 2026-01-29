@@ -6,14 +6,14 @@ This document shows how to use the optimizer in a marimo notebook. It demonstrat
 
 **File:** `notebook.py` (at project root)
 
+**Key principle:** All data comes from the database via `refresh_all_data()`. The notebook never loads CSVs directly.
+
 ---
 
 ## Notebook Structure
 
-The notebook should be organized into logical sections:
-
 1. **Setup** - Imports and configuration
-2. **Data Pipeline** - Fantrax conversion, name correction, data loading
+2. **Data Loading** - Single call to `refresh_all_data()` (syncs FanGraphs + Fantrax → database)
 3. **Current Situation** - Analyze current roster
 4. **Free Agent Analysis** - Run optimizer, review recommendations
 5. **Trade Analysis** - Identify trade opportunities
@@ -30,15 +30,23 @@ import marimo as mo
 import pandas as pd
 import matplotlib.pyplot as plt
 
-# Data loading
+# Database is the primary data source
+from optimizer.database import (
+    refresh_all_data,
+    get_projections,
+    get_roster_names,
+    get_free_agents,
+)
+
+# Data utilities (constants from data_loader, the single source of truth)
 from optimizer.data_loader import (
-    load_projections,
-    convert_fantrax_rosters_from_dir,
-    apply_name_corrections,
-    load_all_data,
+    MY_TEAM_NAME,
+    NUM_OPPONENTS,
+    FANTRAX_TEAM_IDS,
     compute_team_totals,
     compute_all_opponent_totals,
     compute_quality_scores,
+    estimate_projection_uncertainty,
 )
 
 # Free agent optimizer
@@ -47,7 +55,7 @@ from optimizer.roster_optimizer import (
     build_and_solve_milp,
     compute_standings,
     print_roster_summary,
-    compute_player_sensitivity,
+    compute_roster_change_values,
 )
 
 # Trade engine
@@ -75,70 +83,57 @@ from optimizer.visualizations import (
     plot_win_probability_breakdown,
     plot_player_value_scatter,
     plot_trade_impact,
+    plot_constraint_analysis,
 )
 ```
 
 ### Cell 2: Configuration
 
 ```python
-# File paths
+# File paths for FanGraphs CSVs (input to database)
 DATA_DIR = "data/"
-RAW_ROSTERS_DIR = DATA_DIR + "raw_rosters/"
 HITTER_PROJ_PATH = DATA_DIR + "fangraphs-steamer-projections-hitters.csv"
 PITCHER_PROJ_PATH = DATA_DIR + "fangraphs-steamer-projections-pitchers.csv"
-DB_PATH = "../mlb_player_comps_dashboard/mlb_stats.db"
+DB_PATH = DATA_DIR + "optimizer.db"
 ```
 
-### Cell 3: Convert Fantrax Rosters
+### Cell 3: Load Data (Full Refresh)
 
 ```python
-# Convert raw Fantrax exports to pipeline format
-# Returns paths to the generated files
-my_roster_path, opponent_rosters_path = convert_fantrax_rosters_from_dir(
-    raw_rosters_dir=RAW_ROSTERS_DIR,
-    my_team_filename='my_team.csv',
-)
-```
+mo.md("## Data Loading")
 
-### Cell 4: Apply Name Corrections
-
-```python
-# Load projections temporarily for name matching
-_projections_temp = load_projections(HITTER_PROJ_PATH, PITCHER_PROJ_PATH, DB_PATH)
-
-# Auto-correct accents, apostrophes, known mismatches
-apply_name_corrections(my_roster_path, _projections_temp)
-apply_name_corrections(opponent_rosters_path, _projections_temp, is_opponent_file=True)
-```
-
-### Cell 5: Load All Data
-
-```python
-# Load validated data (uses the converted paths from Cell 3)
-projections, my_roster_names, opponent_rosters = load_all_data(
-    HITTER_PROJ_PATH,
-    PITCHER_PROJ_PATH,
-    my_roster_path,
-    opponent_rosters_path,
-    DB_PATH,
+# Refresh all data: FanGraphs + Fantrax API → database
+# This is the SINGLE data loading call
+data = refresh_all_data(
+    hitter_proj_path=HITTER_PROJ_PATH,
+    pitcher_proj_path=PITCHER_PROJ_PATH,
+    db_path=DB_PATH,
 )
 
-# Compute opponent totals
-opponent_totals = compute_all_opponent_totals(opponent_rosters, projections)
+# Extract what we need (all from database queries)
+projections = data["projections"]
+my_roster_names = data["my_roster"]
+opponent_rosters = data["opponent_rosters"]
 
-# Compute my current totals
+print(f"Projections: {len(projections)} players")
+print(f"My roster: {len(my_roster_names)} players")
+print(f"Opponents: {len(opponent_rosters)} teams")
+```
+
+### Cell 4: Compute Totals
+
+```python
+# Compute team totals for comparison
 my_totals = compute_team_totals(my_roster_names, projections)
+
+# Opponent rosters need to be converted to dict[int, set[str]] format
+opponent_rosters_indexed = {
+    i+1: names for i, (team, names) in enumerate(opponent_rosters.items())
+}
+opponent_totals = compute_all_opponent_totals(opponent_rosters_indexed, projections)
 ```
 
-### Cell 6: Display Opponent Summary
-
-```python
-# Show opponent totals as a table
-mo.md("## Opponent Totals")
-pd.DataFrame(opponent_totals).T.round(2)
-```
-
-### Cell 7: Team Comparison Radar
+### Cell 5: Team Comparison Radar
 
 ```python
 mo.md("## Team Comparison")
@@ -146,7 +141,7 @@ fig = plot_team_radar(my_totals, opponent_totals)
 fig
 ```
 
-### Cell 8: Win Matrix
+### Cell 6: Win Matrix
 
 ```python
 mo.md("## Win/Loss Matrix")
@@ -154,19 +149,22 @@ fig = plot_win_matrix(my_totals, opponent_totals)
 fig
 ```
 
----
+### Cell 7: Category Margins
 
-## Free Agent Optimizer Section
+```python
+fig = plot_category_margins(my_totals, opponent_totals)
+fig
+```
 
-### Cell 9: Filter Candidates
+### Cell 8: Filter Candidates
 
 ```python
 mo.md("## Free Agent Optimizer")
 
-# Compute quality scores for prefiltering
+# Compute quality scores for filtering
 quality_scores = compute_quality_scores(projections)
 
-# Get all opponent player names (unavailable)
+# All opponent player names (unavailable)
 opponent_roster_names = set().union(*opponent_rosters.values())
 
 # Filter to optimization candidates
@@ -180,10 +178,11 @@ candidates = filter_candidates(
 )
 ```
 
-### Cell 10: Solve MILP
+### Cell 9: Solve MILP
 
 ```python
-# Run the optimizer
+mo.md("### Running Optimizer...")
+
 optimal_roster_names, solution_info = build_and_solve_milp(
     candidates,
     opponent_totals,
@@ -192,15 +191,16 @@ optimal_roster_names, solution_info = build_and_solve_milp(
 
 print(f"Objective: {solution_info['objective']}/60 wins")
 print(f"Solve time: {solution_info['solve_time']:.1f}s")
+print(f"Status: {solution_info['status']}")
 ```
 
-### Cell 11: Roster Summary
+### Cell 10: Roster Summary
 
 ```python
 # Compute optimal roster totals
 optimal_totals = compute_team_totals(optimal_roster_names, projections)
 
-# Print detailed summary
+# Print summary with waiver priority
 print_roster_summary(
     optimal_roster_names,
     projections,
@@ -210,168 +210,139 @@ print_roster_summary(
 )
 ```
 
-### Cell 12: Visualize Changes
+### Cell 11: Roster Changes Visualization
 
 ```python
-mo.md("## Roster Changes")
-fig = plot_roster_changes(my_roster_names, set(optimal_roster_names), projections)
+mo.md("### Waiver Priority List")
+
+added = set(optimal_roster_names) - my_roster_names
+dropped = my_roster_names - set(optimal_roster_names)
+
+added_df, dropped_df = compute_roster_change_values(
+    added, dropped, my_roster_names, projections, opponent_totals
+)
+fig = plot_roster_changes(added_df, dropped_df)
 fig
 ```
 
----
-
-## Trade Analysis Section
-
-### Cell 13: Roster Situation Analysis
+### Cell 12: Trade Analysis Setup
 
 ```python
-mo.md("## Trade Analysis")
+mo.md("## Trade Analysis (from optimized roster)")
 
-# Analyze current situation (computes category_sigmas internally)
-situation = compute_roster_situation(my_roster_names, projections, opponent_totals)
-
-# Extract for later use
-category_sigmas = situation['category_sigmas']
+# Use optimized roster for trade analysis
+trade_roster_names = set(optimal_roster_names)
+situation = compute_roster_situation(
+    trade_roster_names, projections, opponent_totals
+)
 
 print(f"Win probability: {situation['win_probability']:.1%}")
 print(f"Expected wins: {situation['expected_wins']:.1f}/60")
+print(f"Strengths: {', '.join(situation['strengths']) or 'None'}")
+print(f"Weaknesses: {', '.join(situation['weaknesses']) or 'None'}")
+
+category_sigmas = situation["category_sigmas"]
 ```
 
-### Cell 14: Win Probability Breakdown
+### Cell 13: Win Probability Breakdown
 
 ```python
-fig = plot_win_probability_breakdown(situation['diagnostics'])
+fig = plot_win_probability_breakdown(situation["diagnostics"])
 fig
 ```
 
-### Cell 15: Compute Player Values
+### Cell 14: Player Values
 
 ```python
-# Include my roster + all opponent rosters for comparison
-all_roster_names = my_roster_names | opponent_roster_names
+mo.md("### Player Values")
 
-# Compute probabilistic player values
+# Include my roster + all opponent rosters
+all_roster_names = trade_roster_names | opponent_roster_names
+
 player_values = compute_player_values(
     player_names=all_roster_names,
-    my_roster_names=my_roster_names,
+    my_roster_names=trade_roster_names,
     projections=projections,
-    my_totals=my_totals,
+    my_totals=optimal_totals,
     opponent_totals=opponent_totals,
     category_sigmas=category_sigmas,
 )
 
-# Show top players by contextual value
 player_values.head(20)
 ```
 
-### Cell 16: Player Value Scatter
+### Cell 15: Player Value Scatter
 
 ```python
-fig = plot_player_value_scatter(player_values, my_roster_names)
+fig = plot_player_value_scatter(player_values, trade_roster_names)
 fig
 ```
 
-### Cell 17: Generate Trade Candidates
+### Cell 16: Generate Trade Candidates
 
 ```python
-# Generate trade recommendations
+mo.md("### Trade Recommendations")
+
 trade_candidates = generate_trade_candidates(
-    my_roster_names=my_roster_names,
+    my_roster_names=trade_roster_names,
     player_values=player_values,
-    opponent_rosters=opponent_rosters,
+    opponent_rosters=opponent_rosters_indexed,
     projections=projections,
-    my_totals=my_totals,
+    my_totals=optimal_totals,
     opponent_totals=opponent_totals,
     category_sigmas=category_sigmas,
     max_send=2,
     max_receive=2,
-    n_targets=15,
-    n_pieces=15,
-    n_candidates=20,
+    n_targets=20,
+    n_pieces=20,
+    n_candidates=30,
 )
 ```
 
-### Cell 18: Trade Report
+### Cell 17: Trade Report
 
 ```python
 print_trade_report(situation, trade_candidates, player_values, top_n=5)
 ```
 
-### Cell 19: Evaluate Specific Trade
+### Cell 18: Deep Dive - Category Contributions
 
 ```python
-mo.md("## Evaluate Specific Trade")
+mo.md("## Deep Dive Analysis")
+mo.md("### Home Run Contributions")
+fig = plot_category_contributions(list(my_roster_names), projections, "HR")
+fig
+```
 
-# Example: evaluate a specific trade idea
-result = evaluate_trade(
-    send_players=['Gunnar Henderson-H'],  # Adjust to your roster
-    receive_players=['Trea Turner-H'],     # Adjust to opponent roster
-    player_values=player_values,
-    my_roster_names=my_roster_names,
-    projections=projections,
-    my_totals=my_totals,
-    opponent_totals=opponent_totals,
-    category_sigmas=category_sigmas,
+### Cell 19: Player Contribution Radar
+
+```python
+mo.md("### Hitter Contributions")
+fig = plot_player_contribution_radar(
+    list(my_roster_names), projections, "hitter", top_n=10
 )
-
-# Visualize the trade impact
-new_totals = compute_team_totals(
-    (my_roster_names - set(result['send_players'])) | set(result['receive_players']),
-    projections,
-)
-fig = plot_trade_impact(result, my_totals, new_totals, opponent_totals)
 fig
 ```
 
-### Cell 20: Verify Trade
+### Cell 20: Constraint Analysis
 
 ```python
-# Ground-truth verification
-verification = verify_trade_impact(
-    send_players=['Gunnar Henderson-H'],
-    receive_players=['Trea Turner-H'],
-    my_roster_names=my_roster_names,
-    projections=projections,
-    opponent_totals=opponent_totals,
-    category_sigmas=category_sigmas,
-)
-```
-
----
-
-## Deep Dive Section
-
-### Cell 21: Category Deep Dive
-
-```python
-mo.md("## Category Analysis")
-
-# Analyze SB contributions (example weak category)
-fig = plot_category_contributions(list(my_roster_names), projections, 'SB')
+mo.md("### Constraint Analysis")
+fig = plot_constraint_analysis(optimal_roster_names, projections)
 fig
 ```
 
-### Cell 22: Hitter Contribution Radar
+### Cell 21: Sensitivity Analysis (Optional)
 
 ```python
-fig = plot_player_contribution_radar(list(my_roster_names), projections, "hitter", top_n=10)
-fig
-```
+mo.md("""
+### Sensitivity Analysis (Optional - Slow)
 
-### Cell 23: Pitcher Contribution Radar
-
-```python
-fig = plot_player_contribution_radar(list(my_roster_names), projections, "pitcher", top_n=10)
-fig
-```
-
-### Cell 24: Sensitivity Analysis (Optional - Slow)
-
-```python
-mo.md("## Sensitivity Analysis")
-mo.md("*This takes 5-15 minutes. Run only when needed.*")
+*Uncomment the code below to run sensitivity analysis. Takes 5-15 minutes.*
+""")
 
 # Uncomment to run:
+# from optimizer.roster_optimizer import compute_player_sensitivity
 # sensitivity = compute_player_sensitivity(optimal_roster_names, candidates, opponent_totals)
 # fig = plot_player_sensitivity(sensitivity)
 # fig
@@ -379,51 +350,21 @@ mo.md("*This takes 5-15 minutes. Run only when needed.*")
 
 ---
 
-## Running the Notebook
+## Key Points
 
-```bash
-# Install dependencies
-uv sync
+1. **Single data source:** All data comes from `refresh_all_data()`, which:
+   - Loads FanGraphs CSVs
+   - Fetches Fantrax API data
+   - Syncs everything to SQLite database
+   - Returns data from database queries
 
-# Run the notebook
-marimo edit notebook.py
-```
+2. **Skip Fantrax during development:** Use `skip_fantrax=True` to avoid API calls:
+   ```python
+   data = refresh_all_data(..., skip_fantrax=True)
+   ```
 
----
+3. **Trade analysis uses optimized roster:** After running the free agent optimizer, trade analysis starts from the improved roster position.
 
-## Workflow Summary
+4. **Visualizations return figures:** Never call `plt.show()` — marimo handles display.
 
-1. **Data Pipeline**
-   - Convert Fantrax exports → pipeline format
-   - Apply name corrections (accents, spelling)
-   - Load validated projections and rosters
-
-2. **Free Agent Optimizer** (for rebuilding roster)
-   - Filter to candidate players
-   - Solve MILP for optimal roster
-   - Review changes and projected standings
-
-3. **Trade Engine** (for evaluating trades)
-   - Compute win probability and player values
-   - Generate trade candidates
-   - Evaluate specific proposals
-   - Verify impact before executing
-
-4. **Deep Dives** (for understanding)
-   - Visualize category contributions
-   - Run sensitivity analysis
-   - Identify bottlenecks and opportunities
-
----
-
-## Tips
-
-1. **Start with Trade Analysis** if you just want trade ideas without changing roster.
-
-2. **Use Free Agent Optimizer** when you want to see the globally optimal roster (might recommend many changes).
-
-3. **Verify trades** with `verify_trade_impact` before proposing — ensures gradient-based evaluation matches full recomputation.
-
-4. **Sensitivity analysis is expensive** — only run when you need to understand which players are truly irreplaceable.
-
-5. **Update data regularly** — re-download projections and re-export rosters from Fantrax before each analysis session.
+5. **Progress reporting:** Long operations use `print()` for status and `tqdm` for progress bars.

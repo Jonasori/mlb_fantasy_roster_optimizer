@@ -8,6 +8,16 @@ This document establishes the coding standards, architectural constraints, and i
 
 ---
 
+## Implementation Priorities
+
+When making decisions, prioritize in this order:
+
+1. **Correctness** — Code must work. Crash loudly with clear messages if something is wrong.
+2. **Simplicity** — Fewer abstractions, plain data structures, obvious code paths.
+3. **Specification compliance** — Follow these docs exactly. Don't improvise or add unrequested features.
+
+---
+
 ## Mandatory Constraints
 
 ### No Object-Oriented Programming
@@ -82,23 +92,35 @@ for player in tqdm(candidates, desc="Computing sensitivities"):
 mlb_fantasy_roster_optimizer/
 ├── optimizer/
 │   ├── __init__.py           # Minimal exports
-│   ├── data_loader.py        # Data loading and preprocessing
+│   ├── data_loader.py        # Config, FanGraphs loading, team totals, SGP
+│   ├── fantrax_api.py        # Fantrax API integration (rosters, ages, standings)
+│   ├── database.py           # SQLite schema, sync, queries (PRIMARY DATA SOURCE)
 │   ├── roster_optimizer.py   # MILP formulation and solving
 │   ├── trade_engine.py       # Trade analysis and recommendations
 │   └── visualizations.py     # All plotting functions
+├── dashboard/
+│   ├── app.py                # Streamlit main entry point
+│   └── components.py         # Reusable UI components
+├── tests/
+│   └── test_core.py          # All tests in one file (minimal, no classes)
 ├── data/
-│   ├── raw_rosters/          # Fantrax CSV exports (input)
-│   │   ├── my_team.csv
-│   │   ├── team_aidan.csv
-│   │   └── ... (opponent teams)
 │   ├── fangraphs-steamer-projections-hitters.csv
 │   ├── fangraphs-steamer-projections-pitchers.csv
-│   ├── my-roster.csv         # Generated from raw_rosters/
-│   └── opponent-rosters.csv  # Generated from raw_rosters/
+│   ├── fantrax_cookies.json  # API authentication (not in git)
+│   └── optimizer.db          # SQLite database (generated, PRIMARY DATA SOURCE)
 ├── implementation_specs/     # This documentation
 ├── notebook.py               # Marimo notebook (at project root)
 └── pyproject.toml
 ```
+
+### Database Is Primary
+
+**Critical architectural decision:** The SQLite database (`data/optimizer.db`) is the single source of truth for all player data.
+
+- FanGraphs CSVs and Fantrax API are **inputs** that sync to the database
+- All optimizer and trade engine code queries the database via `get_projections()`, `get_roster_names()`, etc.
+- DataFrames in the codebase are query results, not independent data structures
+- This enables caching, fast queries, and consistent state
 
 ---
 
@@ -237,13 +259,43 @@ This eliminates all name collision issues:
 - Luis Castillo the pitcher vs. Luis Castillo the hitter
 - Duplicate names in different player pools
 
-**Display functions strip the suffix** for cleaner output:
+**Display functions strip the suffix** for cleaner output using `strip_name_suffix()` from `data_loader.py`:
 ```python
-def _strip_suffix(name: str) -> str:
-    """Strip -H or -P suffix from player name for display."""
-    if name.endswith('-H') or name.endswith('-P'):
-        return name[:-2]
-    return name
+from .data_loader import strip_name_suffix
+
+# In display code:
+display_name = strip_name_suffix(player_name)  # "Mike Trout-H" → "Mike Trout"
+```
+
+**Important:** `strip_name_suffix()` is defined ONLY in `data_loader.py` and imported everywhere else. Do NOT duplicate this function.
+
+### Name Handling Flow
+
+There are two distinct name operations:
+
+1. **Name corrections** — Fix spelling differences between data sources (FanGraphs vs Fantrax)
+   - Applied to raw names BEFORE adding suffix
+   - Example: `"Julio Rodriguez"` → `"Julio Rodríguez"` → `"Julio Rodríguez-H"`
+   
+2. **Name normalization** — For fuzzy matching when corrections don't cover all cases
+   - Used for comparing names from different sources
+   - Handles accents, suffixes (Jr./Sr.), case
+   - Preserves the `-H`/`-P` suffix
+
+```
+FanGraphs CSV: "Ronald Acuña Jr."
+                     ↓ Apply corrections (if any)
+                "Ronald Acuña Jr."
+                     ↓ Add suffix based on player_type
+                "Ronald Acuña Jr.-H"
+                     ↓ Stored in database
+                     
+Fantrax API: "Ronald Acuna Jr."
+                     ↓ Apply corrections
+                "Ronald Acuña Jr."
+                     ↓ Add suffix based on position
+                "Ronald Acuña Jr.-H"
+                     ↓ Matches database!
 ```
 
 ### Ratio Stats Are Never Summed Directly
@@ -256,6 +308,24 @@ team_era = (pitchers['IP'] * pitchers['ERA']).sum() / pitchers['IP'].sum()
 # WRONG - Never sum ratio stats
 team_ops = hitters['OPS'].sum()  # Meaningless!
 ```
+
+### SGP Calculation Weights Rate Stats by Playing Time
+
+**This is important.** The canonical SGP methodology (Smart Fantasy Baseball) weights rate stats by playing time. A .850 OPS player with 600 PA is worth more than the same OPS with 100 PA because they contribute more to the team's ratio.
+
+```python
+# CORRECT - Playing time weighted impact on team ratio
+avg_player_pa = 500  # Baseline
+remaining_pa = 7000 - avg_player_pa
+team_ops = (player_pa * player_ops + remaining_pa * league_avg_ops) / (player_pa + remaining_pa)
+ops_impact = team_ops - league_avg_ops
+ops_sgp = ops_impact / 0.010  # SGP denominator
+
+# WRONG - No playing time weighting
+ops_sgp = (player_ops - league_avg_ops) / 0.010  # Ignores PA entirely
+```
+
+See `01a_config.md` for the complete `compute_sgp_value()` implementation.
 
 ### Sign Conventions for "Lower is Better" Stats
 
@@ -324,13 +394,27 @@ assert len(unmatched) == 0, (
 
 ## Testing Philosophy
 
-This codebase does not use formal unit tests. Instead:
+This codebase uses **minimal, focused testing**:
 
-1. **Assertions embedded in functions** catch invariant violations
+1. **Assertions embedded in functions** catch invariant violations at runtime
 2. **Print statements** report progress and intermediate results
-3. **The notebook serves as the integration test** — if it runs end-to-end, the system works
+3. **The notebook serves as the primary integration test** — if it runs end-to-end, the system works
+4. **A small pytest suite** provides guardrails for the implementing agent
 
-This is appropriate for a personal analysis tool. A production system would require formal testing.
+### Test Design Principles
+
+- **No classes** — all tests are module-level functions
+- **No fixtures** — each test is self-contained with inline test data
+- **No mocking** — tests use real functions with minimal test data
+- **Fail fast** — tests assert clearly, no try/except
+- **Skip integration tests** that require external dependencies (Fantrax cookies)
+
+The test suite is intentionally minimal. Its purpose is to:
+- Verify imports and module structure work
+- Catch obvious bugs in core calculations (SGP, team totals, ratio stats)
+- Ensure function signatures match expectations
+
+If the tests pass and the notebook runs end-to-end, the system is working.
 
 ---
 
@@ -345,6 +429,9 @@ Before considering any module complete:
 - [ ] Print statements at key stages
 - [ ] tqdm for loops > few seconds
 - [ ] Visualizations return Figure objects (no plt.show())
-- [ ] Ratio stats computed as weighted averages
+- [ ] Ratio stats computed as weighted averages (PA for OPS, IP for ERA/WHIP)
+- [ ] SGP calculation weights rate stats by playing time
 - [ ] Player names include -H/-P suffix internally
 - [ ] Display functions strip suffix for output
+- [ ] All data queries go through database functions (not direct CSV loading)
+- [ ] Name corrections applied BEFORE adding -H/-P suffix

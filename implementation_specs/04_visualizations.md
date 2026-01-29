@@ -219,26 +219,42 @@ def plot_player_contribution_radar(
 
 ```python
 def plot_roster_changes(
-    old_roster_names: set[str],
-    new_roster_names: set[str],
-    projections: pd.DataFrame,
+    added_df: pd.DataFrame,
+    dropped_df: pd.DataFrame,
 ) -> plt.Figure:
     """
-    Visual comparison of old vs new roster.
+    Diverging bar chart showing roster changes sorted by WPA.
     
-    Layout: Two sections using gridspec
+    Players are sorted by priority (highest WPA magnitude at top).
+    Bar length is proportional to WPA. Names include SGP and WPA values.
     
-    Top section: Two-column comparison
-        Left: "DROPPED" - players removed with key stats
-        Right: "ADDED" - players added with key stats
-        Table format with alternating row colors
+    Args:
+        added_df: DataFrame with columns: Name, Position, WPA, SGP
+                  (sorted by WPA descending - from compute_roster_change_values)
+        dropped_df: DataFrame with columns: Name, Position, WPA, SGP
+                    (sorted by WPA descending, i.e., least harmful to drop first)
     
-    Bottom section: Category impact bar chart
-        Bar chart showing net change in each category total
-        Green = improvement, red = decline
+    Layout:
+        - Single figure with diverging bars from center vertical axis
+        - Left side: DROPPED players (red bars extending left)
+        - Right side: ADDED players (green bars extending right)
+        - Top row = highest priority (most WPA impact)
+        - Bar length proportional to |WPA|
+        - Labels: "POS Name (SGP: X.X, WPA: +Y.Y%)"
+    
+    Styling:
+        - Red (#E74C3C) for drops, Green (#2ECC71) for adds
+        - Vertical center line
+        - Column headers: "DROP (N)" and "ADD (N)"
+        - Title: "Waiver Priority List (sorted by Win Probability Added)"
     
     Returns:
-        Figure with roster comparison.
+        Figure with diverging bar chart.
+    
+    Note:
+        This is called from the notebook AFTER compute_roster_change_values()
+        computes the WPA and SGP DataFrames. The old signature taking
+        (old_roster_names, new_roster_names, projections) is deprecated.
     """
 ```
 
@@ -444,11 +460,8 @@ def plot_player_value_scatter(
 ## Utility Functions
 
 ```python
-def _strip_suffix(name: str) -> str:
-    """Strip -H or -P suffix for display."""
-    if name.endswith('-H') or name.endswith('-P'):
-        return name[:-2]
-    return name
+# Import the shared utility function - do NOT redefine it
+from .data_loader import strip_name_suffix
 
 
 def _format_stat(value: float, category: str) -> str:
@@ -476,10 +489,11 @@ def _get_category_color(category: str, value: float, opponent_value: float) -> s
 
 - [ ] All functions return `plt.Figure` objects
 - [ ] No `plt.show()` calls anywhere
-- [ ] Player names stripped of -H/-P suffix in displays
+- [ ] Player names stripped using `strip_name_suffix()` imported from data_loader
 - [ ] NEGATIVE_CATEGORIES handled correctly (ERA, WHIP)
 - [ ] Consistent color scheme across visualizations
 - [ ] Figure sizes appropriate for notebook display
 - [ ] Legends included where needed
 - [ ] Axis labels clear and descriptive
 - [ ] Title on every plot
+- [ ] `plot_roster_changes` uses new signature (added_df, dropped_df) with WPA/SGP

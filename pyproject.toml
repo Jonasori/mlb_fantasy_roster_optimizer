@@ -8,9 +8,12 @@ dependencies = [
     "pulp>=2.8",
     "highspy>=1.5",
     "matplotlib>=3.7",
+    "seaborn>=0.12",
+    "scipy>=1.10",
     "tqdm>=4.65",
     "marimo>=0.8",
     "pyzmq>=27.1.0",
+    "fantraxapi>=1.0.1",
 ]
 
 [build-system]
