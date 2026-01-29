@@ -1,126 +1,119 @@
 import marimo
 
 __generated_with = "0.19.6"
-app = marimo.App(width="full")
+app = marimo.App(width="medium")
 
 
 @app.cell
 def _():
+    """Imports and setup."""
     import marimo as mo
-    return (mo,)
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    # Dynasty Roto Roster Optimizer
-
-    This notebook optimizes a 26-player fantasy baseball roster using Mixed-Integer
-    Linear Programming (MILP) to maximize wins against opponents across 10 scoring categories.
-
-    **Key Features:**
-    - All rostered players' stats count (not just starters)
-    - Starting lineup slots enforce positional validity
-    - Optimizes across 10 roto categories: R, HR, RBI, SB, OPS, W, SV, K, ERA, WHIP
-    """)
-    return
-
-
-@app.cell
-def _():
-    # Imports
-    import pandas as pd
     import matplotlib.pyplot as plt
-    from optimizer.roster_optimizer import (
-        # Fantrax roster conversion
-        convert_fantrax_rosters_from_dir,
-        load_projections,
+    import pandas as pd
+
+    # Data loading
+    from optimizer.data_loader import (
         apply_name_corrections,
-        # Data loading
-        load_all_data,
         compute_all_opponent_totals,
-        compute_team_totals,
         compute_quality_scores,
-        filter_candidates,
+        compute_team_totals,
+        convert_fantrax_rosters_from_dir,
+        estimate_projection_uncertainty,
+        load_all_data,
+        load_projections,
+    )
+
+    # Free agent optimizer
+    from optimizer.roster_optimizer import (
         build_and_solve_milp,
+        compute_player_sensitivity,
+        compute_roster_change_values,
         compute_standings,
+        filter_candidates,
         print_roster_summary,
     )
+
+    # Trade engine
+    from optimizer.trade_engine import (
+        compute_player_values,
+        compute_roster_situation,
+        compute_win_probability,
+        evaluate_trade,
+        generate_trade_candidates,
+        identify_trade_pieces,
+        identify_trade_targets,
+        print_trade_report,
+        verify_trade_impact,
+    )
+
+    # Visualizations
     from optimizer.visualizations import (
-        plot_team_radar,
-        plot_category_margins,
-        plot_win_matrix,
         plot_category_contributions,
-        plot_roster_changes,
-        compute_player_sensitivity,
-        plot_player_sensitivity,
+        plot_category_margins,
         plot_constraint_analysis,
+        plot_player_contribution_radar,
+        plot_player_sensitivity,
+        plot_player_value_scatter,
+        plot_roster_changes,
+        plot_team_radar,
+        plot_trade_impact,
+        plot_win_matrix,
+        plot_win_probability_breakdown,
     )
     return (
         apply_name_corrections,
         build_and_solve_milp,
         compute_all_opponent_totals,
         compute_player_sensitivity,
+        compute_player_values,
         compute_quality_scores,
+        compute_roster_change_values,
+        compute_roster_situation,
         compute_team_totals,
         convert_fantrax_rosters_from_dir,
         filter_candidates,
+        generate_trade_candidates,
         load_all_data,
         load_projections,
+        mo,
         pd,
         plot_category_contributions,
         plot_category_margins,
         plot_constraint_analysis,
+        plot_player_contribution_radar,
         plot_player_sensitivity,
+        plot_player_value_scatter,
         plot_roster_changes,
         plot_team_radar,
         plot_win_matrix,
+        plot_win_probability_breakdown,
         print_roster_summary,
+        print_trade_report,
     )
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ## Configuration
-    """)
-    return
 
 
 @app.cell
 def _():
-    # File paths
+    """Configuration - File paths."""
     DATA_DIR = "data/"
     RAW_ROSTERS_DIR = DATA_DIR + "raw_rosters/"
     HITTER_PROJ_PATH = DATA_DIR + "fangraphs-steamer-projections-hitters.csv"
     PITCHER_PROJ_PATH = DATA_DIR + "fangraphs-steamer-projections-pitchers.csv"
-    MY_ROSTER_PATH = DATA_DIR + "my-roster.csv"
-    OPPONENT_ROSTERS_PATH = DATA_DIR + "opponent-rosters.csv"
     DB_PATH = "../mlb_player_comps_dashboard/mlb_stats.db"
-    return (
-        DB_PATH,
-        HITTER_PROJ_PATH,
-        MY_ROSTER_PATH,
-        OPPONENT_ROSTERS_PATH,
-        PITCHER_PROJ_PATH,
-        RAW_ROSTERS_DIR,
-    )
+    return DB_PATH, HITTER_PROJ_PATH, PITCHER_PROJ_PATH, RAW_ROSTERS_DIR
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## Convert Fantrax Rosters
+def _(RAW_ROSTERS_DIR, convert_fantrax_rosters_from_dir, mo):
+    """Convert Fantrax roster exports to pipeline format."""
+    mo.md("## 1. Data Pipeline")
 
-    This step converts raw Fantrax roster exports to the pipeline format and applies
-    automatic name corrections (accents, apostrophes, etc.).
-
-    **To update rosters:**
-    1. Download roster CSVs from Fantrax
-    2. Place them in `data/raw_rosters/` (my_team.csv + team_*.csv for opponents)
-    3. Re-run this notebook
-    """)
-    return
+    # Convert raw Fantrax exports to pipeline format
+    my_roster_path, opponent_rosters_path = convert_fantrax_rosters_from_dir(
+        raw_rosters_dir=RAW_ROSTERS_DIR,
+        my_team_filename="my_team.csv",
+    )
+    return my_roster_path, opponent_rosters_path
 
 
 @app.cell
@@ -128,40 +121,20 @@ def _(
     DB_PATH,
     HITTER_PROJ_PATH,
     PITCHER_PROJ_PATH,
-    RAW_ROSTERS_DIR,
     apply_name_corrections,
-    convert_fantrax_rosters_from_dir,
     load_projections,
+    my_roster_path,
+    opponent_rosters_path,
 ):
-    # Step 1: Convert Fantrax exports to pipeline format
-    converted_my_roster_path, converted_opponent_rosters_path = (
-        convert_fantrax_rosters_from_dir(
-            raw_rosters_dir=RAW_ROSTERS_DIR,
-        )
-    )
+    """Apply name corrections to roster files."""
+    # Load projections temporarily for name matching
+    _projections_temp = load_projections(HITTER_PROJ_PATH, PITCHER_PROJ_PATH, DB_PATH)
 
-    # Step 2: Load projections for name validation
-    _projections_for_correction = load_projections(
-        HITTER_PROJ_PATH,
-        PITCHER_PROJ_PATH,
-        DB_PATH,
-    )
-
-    # Step 3: Apply automatic name corrections (accents, apostrophes, etc.)
-    apply_name_corrections(converted_my_roster_path, _projections_for_correction)
+    # Auto-correct accents, apostrophes, known mismatches
+    apply_name_corrections(my_roster_path, _projections_temp)
     apply_name_corrections(
-        converted_opponent_rosters_path,
-        _projections_for_correction,
-        is_opponent_file=True,
+        opponent_rosters_path, _projections_temp, is_opponent_file=True
     )
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ## Load Data
-    """)
     return
 
 
@@ -169,59 +142,68 @@ def _(mo):
 def _(
     DB_PATH,
     HITTER_PROJ_PATH,
-    MY_ROSTER_PATH,
-    OPPONENT_ROSTERS_PATH,
     PITCHER_PROJ_PATH,
+    compute_all_opponent_totals,
+    compute_team_totals,
     load_all_data,
+    my_roster_path,
+    opponent_rosters_path,
 ):
-    # Load all data using the converted roster files
+    """Load all validated data."""
     projections, my_roster_names, opponent_rosters = load_all_data(
         HITTER_PROJ_PATH,
         PITCHER_PROJ_PATH,
-        MY_ROSTER_PATH,
-        OPPONENT_ROSTERS_PATH,
+        my_roster_path,
+        opponent_rosters_path,
         DB_PATH,
     )
-    return my_roster_names, opponent_rosters, projections
+
+    # Compute opponent totals
+    opponent_totals = compute_all_opponent_totals(opponent_rosters, projections)
+
+    # Compute my current totals
+    my_totals = compute_team_totals(my_roster_names, projections)
+    return (
+        my_roster_names,
+        my_totals,
+        opponent_rosters,
+        opponent_totals,
+        projections,
+    )
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## Compute Opponent Totals
-    """)
+def _(mo, opponent_totals, pd):
+    """Display opponent totals summary."""
+    mo.md("## 2. Opponent Analysis")
+    pd.DataFrame(opponent_totals).T.round(2)
     return
 
 
 @app.cell
-def _(compute_all_opponent_totals, opponent_rosters, pd, projections):
-    opponent_totals = compute_all_opponent_totals(opponent_rosters, projections)
-
-    # Display opponent totals as a table with roto points
-    opponent_totals_df = pd.DataFrame(opponent_totals).T
-    opponent_totals_df.index.name = "Team"
-
-    # Compute roto points: rank each category, sum (7 - rank) for points
-    # For most categories, higher is better (rank descending)
-    # For ERA/WHIP, lower is better (rank ascending)
-    negative_cats = {"ERA", "WHIP"}
-    roto_points = pd.Series(0, index=opponent_totals_df.index)
-    for cat in opponent_totals_df.columns:
-        ascending = cat in negative_cats  # Lower is better for ERA/WHIP
-        ranks = opponent_totals_df[cat].rank(ascending=ascending, method="min")
-        roto_points += (7 - ranks)  # 7 - rank gives points (best = 6 pts)
-
-    opponent_totals_df["Roto Pts"] = roto_points.astype(int)
-    opponent_totals_df = opponent_totals_df.sort_values("Roto Pts", ascending=False)
-    opponent_totals_df
-    return (opponent_totals,)
+def _(mo, my_totals, opponent_totals, plot_team_radar):
+    """Team comparison radar chart."""
+    mo.md("### Team Comparison Radar")
+    fig_radar = plot_team_radar(my_totals, opponent_totals)
+    fig_radar
+    return
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## Filter Candidates
-    """)
+def _(mo, my_totals, opponent_totals, plot_win_matrix):
+    """Win/loss matrix heatmap."""
+    mo.md("### Win/Loss Matrix")
+    fig_matrix = plot_win_matrix(my_totals, opponent_totals)
+    fig_matrix
+    return
+
+
+@app.cell
+def _(mo, my_totals, opponent_totals, plot_category_margins):
+    """Category margins bar chart."""
+    mo.md("### Category Margins")
+    fig_margins = plot_category_margins(my_totals, opponent_totals)
+    fig_margins
     return
 
 
@@ -229,17 +211,21 @@ def _(mo):
 def _(
     compute_quality_scores,
     filter_candidates,
+    mo,
     my_roster_names,
     opponent_rosters,
     projections,
 ):
+    """Filter candidates for optimization."""
+    mo.md("## 3. Free Agent Optimizer")
+
+    # Compute quality scores for prefiltering
     quality_scores = compute_quality_scores(projections)
 
-    # Combine all opponent names into a single set
-    opponent_roster_names = set()
-    for team_names in opponent_rosters.values():
-        opponent_roster_names.update(team_names)
+    # Get all opponent player names (unavailable)
+    opponent_roster_names = set().union(*opponent_rosters.values())
 
+    # Filter to optimization candidates
     candidates = filter_candidates(
         projections,
         quality_scores,
@@ -248,33 +234,24 @@ def _(
         top_n_per_position=30,
         top_n_per_category=10,
     )
-    return (candidates,)
+    return candidates, opponent_roster_names
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## Solve Optimization
-    """)
-    return
+def _(build_and_solve_milp, candidates, mo, my_roster_names, opponent_totals):
+    """Solve the MILP for optimal roster."""
+    mo.md("### Running Optimizer...")
 
-
-@app.cell
-def _(build_and_solve_milp, candidates, my_roster_names, opponent_totals):
     optimal_roster_names, solution_info = build_and_solve_milp(
         candidates,
         opponent_totals,
         my_roster_names,
     )
+
+    print(f"\nObjective: {solution_info['objective']}/60 wins")
+    print(f"Solve time: {solution_info['solve_time']:.1f}s")
+    print(f"Status: {solution_info['status']}")
     return (optimal_roster_names,)
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ## Results Summary
-    """)
-    return
 
 
 @app.cell
@@ -286,160 +263,198 @@ def _(
     print_roster_summary,
     projections,
 ):
-    # Compute totals for optimal roster
-    my_totals = compute_team_totals(optimal_roster_names, projections)
+    """Print optimal roster summary."""
+    optimal_totals = compute_team_totals(optimal_roster_names, projections)
 
-    # Print detailed summary
     print_roster_summary(
         optimal_roster_names,
         projections,
-        my_totals,
+        optimal_totals,
         opponent_totals,
         old_roster_names=my_roster_names,
     )
-    return (my_totals,)
+    return (optimal_totals,)
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## Visualizations
-    """)
-    return
+def _(
+    compute_roster_change_values,
+    mo,
+    my_roster_names,
+    opponent_totals,
+    optimal_roster_names,
+    plot_roster_changes,
+    projections,
+):
+    """Visualize roster changes with WPA-based priority."""
+    mo.md("### Waiver Priority List")
 
+    added = set(optimal_roster_names) - my_roster_names
+    dropped = my_roster_names - set(optimal_roster_names)
 
-@app.cell
-def _(mo):
-    mo.md("""
-    ### Team Comparison Radar
-    """)
-    return
-
-
-@app.cell
-def _(my_totals, opponent_totals, plot_team_radar):
-    fig_radar = plot_team_radar(my_totals, opponent_totals)
-    fig_radar
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ### Win/Loss Matrix
-    """)
-    return
-
-
-@app.cell
-def _(my_totals, opponent_totals, plot_win_matrix):
-    fig_win_matrix = plot_win_matrix(my_totals, opponent_totals)
-    fig_win_matrix
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ### Category Margins
-    """)
-    return
-
-
-@app.cell
-def _(my_totals, opponent_totals, plot_category_margins):
-    fig_margins = plot_category_margins(my_totals, opponent_totals)
-    fig_margins
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ### Roster Changes
-    """)
-    return
-
-
-@app.cell
-def _(my_roster_names, optimal_roster_names, plot_roster_changes, projections):
-    fig_changes = plot_roster_changes(
-        my_roster_names, set(optimal_roster_names), projections
+    added_df, dropped_df = compute_roster_change_values(
+        added, dropped, my_roster_names, projections, opponent_totals
     )
+    fig_changes = plot_roster_changes(added_df, dropped_df)
     fig_changes
     return
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ### Category Contributions
-    """)
+def _(
+    compute_roster_situation,
+    mo,
+    opponent_totals,
+    optimal_roster_names,
+    projections,
+):
+    """Analyze post-free-agency roster situation for trade analysis."""
+    mo.md("## 4. Trade Analysis (from optimized roster)")
+
+    # Use optimized roster for trade analysis - this is post-free-agency
+    trade_roster_names = set(optimal_roster_names)
+    situation = compute_roster_situation(
+        trade_roster_names, projections, opponent_totals
+    )
+    category_sigmas = situation["category_sigmas"]
+
+    print(f"Win probability: {situation['win_probability']:.1%}")
+    print(f"Expected wins: {situation['expected_wins']:.1f}/60")
+    print(
+        f"\nStrengths: {', '.join(situation['strengths']) if situation['strengths'] else 'None'}"
+    )
+    print(
+        f"Weaknesses: {', '.join(situation['weaknesses']) if situation['weaknesses'] else 'None'}"
+    )
+    return category_sigmas, situation, trade_roster_names
+
+
+@app.cell
+def _(mo, plot_win_probability_breakdown, situation):
+    """Visualize win probability breakdown."""
+    mo.md("### Win Probability Breakdown")
+    fig_wp = plot_win_probability_breakdown(situation["diagnostics"])
+    fig_wp
     return
 
 
 @app.cell
-def _(optimal_roster_names, projections):
-    from optimizer.visualizations import plot_player_contribution_radar
-    # Hitter contributions radar (top 10 hitters)
-    plot_player_contribution_radar(list(optimal_roster_names), projections, "hitter", top_n=10)
-    return (plot_player_contribution_radar,)
+def _(
+    category_sigmas,
+    compute_player_values,
+    mo,
+    opponent_roster_names,
+    opponent_totals,
+    optimal_totals,
+    projections,
+    trade_roster_names,
+):
+    """Compute player values for trade analysis (from optimized roster)."""
+    mo.md("### Player Values")
+
+    # Include optimized roster + all opponent rosters
+    all_roster_names = trade_roster_names | opponent_roster_names
+
+    player_values = compute_player_values(
+        player_names=all_roster_names,
+        my_roster_names=trade_roster_names,
+        projections=projections,
+        my_totals=optimal_totals,
+        opponent_totals=opponent_totals,
+        category_sigmas=category_sigmas,
+    )
+
+    # Show top players
+    player_values.head(20)
+    return (player_values,)
 
 
 @app.cell
-def _(optimal_roster_names, plot_player_contribution_radar, projections):
-
-    # Pitcher contributions radar (top 10 pitchers)  
-    plot_player_contribution_radar(list(optimal_roster_names), projections, "pitcher", top_n=10)
+def _(mo, player_values, plot_player_value_scatter, trade_roster_names):
+    """Scatter plot of player values."""
+    mo.md("### Player Value Scatter")
+    fig_scatter = plot_player_value_scatter(player_values, trade_roster_names)
+    fig_scatter
     return
 
 
 @app.cell
-def _():
+def _(
+    category_sigmas,
+    generate_trade_candidates,
+    mo,
+    opponent_rosters,
+    opponent_totals,
+    optimal_totals,
+    player_values,
+    projections,
+    trade_roster_names,
+):
+    """Generate trade candidates (from optimized roster)."""
+    mo.md("### Trade Recommendations")
+
+    trade_candidates = generate_trade_candidates(
+        my_roster_names=trade_roster_names,
+        player_values=player_values,
+        opponent_rosters=opponent_rosters,
+        projections=projections,
+        my_totals=optimal_totals,
+        opponent_totals=opponent_totals,
+        category_sigmas=category_sigmas,
+        max_send=2,
+        max_receive=2,
+        n_targets=20,
+        n_pieces=20,
+        n_candidates=30,
+    )
+    return (trade_candidates,)
+
+
+@app.cell
+def _(player_values, print_trade_report, situation, trade_candidates):
+    """Print trade recommendations report."""
+    print_trade_report(situation, trade_candidates, player_values, top_n=5)
     return
 
 
 @app.cell
-def _(optimal_roster_names, plot_category_contributions, projections):
-    # Show stolen base contributions
-    fig_sb = plot_category_contributions(optimal_roster_names, projections, "SB")
+def _(mo, my_roster_names, plot_category_contributions, projections):
+    """Category contribution analysis - Stolen Bases."""
+    mo.md("## 5. Deep Dive Analysis")
+    mo.md("### Stolen Bases Contributions")
+    fig_sb = plot_category_contributions(list(my_roster_names), projections, "HR")
     fig_sb
     return
 
 
 @app.cell
-def _(optimal_roster_names, plot_category_contributions, projections):
-    # Show ERA contributions (impact on team ERA)
-    fig_era = plot_category_contributions(optimal_roster_names, projections, "SV")
-    fig_era
-    return
-
-
-@app.cell
-def _(mo):
-    mo.md("""
-    ### Constraint Analysis
-    """)
-    return
-
-
-@app.cell
-def _(candidates, optimal_roster_names, plot_constraint_analysis, projections):
-    fig_constraints = plot_constraint_analysis(
-        candidates, optimal_roster_names, projections
+def _(mo, my_roster_names, plot_player_contribution_radar, projections):
+    """Hitter contribution radar."""
+    mo.md("### Hitter Contributions")
+    fig_hitter_radar = plot_player_contribution_radar(
+        list(my_roster_names), projections, "hitter", top_n=10
     )
-    fig_constraints
+    fig_hitter_radar
     return
 
 
 @app.cell
-def _(mo):
-    mo.md("""
-    ## Sensitivity Analysis
+def _(mo, my_roster_names, plot_player_contribution_radar, projections):
+    """Pitcher contribution radar."""
+    mo.md("### Pitcher Contributions")
+    fig_pitcher_radar = plot_player_contribution_radar(
+        list(my_roster_names), projections, "pitcher", top_n=10
+    )
+    fig_pitcher_radar
+    return
 
-    **Warning:** This section takes 5-15 minutes to run as it solves a separate
-    MILP for each candidate player. Run the cells below only when needed.
-    """)
+
+@app.cell
+def _(mo, optimal_roster_names, plot_constraint_analysis, projections):
+    """Constraint analysis."""
+    mo.md("### Constraint Analysis")
+    fig_constraints = plot_constraint_analysis(optimal_roster_names, projections)
+    fig_constraints
     return
 
 
@@ -447,26 +462,27 @@ def _(mo):
 def _(
     candidates,
     compute_player_sensitivity,
+    mo,
     opponent_totals,
     optimal_roster_names,
+    plot_player_sensitivity,
 ):
-    # Uncomment to run sensitivity analysis (takes ~5-15 minutes)
-    sensitivity_df = compute_player_sensitivity(
-        optimal_roster_names,
-        candidates,
-        opponent_totals
-    )
-    # sensitivity_df = None  # Placeholder
-    return (sensitivity_df,)
+    """Sensitivity analysis placeholder."""
+    mo.md("""
+    ### Sensitivity Analysis (Optional - Slow)
+
+    *Uncomment the code below to run sensitivity analysis. This takes 5-15 minutes.*
+    """)
+
+    # Uncomment to run sensitivity analysis:
+    sensitivity = compute_player_sensitivity(optimal_roster_names, candidates, opponent_totals)
+    fig_sensitivity = plot_player_sensitivity(sensitivity)
+    fig_sensitivity
+    return
 
 
 @app.cell
-def _(plot_player_sensitivity, sensitivity_df):
-    if sensitivity_df is not None:
-        fig_sensitivity = plot_player_sensitivity(sensitivity_df)
-        fig_sensitivity
-    else:
-        print("Run sensitivity analysis cell above to see results")
+def _():
     return
 
 

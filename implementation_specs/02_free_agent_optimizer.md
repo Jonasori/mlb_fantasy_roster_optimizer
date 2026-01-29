@@ -91,7 +91,9 @@ def filter_candidates(
         1. available_pool = projections excluding opponent_roster_names
         2. Join quality_scores to available_pool
         3. For each slot type in SLOT_ELIGIBILITY:
-           - Find players whose Position is in SLOT_ELIGIBILITY[slot]
+           - Find players eligible for this slot (handle multi-position!)
+           - A player with Position="SS,2B" is eligible for SS, 2B, AND UTIL
+           - Use: player_positions & SLOT_ELIGIBILITY[slot] (set intersection)
            - Take top N by quality_score
            - Add to candidate set
         4. For each scoring category:
@@ -100,6 +102,13 @@ def filter_candidates(
            - Add to candidate set
         5. Add all my_roster_names to candidate set
         6. Return projections filtered to candidate set
+    
+    Multi-position handling:
+        To check if a player is eligible for a slot:
+        ```
+        player_positions = set(p.strip() for p in row["Position"].split(","))
+        is_eligible = bool(player_positions & SLOT_ELIGIBILITY[slot])
+        ```
     
     Print:
         "Filtered to {X} candidates from {Y} total players"
@@ -340,6 +349,53 @@ def compute_standings(
     """
 
 
+def compute_roster_change_values(
+    added_names: set[str],
+    dropped_names: set[str],
+    old_roster_names: set[str],
+    projections: pd.DataFrame,
+    opponent_totals: dict[int, dict[str, float]],
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Compute win probability value and SGP for each roster change.
+    
+    This is used for waiver wire prioritization:
+    - Additions sorted by WPA descending (most valuable first)
+    - Drops sorted by WPA descending (least harmful to drop first)
+    
+    Args:
+        added_names: Set of player names being added
+        dropped_names: Set of player names being dropped
+        old_roster_names: Current roster before changes
+        projections: Combined projections DataFrame (must have SGP column)
+        opponent_totals: Opponent category totals
+    
+    Returns:
+        Tuple of (added_df, dropped_df) DataFrames with columns:
+            Name, Position, Team, player_type, WPA (win prob added), SGP
+        
+        added_df is sorted by WPA descending (highest value first)
+        dropped_df is sorted by WPA descending (negative WPA means loss;
+            first entry = closest to 0 = least harmful to drop)
+    
+    Implementation:
+        1. Import compute_win_probability from trade_engine (local import to avoid circular)
+        2. Compute category_sigmas using estimate_projection_uncertainty
+        3. Compute baseline win probability with old_roster_names
+        4. For each added player:
+           - Compute win probability if we add them to current roster
+           - WPA = V_with_player - V_baseline (positive = helps)
+        5. For each dropped player:
+           - Compute win probability if we remove them from current roster
+           - WPA = V_without_player - V_baseline (negative = hurts to lose)
+        6. Return DataFrames sorted by WPA descending
+    
+    Note:
+        This uses the same probabilistic win model as the trade engine,
+        ensuring consistent player valuations across the codebase.
+    """
+
+
 def print_roster_summary(
     roster_names: list[str],
     projections: pd.DataFrame,
@@ -356,9 +412,20 @@ def print_roster_summary(
        Split into Hitters and Pitchers.
        Show: position, name (suffix stripped), team, relevant stats.
        
-    2. CHANGES (if old_roster_names provided)
-       List players added and dropped with their stats.
-       Flag low-PA/IP players with warning symbols.
+    2. WAIVER PRIORITY LIST (if old_roster_names provided)
+       Calls compute_roster_change_values() to get WPA and SGP for each change.
+       
+       FREE AGENTS TO ADD - sorted by WPA descending:
+         #   Name                      Pos  Team   WPA      SGP
+         1   Luis Castillo             SP   SEA   +2.35%   18.2
+         2   Willy Adames              SS   SFG   +1.89%   15.4
+         ...
+       
+       PLAYERS TO DROP - sorted by expendability (least harmful first):
+         #   Name                      Pos  Team   WPA      SGP
+         1   Tanner Houck              RP   BOS   -0.12%    8.3
+         2   Matt Brash                RP   SEA   -0.25%    6.1
+         ...
     
     3. STANDINGS PROJECTION
        Table showing my value vs each opponent in each category.
@@ -416,39 +483,137 @@ def compute_player_sensitivity(
 
 ---
 
+## Slot Eligibility (Multi-Position Handling)
+
+**Key insight:** Parse position strings ONCE before MILP, not during constraint creation.
+
+### Precompute Eligibility Matrix
+
+```python
+def compute_slot_eligibility(candidates: pd.DataFrame) -> dict[int, set[str]]:
+    """
+    Precompute which slots each candidate can fill.
+    
+    This handles multi-position players correctly:
+        - "SS,2B" player can fill: SS, 2B, UTIL
+        - "SP,RP" pitcher can fill: SP, RP
+        - "OF" player can fill: OF, UTIL
+    
+    Args:
+        candidates: Filtered candidates DataFrame with Position column
+    
+    Returns:
+        Dict mapping candidate index to set of eligible slot types.
+        Example: {0: {'SS', '2B', 'UTIL'}, 1: {'OF', 'UTIL'}, 2: {'SP', 'RP'}, ...}
+    
+    Implementation:
+        For each candidate:
+            1. Parse Position string into set: "SS,2B" → {"SS", "2B"}
+            2. For each slot type, check if player_positions & SLOT_ELIGIBILITY[slot]
+            3. Collect all slots where intersection is non-empty
+    """
+    eligibility = {}
+    
+    for i in range(len(candidates)):
+        position_str = candidates.iloc[i]["Position"]
+        player_positions = set(p.strip() for p in position_str.split(","))
+        
+        eligible_slots = set()
+        for slot, valid_positions in SLOT_ELIGIBILITY.items():
+            if player_positions & valid_positions:  # Set intersection
+                eligible_slots.add(slot)
+        
+        eligibility[i] = eligible_slots
+    
+    return eligibility
+```
+
+### Pre-Solve Validation
+
+```python
+def validate_slot_coverage(
+    eligibility: dict[int, set[str]],
+    candidates: pd.DataFrame,
+) -> None:
+    """
+    Verify enough candidates exist for each slot BEFORE solving.
+    
+    This catches infeasibility early with a clear error message,
+    rather than getting an opaque "infeasible" from the solver.
+    """
+    all_slots = {**HITTING_SLOTS, **PITCHING_SLOTS}
+    
+    for slot, required_count in all_slots.items():
+        candidates_for_slot = sum(1 for i in eligibility if slot in eligibility[i])
+        
+        assert candidates_for_slot >= required_count, (
+            f"Cannot fill {slot} slot: need {required_count}, "
+            f"but only {candidates_for_slot} candidates are eligible. "
+            f"Increase top_n_per_position or add more candidates at {slot}."
+        )
+```
+
+### MILP Variable Creation (Using Eligibility)
+
+```python
+# Precompute eligibility ONCE before building MILP
+eligibility = compute_slot_eligibility(candidates)
+validate_slot_coverage(eligibility, candidates)
+
+# Create slot assignment variables ONLY for eligible (player, slot) pairs
+a = {}
+for i in range(len(candidates)):
+    for s in eligibility[i]:
+        a[i, s] = pulp.LpVariable(f"a_{i}_{s}", cat='Binary')
+```
+
+### Slot Filling Constraints (Using Eligibility)
+
+```python
+# Each slot type must have required number of starters
+for slot, count in {**HITTING_SLOTS, **PITCHING_SLOTS}.items():
+    prob += lpSum(
+        a[i, slot] 
+        for i in range(len(candidates)) 
+        if slot in eligibility[i]  # Only sum over eligible players
+    ) >= count, f"fill_{slot}"
+```
+
+---
+
 ## Edge Cases and Implementation Notes
 
-1. **Position eligibility:** Test if `player['Position'] in SLOT_ELIGIBILITY[slot]`.
+1. **OPS already exists:** The FanGraphs CSV has OPS. Do NOT recompute.
 
-2. **OPS already exists:** The FanGraphs CSV has OPS. Do NOT recompute.
+2. **Strikeouts:** Rename `SO` → `K` during pitcher load.
 
-3. **Strikeouts:** Rename `SO` → `K` during pitcher load.
+3. **Pitcher positions:** From Fantrax API or `'SP' if GS >= 3 else 'RP'` for FanGraphs.
 
-4. **Pitcher positions:** `'SP' if GS >= 3 else 'RP'`
+4. **Hitter position:** From Fantrax API `posShortNames` field. Default to `'DH'` if unavailable.
 
-5. **Hitter position fallback:** Default to `'DH'` if MLBAMID not in database.
-
-6. **Ratio stat linearization signs:**
+5. **Ratio stat linearization signs:**
    - OPS: `PA * (OPS_player - OPS_opponent)`
    - ERA: `IP * (ERA_opponent - ERA_player)` — note flipped order!
    - WHIP: `IP * (WHIP_opponent - WHIP_player)`
 
-7. **Filter by player_type:** Hitting constraints sum only over I_H. Pitching constraints sum only over I_P. Common bug: accidentally including pitchers in OPS calculation.
+6. **Filter by player_type:** Hitting constraints sum only over I_H. Pitching constraints sum only over I_P. Common bug: accidentally including pitchers in OPS calculation.
 
-8. **Big-M values:**
+7. **Big-M values:**
    - Counting stats: 10000
    - Ratio stats: 5000
    - Too small = falsely constrains; too large = numerical issues
 
-9. **Epsilon values:**
+8. **Epsilon values:**
    - Counting stats: 0.5 (ensures strict inequality for integers)
    - Ratio stats: 0.001 (small positive for continuous values)
 
-10. **Variable naming:** Use `f"x_{i}"` with integer index i. Never put player names in variable names (special characters break PuLP).
+9. **Variable naming:** Use `f"x_{i}"` with integer index i. Never put player names in variable names (special characters break PuLP).
 
-11. **Zero PA or IP:** Assert `sum(PA) > 0` for hitters, `sum(IP) > 0` for pitchers for ALL teams including opponents.
+10. **Zero PA or IP:** Assert `sum(PA) > 0` for hitters, `sum(IP) > 0` for pitchers for ALL teams including opponents.
 
-12. **Infeasibility:** If solver returns non-optimal, identify which position slot is problematic in the error message.
+11. **Infeasibility:** With `validate_slot_coverage()`, you'll catch most infeasibility before solving. If solver still returns non-optimal, report status and check constraint feasibility.
+
+12. **Data comes from database:** All projections and roster data should come from `get_projections()` and `get_roster_names()` database queries, not direct CSV loading.
 
 ---
 
@@ -464,7 +629,7 @@ Before the optimizer is complete:
 - [ ] Uses `pulp.HiGHS_CMD()` with `highspy` package installed
 - [ ] Ratio stat linearization has correct signs
 - [ ] Beat constraints filter by player_type
-- [ ] Position eligibility via set membership
-- [ ] Pre-solve validation for slot eligibility
-- [ ] Infeasibility error identifies problematic slot
+- [ ] `compute_slot_eligibility()` parses multi-position strings correctly
+- [ ] `validate_slot_coverage()` runs before MILP solve
+- [ ] `a[i,s]` variables created only for eligible (player, slot) pairs
 - [ ] sum(PA) > 0 and sum(IP) > 0 asserted for all teams

@@ -64,16 +64,24 @@ from .data_loader import (
 MEV_TABLE = {1: 0.0, 2: 0.564, 3: 0.846, 4: 1.029, 5: 1.163, 6: 1.267}
 MVAR_TABLE = {1: 1.0, 2: 0.682, 3: 0.559, 4: 0.492, 5: 0.448, 6: 0.416}
 
-# Trade fairness threshold
-# generic_value is sum of z-scores across categories (typically 4-5 categories)
-# A "fair" trade has |Δ_generic| <= FAIRNESS_THRESHOLD
-# Value of 2.0 means accepting trades where I gain/lose up to ~2 z-score units total
-FAIRNESS_THRESHOLD = 2.0
+# Trade fairness threshold: percentage-based
+# A fair trade has dynasty_SGP differential within 10% of total dynasty_SGP involved
+# Example: 45.0 dynasty_SGP for 62.0 dynasty_SGP = 17 diff / 107 total = 16% -> UNFAIR
+# Example: 30.0 dynasty_SGP for 35.0 dynasty_SGP = 5 diff / 65 total = 8% -> FAIR
+FAIRNESS_THRESHOLD_PERCENT = 0.10  # 10% max differential
+
+# Note: For dynasty leagues, generic_value uses dynasty_SGP (multi-year NPV)
+# rather than single-season SGP. Both columns exist in projections DataFrame.
+# See 01e_dynasty_valuation.md for dynasty_SGP calculation details.
 
 # Maximum players per side in a trade
 MAX_TRADE_SIZE = 3
 
-# Minimum standard deviation for z-score calculation
+# Minimum meaningful improvement to recommend ACCEPT (0.1% = 0.001)
+# Trades with smaller delta_V are marked NEUTRAL even if positive
+MIN_MEANINGFUL_IMPROVEMENT = 0.001
+
+# Minimum standard deviation for calculations
 MIN_STD = 0.001
 ```
 
@@ -348,7 +356,7 @@ def compute_player_values(
     Args:
         player_names: All players to evaluate (my roster + opponent rosters)
         my_roster_names: Players currently on my roster (subset of player_names)
-        projections: Projections DataFrame
+        projections: Projections DataFrame (must include SGP and dynasty_SGP columns)
         my_totals: Current team totals
         opponent_totals: Opponent totals
         category_sigmas: Category standard deviations
@@ -358,17 +366,26 @@ def compute_player_values(
             Name, player_type, Position, on_my_roster,
             delta_V_acquire (value if I acquire this player),
             delta_V_lose (cost if I lose this player, NaN if not on my roster),
-            generic_value (context-free z-score sum),
-            contrib_z_{category} for each category
+            generic_value (dynasty_SGP for trade fairness)
         
         Sorted by delta_V_acquire descending.
     
     Implementation:
-        1. For each player, compute delta_V for acquisition
-        2. For players in my_roster_names, also compute delta_V for losing
-        3. For players NOT in my_roster_names, delta_V_lose = NaN
-        4. Compute generic value as sum of z-scores (for fairness comparison)
-        5. Z-scores computed within player type (hitters vs pitchers)
+        1. Use dynasty_SGP as generic_value (falls back to SGP if not available)
+        2. For each player, compute delta_V for acquisition using numerical diff
+        3. For players in my_roster_names, also compute delta_V for losing
+        4. For players NOT in my_roster_names, delta_V_lose = NaN
+    
+    Note:
+        generic_value is dynasty_SGP (multi-year NPV of SGP), which accounts for:
+        - Future production based on aging curves
+        - Time-discounting (current year worth more than future years)
+        - It's context-free (same dynasty_SGP regardless of which roster)
+        - It's "fair" in the eyes of other managers who value youth
+        
+        For details on dynasty_SGP calculation, see 01e_dynasty_valuation.md.
+        
+        If dynasty_SGP is not available, falls back to single-season SGP.
     """
 ```
 
@@ -386,17 +403,27 @@ def identify_trade_targets(
     """
     Identify players to TARGET (acquire) in trades.
     
-    Targets are players on opponent rosters with high delta_V_acquire.
+    Targets are players on opponent rosters ranked by "acquirability" - the ratio
+    of value-to-me vs their market value (dynasty_SGP). This surfaces players who fit
+    YOUR roster needs but aren't universally coveted superstars.
+    
+    acquirability = delta_V_acquire / (dynasty_SGP.clip(lower=0.5) + 0.5)
+    
+    Higher acquirability = better "bang for your buck" in trades.
+    A player with +5% value to you and 45 dynasty_SGP is more acquirable than
+    a player with +10% value but 80 dynasty_SGP (the latter is a young superstar everyone wants).
     
     Returns:
         DataFrame of targets with:
-            Name, player_type, Position, delta_V_acquire, generic_value,
+            Name, player_type, Position, delta_V_acquire, generic_value (dynasty_SGP),
             owner_id (which opponent owns them),
-            primary_benefit (which category they help most)
+            acquirability (value/dynasty_SGP ratio)
+        
+        Sorted by acquirability descending.
     
     Print:
-        "Trade targets: {N} players identified"
-        "  Best: {name} from opponent {id} (+{delta_V:.3f} win prob)"
+        "Trade targets: {N} players identified (ranked by value/dynasty_SGP ratio)"
+        "  Best: {name} from Team {id} (value to me: +{delta_V:.3f} W, dynasty_SGP: {sgp:.1f})"
     """
 
 
@@ -409,21 +436,31 @@ def identify_trade_pieces(
     Identify players to OFFER (trade away) from my roster.
     
     Good trade pieces have:
-        - High generic value (attractive to opponents)
-        - Low delta_V_lose (not critical to my win probability)
+        - High dynasty_SGP (attractive to opponents - "good long-term value")
+        - Low delta_V_lose (not critical to MY win probability)
     
-    expendability_score = generic_value - delta_V_lose * scale_factor
+    expendability = -(dynasty_SGP + delta_V_lose * LOSE_COST_SCALE)
+    
+    This naturally handles both normal and edge cases:
+    - Low dynasty_SGP → more expendable (not a valuable asset)
+    - Low lose_cost → more expendable (doesn't hurt to lose)
+    - When win prob is at floor/ceiling and lose_cost ≈ 0 for everyone,
+      the formula degrades gracefully to ranking by -dynasty_SGP
+    
+    Note: Using dynasty_SGP means older players with high current SGP but
+    limited future value are more expendable than young players with similar
+    current production. This is "win-now" optimized.
     
     Returns:
         DataFrame of tradeable players with:
-            Name, player_type, Position, delta_V_lose, generic_value,
-            expendability_score
+            Name, player_type, Position, delta_V_lose, generic_value (dynasty_SGP),
+            expendability
         
-        Sorted by expendability_score descending.
+        Sorted by expendability descending.
     
     Print:
         "Trade pieces: {N} players identified"
-        "  Most expendable: {name} (generic={gv:.1f}, lose_cost={dv:.3f})"
+        "  Most expendable: {name} (dynasty_SGP={sgp:.1f}, lose_cost={dv:.3f})"
     """
 ```
 
@@ -441,6 +478,7 @@ def evaluate_trade(
     my_totals: dict[str, float],
     opponent_totals: dict[int, dict[str, float]],
     category_sigmas: dict[str, float],
+    opponent_rosters: dict[int, set[str]] | None = None,
 ) -> dict:
     """
     Evaluate a specific trade proposal.
@@ -454,41 +492,50 @@ def evaluate_trade(
         my_totals: Current totals
         opponent_totals: Opponent totals
         category_sigmas: Category standard deviations
+        opponent_rosters: Optional dict to identify trade partner team
     
     Returns:
         Dict with:
             'send_players': list
             'receive_players': list
             'delta_V': float (change in win probability, positive = good)
-            'delta_generic': float (generic value change)
+            'delta_generic': float (SGP change - positive means I get more SGP)
             'V_before': float (win prob before trade)
             'V_after': float (win prob after trade)
-            'is_fair': bool (|delta_generic| <= FAIRNESS_THRESHOLD)
-            'is_good_for_me': bool (delta_V > 0)
-            'recommendation': str ('ACCEPT', 'REJECT', 'UNFAIR', 'STEAL')
+            'is_fair': bool (SGP differential <= 10% of total SGP)
+            'is_good_for_me': bool (delta_V >= MIN_MEANINGFUL_IMPROVEMENT)
+            'recommendation': str ('ACCEPT', 'REJECT', 'NEUTRAL', 'UNFAIR', 'STEAL')
             'category_impact': dict (change in each category total)
-            'send_details': DataFrame of sent players
-            'receive_details': DataFrame of received players
+            'send_generics': list of (name, SGP) tuples
+            'receive_generics': list of (name, SGP) tuples
+            'trade_partner_id': int or None (which opponent team)
     
     Implementation:
         1. Compute current V_before
         2. Compute new roster: (my_roster - send) | receive
-        3. Compute new totals
-        4. Compute V_after
-        5. delta_V = V_after - V_before
-        6. delta_generic from player_values
-        7. Determine recommendation:
-           - delta_V > 0 and fair: 'ACCEPT'
-           - delta_V > 0 and not fair (I'm getting more): 'STEAL'
-           - delta_V <= 0 and fair: 'REJECT'
-           - delta_V <= 0 and not fair: 'UNFAIR'
+        3. Validate roster composition (MIN/MAX hitters/pitchers)
+        4. Compute new totals
+        5. Compute V_after
+        6. delta_V = V_after - V_before
+        7. delta_generic = sum(receive dynasty_SGP) - sum(send dynasty_SGP)
+        8. Fairness check (percentage-based):
+           total_dynasty_sgp = send_dynasty_SGP + receive_dynasty_SGP
+           relative_diff = |delta_generic| / total_dynasty_sgp
+           is_fair = relative_diff <= FAIRNESS_THRESHOLD_PERCENT (10%)
+        9. Determine recommendation:
+           - delta_V >= 0.001 and fair: 'ACCEPT'
+           - delta_V >= 0.001 and not fair (I'm getting more dynasty_SGP): 'STEAL'
+           - delta_V <= -0.001 and fair: 'REJECT'
+           - |delta_V| < 0.001 and fair: 'NEUTRAL' (negligible impact)
+           - not fair and bad for me: 'UNFAIR'
     
-    Print:
-        "Trade evaluation:"
-        "  Send: {players} (lose {dv_lose:.3f} win prob)"
-        "  Receive: {players} (gain {dv_gain:.3f} win prob)"
-        "  Net: {delta_V:+.3f} win probability ({delta_V*100:+.1f}%)"
-        "  Fair: {yes/no} | Recommendation: {rec}"
+    Print (only for fair trades):
+        "Trade with Team {id}:"
+        "  Send: [{players with (dynasty_SGP: X.X)}]"
+        "  Receive: [{players with (dynasty_SGP: X.X)}]"
+        "  Net to me: {delta_V:+.3f} win probability ({delta_V*100:+.1f}%)"
+        "  Dynasty SGP change: {delta_generic:+.1f} ({'Fair' if is_fair else 'Unfair'})"
+        "  Recommendation: {rec}"
     """
 
 
@@ -674,7 +721,7 @@ def print_trade_report(
 
 ## Display Name Handling
 
-Functions that print output strip the -H/-P suffix using `_strip_suffix()`:
+Functions that print output strip the -H/-P suffix using `strip_name_suffix()`:
 - `print_trade_report`
 - `evaluate_trade` (when printing)
 - `identify_trade_targets` (when printing)
@@ -683,7 +730,12 @@ Functions that print output strip the -H/-P suffix using `_strip_suffix()`:
 
 All internal data structures preserve the suffix for uniqueness.
 
-**Note:** `_strip_suffix()` is defined in `visualizations.py` and should be imported, or duplicated as a private helper in this module.
+**Important:** `strip_name_suffix()` is defined ONLY in `data_loader.py`. Import it:
+```python
+from .data_loader import strip_name_suffix
+```
+
+Do NOT duplicate this function or define a local `_strip_suffix` helper.
 
 ---
 
@@ -693,7 +745,7 @@ All internal data structures preserve the suffix for uniqueness.
 
 2. **Correlation handling:** The base implementation assumes category independence. Correlations can be added but increase complexity. Start without correlations.
 
-3. **Roster composition:** `verify_trade_impact` validates MIN/MAX bounds for hitters and pitchers post-trade.
+3. **Roster composition:** `evaluate_trade` validates MIN/MAX bounds for hitters (12-16) and pitchers (10-14) post-trade. Invalid trades fail with assertion.
 
 4. **Ratio stat changes:** When computing how a player changes ratio stats, must recompute the full weighted average, not just add/subtract.
 
@@ -709,6 +761,53 @@ All internal data structures preserve the suffix for uniqueness.
 
 10. **Player not on any roster:** If evaluating a player in `compute_player_values` who isn't on any roster (free agent), `delta_V_lose` should be NaN or 0 since they can't be lost.
 
+11. **dynasty_SGP as generic_value:** For dynasty leagues, generic_value uses dynasty_SGP (net present value of future SGP), not single-season SGP. This accounts for:
+    - Aging curves: older players decline in future years
+    - Time discounting: current production worth more than future (25% discount rate for "win-now")
+    - It's context-free (same dynasty_SGP regardless of which roster)
+    - It's "fair" in dynasty league negotiations (values youth appropriately)
+    - Both SGP and dynasty_SGP columns exist; dynasty_SGP used for trades
+    - If dynasty_SGP not available, falls back to SGP
+    - See `01e_dynasty_valuation.md` for calculation details
+
+12. **Trade target acquirability:** Players are ranked by `delta_V_acquire / (SGP.clip(lower=0.5) + 0.5)`, not raw delta_V. This surfaces "hidden gem" players who are valuable to YOUR team but not universally coveted superstars. A player everyone wants (like Ohtani) is less acquirable even if their value to you is highest.
+
+13. **Meaningful improvement threshold:** ACCEPT requires delta_V >= 0.001 (0.1%). Trades with |delta_V| < 0.001 are marked NEUTRAL to avoid recommending trades with negligible impact.
+
+14. **Expendability formula:** Single unified formula with no conditionals:
+    ```python
+    expendability = -(SGP + delta_V_lose * LOSE_COST_SCALE)
+    ```
+    Where `LOSE_COST_SCALE = 200` converts delta_V_lose (~0.001-0.01) to SGP scale (~0-20).
+    This naturally handles edge cases: when win probability is at floor/ceiling and delta_V_lose ≈ 0 for everyone, the formula degrades gracefully to ranking by -SGP (low SGP = more expendable).
+
+15. **Mixed player types in targets/pieces:** Both `identify_trade_targets` and `identify_trade_pieces` ensure at least 40% of each player type (hitters and pitchers). This is critical for roster composition fixes — if your roster has too many hitters, you need pitcher targets to trade for, and hitter pieces to trade away.
+
+16. **Percentage-based fairness:** Trade fairness is determined by the dynasty_SGP differential as a percentage of total dynasty_SGP involved:
+    ```python
+    relative_diff = abs(send_dynasty_SGP - receive_dynasty_SGP) / (send_dynasty_SGP + receive_dynasty_SGP)
+    is_fair = relative_diff <= FAIRNESS_THRESHOLD_PERCENT  # 10%
+    ```
+    Example: 45 dynasty_SGP for 62 dynasty_SGP = 16% diff → UNFAIR. 60 dynasty_SGP for 62 dynasty_SGP = 2% diff → FAIR.
+
+17. **Trade analysis uses optimized roster:** The notebook runs trade analysis on the post-free-agency optimized roster, not the current roster. This allows you to first fix roster composition via free agency, then evaluate trades from a valid starting point.
+
+18. **Simplified totals computation:** `_compute_totals_with_player_change()` simply modifies the roster set and calls `compute_team_totals()`. Do NOT reimplement the weighted average logic — use the single source of truth function.
+
+19. **No arbitrary trade combination limits:** When generating trade combinations, evaluate ALL targets from each owner, not just the first few. The early code had `combinations(owner_targets[: receive_size * 2], receive_size)` which arbitrarily limited options — this was removed.
+
+20. **strip_name_suffix imported, not duplicated:** Use `from .data_loader import strip_name_suffix` in trade_engine.py. Do NOT define a local `_strip_suffix` function.
+
+21. **Dynasty valuation and "win-now" strategy:** With a 25% discount rate:
+    - Year 0 (current): 100% weight
+    - Year 1: 80% weight
+    - Year 2: 64% weight
+    - Year 3: 51% weight
+    
+    This heavily prioritizes current-year production. The trade engine will favor acquiring older productive players (high current SGP, low dynasty_SGP) and trading away young players with high dynasty_SGP but lower immediate impact. This is correct for "win-now" mode.
+
+22. **Age data missing:** Players without age data from Fantrax API get `dynasty_SGP = SGP` as fallback. This can happen for newly called-up players not yet in the Fantrax database. The trade engine handles this gracefully.
+
 ---
 
 ## Validation Checklist
@@ -717,11 +816,19 @@ All internal data structures preserve the suffix for uniqueness.
 - [ ] Gradients computed correctly (test with numerical differentiation)
 - [ ] Normalized gaps flip sign for ERA/WHIP
 - [ ] Player values use delta_V_acquire for targets, delta_V_lose for pieces
-- [ ] Generic values computed as z-score sums within player type
+- [ ] Generic values use dynasty_SGP (falls back to SGP if not available)
 - [ ] Trade evaluation computes exact V_after (not just gradient approximation)
 - [ ] Verification matches evaluation closely
-- [ ] Roster composition validated post-trade
-- [ ] Display functions strip -H/-P suffix
+- [ ] Roster composition validated post-trade (12-16 hitters, 10-14 pitchers)
+- [ ] Display functions use `strip_name_suffix()` imported from data_loader
 - [ ] Empty results handled gracefully
 - [ ] All print statements use descriptive messages
 - [ ] tqdm for trade candidate evaluation loop
+- [ ] Trade targets ranked by acquirability (value/dynasty_SGP ratio)
+- [ ] ACCEPT requires >= 0.1% improvement; NEUTRAL for negligible impact
+- [ ] Trade output shows dynasty_SGP (generic value) for each player
+- [ ] Trade output identifies trade partner team
+- [ ] `_compute_totals_with_player_change` uses `compute_team_totals()` (no reimplementation)
+- [ ] No arbitrary trade combination limits (evaluate all targets per owner)
+- [ ] dynasty_SGP used for fairness evaluation, not single-season SGP
+- [ ] Missing age data falls back to SGP gracefully
