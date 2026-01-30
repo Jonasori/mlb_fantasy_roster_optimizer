@@ -177,11 +177,11 @@ def add_dynasty_sgp_to_projections(
 
 ## Trade Engine Integration
 
-The trade engine uses `dynasty_SGP` for fairness:
+The trade engine uses `SGP` for fairness:
 
 - **Trade fairness:** SGP differential within 10% of total SGP involved
-- **Acquirability:** `delta_V_acquire / (dynasty_SGP + 0.5)`
-- **Expendability:** `-(dynasty_SGP + lose_cost × scale)`
+- **Trade targets:** Ranked by `ewa_acquire` descending
+- **Expendability:** `-SGP + ewa_lose × LOSE_COST_SCALE`
 
 Both `SGP` and `dynasty_SGP` remain in DataFrame for analysis.
 

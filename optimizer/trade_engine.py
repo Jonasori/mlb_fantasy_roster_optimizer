@@ -46,14 +46,14 @@ FAIRNESS_THRESHOLD_PERCENT = 0.10  # 10% max differential
 # Maximum players per side in a trade
 MAX_TRADE_SIZE = 3
 
-# Minimum meaningful improvement to recommend ACCEPT (0.1% = 0.001)
-MIN_MEANINGFUL_IMPROVEMENT = 0.001
+# Minimum meaningful EWA improvement to recommend ACCEPT (0.1 expected wins)
+MIN_MEANINGFUL_IMPROVEMENT = 0.1
 
 # Minimum standard deviation for calculations
 MIN_STD = 0.001
 
-# Scale factor for converting delta_V_lose to SGP scale
-LOSE_COST_SCALE = 200
+# Scale factor for converting ewa_lose to SGP scale for expendability calculation
+LOSE_COST_SCALE = 2
 
 
 # =============================================================================
@@ -259,15 +259,16 @@ def compute_player_marginal_value(
     is_acquisition: bool = True,
 ) -> tuple[float, dict]:
     """
-    Compute the marginal change in win probability from acquiring/losing a player.
+    Compute the marginal change in expected wins from acquiring/losing a player.
 
-    Uses numerical differentiation (actual V computation before/after).
+    Uses numerical differentiation (actual expected_wins computation before/after).
 
     Returns:
-        delta_V: Change in win probability (can be negative)
-        breakdown: Dict with per-category info
+        ewa: Expected Wins Added (change in expected category matchup wins out of 60)
+        breakdown: Dict with V_before, V_after, ew_before, ew_after
     """
-    V_before, _ = compute_win_probability(my_totals, opponent_totals, category_sigmas)
+    _, diag_before = compute_win_probability(my_totals, opponent_totals, category_sigmas)
+    ew_before = diag_before["expected_wins"]
 
     if is_acquisition:
         # Adding this player to roster
@@ -288,14 +289,18 @@ def compute_player_marginal_value(
             projections=projections,
         )
 
-    V_after, _ = compute_win_probability(new_totals, opponent_totals, category_sigmas)
+    _, diag_after = compute_win_probability(new_totals, opponent_totals, category_sigmas)
+    ew_after = diag_after["expected_wins"]
 
-    delta_V = V_after - V_before
+    ewa = ew_after - ew_before
 
-    # Compute per-category breakdown (simplified)
-    breakdown = {"V_before": V_before, "V_after": V_after}
+    # Include both V and expected_wins in breakdown for flexibility
+    breakdown = {
+        "ew_before": ew_before,
+        "ew_after": ew_after,
+    }
 
-    return delta_V, breakdown
+    return ewa, breakdown
 
 
 def compute_player_values(
@@ -307,14 +312,16 @@ def compute_player_values(
     category_sigmas: dict[str, float],
 ) -> pd.DataFrame:
     """
-    Compute marginal value for a set of players.
+    Compute marginal value (EWA) for a set of players.
+
+    EWA = Expected Wins Added (change in expected category matchup wins out of 60).
 
     Returns:
         DataFrame with columns:
             Name, player_type, Position, on_my_roster,
-            delta_V_acquire (value if I acquire this player),
-            delta_V_lose (cost if I lose this player, NaN if not on my roster),
-            generic_value (dynasty_SGP for trade fairness)
+            ewa_acquire (EWA if I acquire this player),
+            ewa_lose (EWA if I lose this player, NaN if not on my roster),
+            generic_value (SGP for trade fairness)
     """
     results = []
 
@@ -326,8 +333,8 @@ def compute_player_values(
 
         on_roster = player_name in my_roster_names
 
-        # Compute delta_V for acquisition
-        delta_V_acquire, _ = compute_player_marginal_value(
+        # Compute EWA for acquisition
+        ewa_acquire, _ = compute_player_marginal_value(
             player_name,
             projections,
             my_totals,
@@ -337,9 +344,9 @@ def compute_player_values(
             is_acquisition=True,
         )
 
-        # Compute delta_V for losing (only if on roster)
+        # Compute EWA for losing (only if on roster)
         if on_roster:
-            delta_V_lose, _ = compute_player_marginal_value(
+            ewa_lose, _ = compute_player_marginal_value(
                 player_name,
                 projections,
                 my_totals,
@@ -349,7 +356,7 @@ def compute_player_values(
                 is_acquisition=False,
             )
         else:
-            delta_V_lose = np.nan
+            ewa_lose = np.nan
 
         # Generic value: use raw SGP (age scaling removed)
         generic_value = player_row["SGP"]
@@ -360,14 +367,14 @@ def compute_player_values(
                 "player_type": player_row["player_type"],
                 "Position": player_row["Position"],
                 "on_my_roster": on_roster,
-                "delta_V_acquire": delta_V_acquire,
-                "delta_V_lose": delta_V_lose,
+                "ewa_acquire": ewa_acquire,
+                "ewa_lose": ewa_lose,
                 "generic_value": generic_value,
             }
         )
 
     df = pd.DataFrame(results)
-    return df.sort_values("delta_V_acquire", ascending=False)
+    return df.sort_values("ewa_acquire", ascending=False)
 
 
 # =============================================================================
@@ -384,8 +391,7 @@ def identify_trade_targets(
     """
     Identify players to TARGET (acquire) in trades.
 
-    Targets are players on opponent rosters ranked by "acquirability" - the ratio
-    of value-to-me vs their market value (dynasty_SGP).
+    Targets are players on opponent rosters ranked by EWA (expected wins added).
     """
     # Find which opponent owns each player
     owner_map = {}
@@ -396,10 +402,10 @@ def identify_trade_targets(
     # Filter to opponent players with positive value
     targets = player_values[~player_values["on_my_roster"]].copy()
     targets = targets[targets["Name"].isin(owner_map.keys())]
-    targets = targets[targets["delta_V_acquire"] > 0.001]  # Only positive value players
+    targets = targets[targets["ewa_acquire"] > 0.01]  # Only positive value players
 
-    # Sort by delta_V_acquire (how much they help us)
-    targets = targets.sort_values("delta_V_acquire", ascending=False).head(n_targets)
+    # Sort by ewa_acquire (how much they help us)
+    targets = targets.sort_values("ewa_acquire", ascending=False).head(n_targets)
 
     # Ensure at least 40% hitters and 40% pitchers
     hitters = targets[targets["player_type"] == "hitter"]
@@ -431,11 +437,11 @@ def identify_trade_targets(
     if len(targets) > 0:
         best = targets.iloc[0]
         print(
-            f"Trade targets: {len(targets)} players identified (ranked by value/SGP ratio)"
+            f"Trade targets: {len(targets)} players identified (ranked by EWA)"
         )
         print(
             f"  Best: {strip_name_suffix(best['Name'])} from Team {best.get('owner_id', '?')} "
-            f"(value to me: +{best['delta_V_acquire']:.3f} W, SGP: {best['generic_value']:.1f})"
+            f"(EWA: +{best['ewa_acquire']:.2f}, SGP: {best['generic_value']:.1f})"
         )
 
     return targets
@@ -450,18 +456,18 @@ def identify_trade_pieces(
     Identify players to OFFER (trade away) from my roster.
 
     Good trade pieces have:
-        - High dynasty_SGP (attractive to opponents)
-        - Low delta_V_lose (not critical to MY win probability)
+        - High SGP (attractive to opponents)
+        - Low ewa_lose (not critical to MY expected wins)
     """
     # Filter to my roster
     pieces = player_values[player_values["on_my_roster"]].copy()
 
     # Compute expendability (higher = more expendable, easier to trade away)
     # - Low SGP: easier to get fair value from opponent
-    # - Small lose cost (delta_V_lose close to 0): doesn't hurt us to lose them
-    # Since delta_V_lose is negative when losing hurts, we ADD it (making expendability lower)
+    # - Small lose cost (ewa_lose close to 0): doesn't hurt us to lose them
+    # Since ewa_lose is negative when losing hurts, we ADD it (making expendability lower)
     pieces["expendability"] = (
-        -pieces["generic_value"] + pieces["delta_V_lose"].fillna(0) * LOSE_COST_SCALE
+        -pieces["generic_value"] + pieces["ewa_lose"].fillna(0) * LOSE_COST_SCALE
     )
 
     # Sort by expendability (most expendable first)
@@ -493,7 +499,7 @@ def identify_trade_pieces(
         print(f"Trade pieces: {len(pieces)} players identified")
         print(
             f"  Most expendable: {strip_name_suffix(best['Name'])} "
-            f"(SGP={best['generic_value']:.1f}, lose_cost={best['delta_V_lose']:.3f})"
+            f"(SGP={best['generic_value']:.1f}, lose_cost={best['ewa_lose']:.2f})"
         )
 
     return pieces
@@ -551,10 +557,10 @@ def evaluate_trade(
         return {
             "send_players": send_players,
             "receive_players": receive_players,
-            "delta_V": float("-inf"),
+            "ewa": float("-inf"),
             "delta_generic": 0.0,
-            "V_before": 0.0,
-            "V_after": 0.0,
+            "ew_before": 0.0,
+            "ew_after": 0.0,
             "is_fair": False,
             "is_good_for_me": False,
             "recommendation": "INVALID",
@@ -565,10 +571,10 @@ def evaluate_trade(
         return {
             "send_players": send_players,
             "receive_players": receive_players,
-            "delta_V": float("-inf"),
+            "ewa": float("-inf"),
             "delta_generic": 0.0,
-            "V_before": 0.0,
-            "V_after": 0.0,
+            "ew_before": 0.0,
+            "ew_after": 0.0,
             "is_fair": False,
             "is_good_for_me": False,
             "recommendation": "INVALID",
@@ -576,13 +582,15 @@ def evaluate_trade(
             "invalid_reason": f"Post-trade pitchers ({n_pitchers}) outside bounds [{MIN_PITCHERS}, {MAX_PITCHERS}]",
         }
 
-    # Compute V before and after
-    V_before, _ = compute_win_probability(my_totals, opponent_totals, category_sigmas)
+    # Compute expected wins before and after
+    _, diag_before = compute_win_probability(my_totals, opponent_totals, category_sigmas)
+    ew_before = diag_before["expected_wins"]
 
     new_totals = compute_team_totals(new_roster, projections)
-    V_after, _ = compute_win_probability(new_totals, opponent_totals, category_sigmas)
+    _, diag_after = compute_win_probability(new_totals, opponent_totals, category_sigmas)
+    ew_after = diag_after["expected_wins"]
 
-    delta_V = V_after - V_before
+    ewa = ew_after - ew_before
 
     # Compute dynasty_SGP change
     send_sgp = sum(
@@ -617,14 +625,14 @@ def evaluate_trade(
     else:
         is_fair = True
 
-    # Determine recommendation
-    is_good_for_me = delta_V >= min_improvement
-    is_bad_for_me = delta_V <= -min_improvement
+    # Determine recommendation (min_improvement is now in EWA terms, e.g., 0.1 expected wins)
+    is_good_for_me = ewa >= min_improvement
+    is_bad_for_me = ewa <= -min_improvement
 
     if is_good_for_me and is_fair:
         recommendation = "ACCEPT"
     elif is_good_for_me and not is_fair and delta_generic > 0:
-        recommendation = "STEAL"  # I'm getting more dynasty_SGP
+        recommendation = "STEAL"  # I'm getting more SGP
     elif is_bad_for_me and is_fair:
         recommendation = "REJECT"
     elif not is_fair and is_bad_for_me:
@@ -647,10 +655,10 @@ def evaluate_trade(
     result = {
         "send_players": send_players,
         "receive_players": receive_players,
-        "delta_V": delta_V,
+        "ewa": ewa,
         "delta_generic": delta_generic,
-        "V_before": V_before,
-        "V_after": V_after,
+        "ew_before": ew_before,
+        "ew_after": ew_after,
         "is_fair": is_fair,
         "is_good_for_me": is_good_for_me,
         "recommendation": recommendation,
@@ -745,8 +753,8 @@ def generate_trade_candidates(
                         if trade_result["is_fair"] and trade_result["is_good_for_me"]:
                             all_trades.append(trade_result)
 
-    # Sort by delta_V descending
-    all_trades.sort(key=lambda t: t["delta_V"], reverse=True)
+    # Sort by EWA descending
+    all_trades.sort(key=lambda t: t["ewa"], reverse=True)
 
     # Keep top N
     all_trades = all_trades[:n_candidates]
@@ -838,12 +846,12 @@ def verify_trade_impact(
     return {
         "V_before": V_before,
         "V_after": V_after,
-        "delta_V": V_after - V_before,
+        "ewa": diag_after["expected_wins"] - diag_before["expected_wins"],
         "old_totals": old_totals,
         "new_totals": new_totals,
         "category_changes": category_changes,
-        "wins_before": diag_before["expected_wins"],
-        "wins_after": diag_after["expected_wins"],
+        "ew_before": diag_before["expected_wins"],
+        "ew_after": diag_after["expected_wins"],
         "matchup_flips": matchup_flips,
     }
 
@@ -973,7 +981,7 @@ def print_trade_report(
         return
 
     for i, trade in enumerate(trade_candidates[:top_n], 1):
-        print(f"\n#{i}: {trade['delta_V']:+.1%} win probability")
+        print(f"\n#{i}: {trade['ewa']:+.2f} expected wins")
 
         send_str = ", ".join(strip_name_suffix(p) for p in trade["send_players"])
         receive_str = ", ".join(strip_name_suffix(p) for p in trade["receive_players"])
@@ -983,9 +991,9 @@ def print_trade_report(
             f"    Receive: {receive_str} [from opponent {trade.get('trade_partner_id', '?')}]"
         )
         print("-" * 50)
-        print(f"    Net: {trade['delta_V']:+.1%} win probability")
+        print(f"    Net: {trade['ewa']:+.2f} expected wins")
         print(
-            f"    Dynasty SGP: {trade['delta_generic']:+.1f} ({'Fair' if trade['is_fair'] else 'Unfair'})"
+            f"    SGP: {trade['delta_generic']:+.1f} ({'Fair' if trade['is_fair'] else 'Unfair'})"
         )
         print(f"    Recommendation: {trade['recommendation']}")
 

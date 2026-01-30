@@ -1021,10 +1021,10 @@ TRADE SUMMARY
 Send: {", ".join(strip_name_suffix(p) for p in trade_eval["send_players"])}
 Receive: {", ".join(strip_name_suffix(p) for p in trade_eval["receive_players"])}
 
-Win Probability: {trade_eval["V_before"]:.1%} → {trade_eval["V_after"]:.1%}
-Change: {trade_eval["delta_V"]:+.1%}
+Expected Wins: {trade_eval["ew_before"]:.1f} → {trade_eval["ew_after"]:.1f}
+Change: {trade_eval["ewa"]:+.2f} EWA
 
-Dynasty SGP: {trade_eval["delta_generic"]:+.1f}
+SGP: {trade_eval["delta_generic"]:+.1f}
 Fairness: {"Fair" if trade_eval["is_fair"] else "Unfair"}
 
 RECOMMENDATION: {trade_eval["recommendation"]}
@@ -1047,15 +1047,15 @@ RECOMMENDATION: {trade_eval["recommendation"]}
 
     # Simple text representation of before/after
     gauge_text = f"""
-WIN PROBABILITY
+EXPECTED WINS (out of 60)
 
-Before: {trade_eval["V_before"]:.1%}
-After:  {trade_eval["V_after"]:.1%}
+Before: {trade_eval["ew_before"]:.1f}
+After:  {trade_eval["ew_after"]:.1f}
 
-Change: {trade_eval["delta_V"]:+.1%}
+Change: {trade_eval["ewa"]:+.2f}
 """
     ax3.text(0.3, 0.5, gauge_text, fontsize=14, family="monospace", va="center")
-    ax3.set_title("Win Probability", fontweight="bold")
+    ax3.set_title("Expected Wins", fontweight="bold")
 
     # Bottom-right: Value comparison
     ax4.axis("off")
@@ -1803,7 +1803,7 @@ def plot_player_value_scatter(
 
     ax.scatter(
         hitters_off["generic_value"],
-        hitters_off["delta_V_acquire"],
+        hitters_off["ewa_acquire"],
         s=50,
         facecolors="none",
         edgecolors="blue",
@@ -1812,7 +1812,7 @@ def plot_player_value_scatter(
     )
     ax.scatter(
         pitchers_off["generic_value"],
-        pitchers_off["delta_V_acquire"],
+        pitchers_off["ewa_acquire"],
         s=50,
         facecolors="none",
         edgecolors="red",
@@ -1826,7 +1826,7 @@ def plot_player_value_scatter(
 
     ax.scatter(
         hitters_on["generic_value"],
-        hitters_on["delta_V_acquire"],
+        hitters_on["ewa_acquire"],
         s=80,
         c="blue",
         alpha=0.8,
@@ -1834,7 +1834,7 @@ def plot_player_value_scatter(
     )
     ax.scatter(
         pitchers_on["generic_value"],
-        pitchers_on["delta_V_acquire"],
+        pitchers_on["ewa_acquire"],
         s=80,
         c="red",
         alpha=0.8,
@@ -1850,8 +1850,8 @@ def plot_player_value_scatter(
         linewidth=0.5,
     )
 
-    ax.set_xlabel("Generic Value (Dynasty SGP)")
-    ax.set_ylabel("Contextual Value (delta_V_acquire)")
+    ax.set_xlabel("Generic Value (SGP)")
+    ax.set_ylabel("Contextual Value (EWA)")
     ax.set_title("Player Value: Generic vs Contextual", fontweight="bold")
     ax.legend(loc="upper right")
 

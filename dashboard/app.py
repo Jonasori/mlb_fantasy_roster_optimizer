@@ -624,7 +624,7 @@ def show_trades():
                             "Player": strip_name_suffix(row["Name"]),
                             "Pos": row.get("Position", ""),
                             "Owner": owner_name,
-                            "Value": f"+{row['delta_V_acquire']:.2%}",
+                            "EWA": f"+{row['ewa_acquire']:.2f}",
                             "SGP": f"{row['generic_value']:.1f}",
                         }
                     )
@@ -635,8 +635,8 @@ def show_trades():
                         "Player": st.column_config.TextColumn("Player", width="medium"),
                         "Pos": st.column_config.TextColumn("Pos", width="small"),
                         "Owner": st.column_config.TextColumn("Owner", width="medium"),
-                        "Value": st.column_config.TextColumn(
-                            "Value to Me", width="small"
+                        "EWA": st.column_config.TextColumn(
+                            "EWA", width="small"
                         ),
                         "SGP": st.column_config.TextColumn("SGP", width="small"),
                     },
@@ -652,12 +652,12 @@ def show_trades():
             if not pieces.empty:
                 pieces_display = []
                 for _, row in pieces.iterrows():
-                    lose_cost = row.get("delta_V_lose", 0)
+                    lose_cost = row.get("ewa_lose", 0)
                     pieces_display.append(
                         {
                             "Player": strip_name_suffix(row["Name"]),
                             "Pos": row.get("Position", ""),
-                            "Lose Cost": f"{lose_cost:.2%}" if lose_cost else "N/A",
+                            "Lose Cost": f"{lose_cost:.2f}" if lose_cost else "N/A",
                             "SGP": f"{row['generic_value']:.1f}",
                         }
                     )
@@ -755,7 +755,7 @@ def show_trades():
                         "Partner": partner_name,
                         "You Send": send_str,
                         "You Get": receive_str,
-                        "ΔWin%": f"{trade['delta_V']:+.2%}",
+                        "EWA": f"{trade['ewa']:+.2f}",
                         "Fairness": "Fair" if trade["is_fair"] else "Unfair",
                         "Rec": trade["recommendation"],
                     }
@@ -769,7 +769,7 @@ def show_trades():
                     "Partner": st.column_config.TextColumn("Partner", width="medium"),
                     "You Send": st.column_config.TextColumn("You Send", width="large"),
                     "You Get": st.column_config.TextColumn("You Get", width="large"),
-                    "ΔWin%": st.column_config.TextColumn("ΔWin%", width="small"),
+                    "EWA": st.column_config.TextColumn("EWA", width="small"),
                     "Fairness": st.column_config.TextColumn("Fair?", width="small"),
                     "Rec": st.column_config.TextColumn("Rec", width="small"),
                 },
@@ -807,9 +807,9 @@ def show_trades():
                                 )
 
                     with detail_col2:
-                        st.metric("Win Probability Change", f"{trade['delta_V']:+.2%}")
+                        st.metric("Expected Wins Added", f"{trade['ewa']:+.2f}")
                         st.markdown(
-                            f"**Dynasty SGP Change:** {trade['delta_generic']:+.1f}"
+                            f"**SGP Change:** {trade['delta_generic']:+.1f}"
                         )
                         st.markdown(
                             f"**Fairness:** {'✅ Fair' if trade['is_fair'] else '⚠️ Unfair'}"
@@ -1114,15 +1114,15 @@ def _evaluate_custom_trade(send_names: list[str], receive_names: list[str]):
 
     with summary_col1:
         st.markdown("**Trade Summary**")
-        delta_V = result["delta_V"]
-        if delta_V > 0.001:
-            st.success(f"Win Prob Change: +{delta_V:.2%}")
-        elif delta_V < -0.001:
-            st.error(f"Win Prob Change: {delta_V:.2%}")
+        ewa = result["ewa"]
+        if ewa > 0.1:
+            st.success(f"Expected Wins Added: +{ewa:.2f}")
+        elif ewa < -0.1:
+            st.error(f"Expected Wins Added: {ewa:.2f}")
         else:
-            st.info("Win Prob Change: ~0%")
+            st.info("Expected Wins Added: ~0")
 
-        st.markdown(f"Dynasty SGP Change: {result['delta_generic']:+.1f}")
+        st.markdown(f"SGP Change: {result['delta_generic']:+.1f}")
 
         if result["is_fair"]:
             st.success("✅ Fair trade")
@@ -1419,15 +1419,17 @@ def _run_simulation(add_selections, drop_selections, fa_name_map, roster_name_ma
         # Compute before
         old_totals = compute_team_totals(my_roster, projections)
         category_sigmas = estimate_projection_uncertainty(old_totals, opponent_totals)
-        V_before, _ = compute_win_probability(
+        _, diag_before = compute_win_probability(
             old_totals, opponent_totals, category_sigmas
         )
+        ew_before = diag_before["expected_wins"]
 
         # Compute after
         new_totals = compute_team_totals(new_roster, projections)
-        V_after, _ = compute_win_probability(
+        _, diag_after = compute_win_probability(
             new_totals, opponent_totals, category_sigmas
         )
+        ew_after = diag_after["expected_wins"]
 
     # Display results
     st.divider()
@@ -1461,13 +1463,13 @@ def _run_simulation(add_selections, drop_selections, fa_name_map, roster_name_ma
 
     with summary_col1:
         st.markdown("**Impact Summary**")
-        delta_V = V_after - V_before
-        if delta_V > 0.001:
-            st.success(f"Win Prob: {V_before:.1%} → {V_after:.1%} (+{delta_V:.2%})")
-        elif delta_V < -0.001:
-            st.error(f"Win Prob: {V_before:.1%} → {V_after:.1%} ({delta_V:.2%})")
+        ewa = ew_after - ew_before
+        if ewa > 0.1:
+            st.success(f"Expected Wins: {ew_before:.1f} → {ew_after:.1f} (+{ewa:.2f})")
+        elif ewa < -0.1:
+            st.error(f"Expected Wins: {ew_before:.1f} → {ew_after:.1f} ({ewa:.2f})")
         else:
-            st.info(f"Win Prob: {V_before:.1%} → {V_after:.1%} (no change)")
+            st.info(f"Expected Wins: {ew_before:.1f} → {ew_after:.1f} (no change)")
 
     with summary_col2:
         st.markdown("**Players Added:**")

@@ -14,8 +14,6 @@ from tqdm.auto import tqdm
 
 from .data_loader import (
     MY_TEAM_NAME,
-    apply_playing_time_adjustments,
-    compute_dynasty_sgp,
     compute_quality_scores,
     load_projections,
     normalize_name,
@@ -28,6 +26,7 @@ from .fantrax_api import (
     get_player_type,
     test_auth,
 )
+from .mlb_api import fetch_player_ages
 
 # =============================================================================
 # SCHEMA
@@ -39,6 +38,9 @@ CREATE TABLE IF NOT EXISTS players (
     name TEXT PRIMARY KEY,              -- With -H/-P suffix: "Mike Trout-H"
     display_name TEXT NOT NULL,         -- Without suffix: "Mike Trout"
     player_type TEXT NOT NULL,          -- 'hitter' or 'pitcher'
+    
+    -- MLB identifiers
+    mlbamid INTEGER,                    -- MLBAM ID from FanGraphs (for MLB API lookups)
     
     -- Position (from Fantrax API or derived)
     position TEXT NOT NULL,             -- C, 1B, 2B, SS, 3B, OF, DH, SP, RP
@@ -104,6 +106,7 @@ CREATE INDEX IF NOT EXISTS idx_players_owner ON players(owner);
 CREATE INDEX IF NOT EXISTS idx_players_position ON players(position);
 CREATE INDEX IF NOT EXISTS idx_players_sgp ON players(sgp DESC);
 CREATE INDEX IF NOT EXISTS idx_players_player_type ON players(player_type);
+CREATE INDEX IF NOT EXISTS idx_players_mlbamid ON players(mlbamid);
 """
 
 STANDINGS_SCHEMA = """
@@ -136,14 +139,28 @@ CREATE TABLE IF NOT EXISTS standings (
 def initialize_database(db_path: str = "data/optimizer.db") -> None:
     """
     Create database and tables if they don't exist.
+    If schema is outdated, deletes and recreates the database.
     """
-    # Create parent directories if needed
-    Path(db_path).parent.mkdir(parents=True, exist_ok=True)
+    db_file = Path(db_path)
+    db_file.parent.mkdir(parents=True, exist_ok=True)
+
+    # Check if existing database has correct schema
+    if db_file.exists():
+        conn = sqlite3.connect(db_path)
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(players)")
+        existing_columns = {row[1] for row in cursor.fetchall()}
+        conn.close()
+
+        # Required columns - if any missing, delete and recreate
+        required = {"mlbamid", "pa_adjusted", "ip_adjusted"}
+        if not required.issubset(existing_columns):
+            print(f"  Schema outdated, recreating database...")
+            db_file.unlink()
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
-    # Create tables
     cursor.executescript(PLAYERS_SCHEMA)
     cursor.executescript(PLAYERS_INDEXES)
     cursor.executescript(STANDINGS_SCHEMA)
@@ -189,20 +206,22 @@ def sync_fangraphs_to_db(
         projections.iterrows(), total=len(projections), desc="Syncing projections"
     ):
         # Use INSERT ... ON CONFLICT to preserve ownership data (owner, roster_status, age, dynasty_sgp)
+        # NOTE: mlbamid IS updated on conflict - it comes from FanGraphs and is needed for MLB API age lookups
         cursor.execute(
             """
             INSERT INTO players 
-            (name, display_name, player_type, position, team,
+            (name, display_name, player_type, mlbamid, position, team,
              pa, r, hr, rbi, sb, ops,
              ip, w, sv, k, era, whip,
              war, sgp, quality_score, last_updated)
-            VALUES (?, ?, ?, ?, ?,
+            VALUES (?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, ?, ?, ?,
                     ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(name) DO UPDATE SET
                 display_name = excluded.display_name,
                 player_type = excluded.player_type,
+                mlbamid = excluded.mlbamid,
                 -- NOTE: Do NOT update position here! Positions come from Fantrax sync.
                 -- FanGraphs hitter CSV has no position data (defaults to UTIL).
                 -- Overwriting would erase good Fantrax positions.
@@ -228,6 +247,7 @@ def sync_fangraphs_to_db(
                 row["Name"],
                 strip_name_suffix(row["Name"]),
                 row["player_type"],
+                int(row["MLBAMID"]) if pd.notna(row.get("MLBAMID")) else None,
                 row["Position"],
                 row["Team"] if row["Team"] != "FA" else None,
                 int(row["PA"]),
@@ -315,9 +335,15 @@ def sync_fantrax_rosters_to_db(
                 suffix = "-P" if player["player_type"] == "pitcher" else "-H"
                 suffixed_name = raw_name + suffix
 
+            # Map status_id to human-readable status for database storage
+            status_id = player.get("status_id", "")
+            status = {"1": "active", "2": "reserve", "3": "minors", "4": "IR"}.get(
+                status_id, "unknown"
+            )
+
             player_info[suffixed_name] = {
                 "age": player.get("age"),
-                "status": player.get("status"),
+                "status": status,
                 "position": player.get("position"),
             }
 
@@ -374,19 +400,21 @@ def sync_player_pool_to_db(
     db_path: str = "data/optimizer.db",
 ) -> dict[str, int]:
     """
-    Sync age and position from Fantrax player pool to all players in database.
+    Sync positions from Fantrax player pool to all players in database.
 
-    This is critical for:
-    - Ages: Needed for dynasty valuation
-    - Positions: Free agents never get positions from roster sync since
-      FanGraphs hitter CSV has no position column (defaults to UTIL)
+    Why this is needed:
+        - FanGraphs hitter CSV has no position column → defaults to "UTIL"
+        - sync_fantrax_rosters_to_db() only updates ROSTERED players
+        - Free agents (owner IS NULL) never get position updates otherwise
+
+    Note: Ages come from MLB Stats API (sync_ages_to_db), not Fantrax.
 
     Args:
-        player_pool: DataFrame from fetch_player_pool() with name, age, position columns
+        player_pool: DataFrame from fetch_player_pool() with name, position columns
         db_path: Path to SQLite database
 
     Returns:
-        Dict with counts: {"age_updated": N, "position_updated": M, "not_found": K}
+        Dict with counts: {"position_updated": N, "not_found": K}
     """
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
@@ -401,7 +429,6 @@ def sync_player_pool_to_db(
         normalized = normalize_name(actual_name)
         normalized_to_actual[normalized] = actual_name
 
-    age_updated = 0
     position_updated = 0
     not_found = 0
 
@@ -432,28 +459,9 @@ def sync_player_pool_to_db(
             not_found += 1
             continue
 
-        # Get age and position values
-        age = row.get("age")
-        has_age = age is not None and not pd.isna(age)
+        # Only update position (ages come from MLB Stats API)
         has_position = position and not pd.isna(position) and position != ""
-
-        # Build dynamic UPDATE based on available data
-        if has_age and has_position:
-            cursor.execute(
-                "UPDATE players SET age = ?, position = ? WHERE name = ?",
-                (int(age), position, db_name),
-            )
-            if cursor.rowcount > 0:
-                age_updated += 1
-                position_updated += 1
-        elif has_age:
-            cursor.execute(
-                "UPDATE players SET age = ? WHERE name = ?",
-                (int(age), db_name),
-            )
-            if cursor.rowcount > 0:
-                age_updated += 1
-        elif has_position:
+        if has_position:
             cursor.execute(
                 "UPDATE players SET position = ? WHERE name = ?",
                 (position, db_name),
@@ -464,17 +472,93 @@ def sync_player_pool_to_db(
     conn.commit()
     conn.close()
 
-    print(
-        f"Synced player pool: {age_updated} ages, {position_updated} positions updated"
-    )
+    print(f"Synced player pool: {position_updated} positions updated")
     if not_found > 0:
         print(f"  ({not_found} players not found in database)")
 
     return {
-        "age_updated": age_updated,
         "position_updated": position_updated,
         "not_found": not_found,
     }
+
+
+# Dynasty SGP constants (from 01e_dynasty_valuation.md)
+DYNASTY_DISCOUNT_RATE = 0.25
+DYNASTY_PROJECTION_YEARS = 4
+
+HITTER_AGING_FACTORS = {
+    22: 0.0,
+    23: 0.0,
+    24: 0.0,
+    25: 0.0,
+    26: 0.0,
+    27: -0.8,
+    28: -0.9,
+    29: -1.0,
+    30: -1.1,
+    31: -1.2,
+    32: -1.4,
+    33: -1.6,
+    34: -1.8,
+    35: -2.2,
+    36: -2.6,
+    37: -3.0,
+    38: -3.5,
+    39: -4.0,
+    40: -4.5,
+}
+
+PITCHER_AGING_FACTORS = {
+    22: 0.0,
+    23: 0.0,
+    24: 0.0,
+    25: 0.0,
+    26: 0.0,
+    27: 0.0,
+    28: 0.0,
+    29: 0.0,
+    30: 0.0,
+    31: 0.0,
+    32: -0.6,
+    33: -0.8,
+    34: -1.0,
+    35: -1.3,
+    36: -1.6,
+    37: -2.0,
+    38: -2.5,
+    39: -3.0,
+    40: -3.5,
+}
+
+
+def _compute_dynasty_sgp_row(row: pd.Series) -> float:
+    """Compute dynasty SGP for a single player row."""
+    sgp = row["sgp"]
+    age = row["age"]
+    player_type = row["player_type"]
+
+    # If no age, dynasty_sgp = sgp
+    if pd.isna(age):
+        return sgp
+
+    age = int(age)
+    aging_factors = (
+        HITTER_AGING_FACTORS if player_type == "hitter" else PITCHER_AGING_FACTORS
+    )
+
+    dynasty_sgp = 0.0
+    current_sgp = sgp
+
+    for year in range(DYNASTY_PROJECTION_YEARS):
+        discount = 1.0 / ((1 + DYNASTY_DISCOUNT_RATE) ** year)
+        dynasty_sgp += max(0, current_sgp) * discount
+
+        # Apply aging decline for next year
+        future_age = age + year + 1
+        decline = aging_factors.get(future_age, -4.5)  # Default to steep decline
+        current_sgp += decline
+
+    return dynasty_sgp
 
 
 def compute_dynasty_sgp_in_db(db_path: str = "data/optimizer.db") -> int:
@@ -486,21 +570,17 @@ def compute_dynasty_sgp_in_db(db_path: str = "data/optimizer.db") -> int:
     """
     conn = sqlite3.connect(db_path)
 
-    # Query all players with age and sgp
     df = pd.read_sql(
         """
         SELECT name, sgp, age, player_type, position
         FROM players
         WHERE sgp IS NOT NULL
-    """,
+        """,
         conn,
     )
 
-    # Rename columns for compute_dynasty_sgp
-    df = df.rename(columns={"sgp": "SGP", "position": "Position"})
-
     # Compute dynasty SGP
-    df["dynasty_sgp"] = df.apply(compute_dynasty_sgp, axis=1)
+    df["dynasty_sgp"] = df.apply(_compute_dynasty_sgp_row, axis=1)
 
     # Update database
     cursor = conn.cursor()
@@ -509,11 +589,7 @@ def compute_dynasty_sgp_in_db(db_path: str = "data/optimizer.db") -> int:
 
     for _, row in df.iterrows():
         cursor.execute(
-            """
-            UPDATE players 
-            SET dynasty_sgp = ?
-            WHERE name = ?
-        """,
+            "UPDATE players SET dynasty_sgp = ? WHERE name = ?",
             (float(row["dynasty_sgp"]), row["name"]),
         )
 
@@ -596,6 +672,44 @@ def sync_standings_to_db(
 
     print(f"Synced standings for {synced} teams")
     return synced
+
+
+def sync_ages_to_db(ages_df: pd.DataFrame, db_path: str = "data/optimizer.db") -> int:
+    """
+    Sync ages from MLB Stats API to database.
+
+    Args:
+        ages_df: DataFrame from fetch_player_ages() with mlbam_id, age columns
+        db_path: Path to database
+
+    Returns:
+        Number of players updated
+    """
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    updated = 0
+    for _, row in tqdm(ages_df.iterrows(), total=len(ages_df), desc="Syncing ages"):
+        mlbam_id = row.get("mlbam_id")
+        age = row.get("age")
+
+        if mlbam_id is None or pd.isna(mlbam_id):
+            continue
+        if age is None or pd.isna(age):
+            continue
+
+        cursor.execute(
+            "UPDATE players SET age = ? WHERE mlbamid = ?",
+            (int(age), int(mlbam_id)),
+        )
+        if cursor.rowcount > 0:
+            updated += 1
+
+    conn.commit()
+    conn.close()
+
+    print(f"Synced ages for {updated} players from MLB Stats API")
+    return updated
 
 
 # =============================================================================
@@ -709,77 +823,6 @@ def sync_historical_stats_to_db(
     }
 
 
-def compute_adjusted_playing_time_in_db(db_path: str = "data/optimizer.db") -> int:
-    """
-    Compute adjusted playing time (PA/IP) for all players in database.
-
-    Uses the three-factor model from data_loader.apply_playing_time_adjustments():
-    1. Historical PA/IP ratio (strongest predictor)
-    2. Age adjustment (older players overprojected)
-    3. Talent adjustment (weaker players overprojected)
-
-    Blend: 65% projection + 35% adjustment (empirically optimal)
-
-    Returns:
-        Number of players with adjusted playing time computed
-    """
-    conn = sqlite3.connect(db_path)
-
-    # Query all players with required columns
-    df = pd.read_sql(
-        """
-        SELECT 
-            name as Name,
-            player_type,
-            position as Position,
-            pa as PA,
-            ip as IP,
-            age,
-            sgp as SGP,
-            pa_actual_2024,
-            pa_actual_2023,
-            ip_actual_2024,
-            ip_actual_2023
-        FROM players
-        WHERE sgp IS NOT NULL
-        """,
-        conn,
-    )
-
-    if len(df) == 0:
-        print("No players found in database")
-        conn.close()
-        return 0
-
-    # Apply adjustments using the function from data_loader
-    df_adjusted = apply_playing_time_adjustments(df)
-
-    # Update database
-    cursor = conn.cursor()
-    updated = 0
-
-    for _, row in df_adjusted.iterrows():
-        cursor.execute(
-            """
-            UPDATE players 
-            SET pa_adjusted = ?, ip_adjusted = ?
-            WHERE name = ?
-            """,
-            (
-                int(row["PA_adjusted"]) if row["PA_adjusted"] > 0 else None,
-                float(row["IP_adjusted"]) if row["IP_adjusted"] > 0 else None,
-                row["Name"],
-            ),
-        )
-        updated += 1
-
-    conn.commit()
-    conn.close()
-
-    print(f"Computed adjusted playing time for {updated} players")
-    return updated
-
-
 # =============================================================================
 # QUERY FUNCTIONS
 # =============================================================================
@@ -812,6 +855,7 @@ def get_projections(
             team as Team,
             position as Position,
             player_type,
+            mlbamid as MLBAMID,
             pa as PA,
             r as R,
             hr as HR,
@@ -999,30 +1043,31 @@ def refresh_all_data(
     pitcher_proj_path: str = "data/fangraphs-steamer-projections-pitchers.csv",
     db_path: str = "data/optimizer.db",
     skip_fantrax: bool = False,
+    skip_mlb_api: bool = False,
 ) -> dict:
     """
-    Complete data refresh: FanGraphs + Fantrax → database.
+    Complete data refresh: FanGraphs + MLB API + Fantrax → database.
 
     This is the MAIN ENTRY POINT for loading data.
 
     Pipeline:
         1. Initialize database (create tables if needed)
-        2. Load FanGraphs projections (computes SGP, quality_score)
-        3. Sync projections to database
+        2. Load FanGraphs projections → sync to database
+        3. Fetch ages from MLB Stats API → sync to database
         4. If not skip_fantrax:
-           a. Create Fantrax session
-           b. Fetch all Fantrax data (rosters, standings, player pool)
-           c. Sync rosters to database (updates ownership)
-           d. Sync player pool to database (ages + positions)
-           e. Compute dynasty_sgp for all players
-           f. Sync standings to database
-        5. Return data from database queries
+           a. Fetch Fantrax data (rosters, standings, player pool)
+           b. Sync rosters (ownership)
+           c. Sync player pool (positions)
+           d. Sync standings
+        5. Compute dynasty_sgp for all players
+        6. Return data from database queries
 
     Args:
         hitter_proj_path: Path to FanGraphs hitter projections CSV
         pitcher_proj_path: Path to FanGraphs pitcher projections CSV
         db_path: Path to SQLite database
         skip_fantrax: If True, skip Fantrax API calls (use existing DB data)
+        skip_mlb_api: If True, skip MLB Stats API call for ages
 
     Returns:
         {
@@ -1046,32 +1091,41 @@ def refresh_all_data(
     print("\nStep 3: Syncing projections to database...")
     sync_fangraphs_to_db(projections, db_path)
 
+    # Step 4: Fetch ages from MLB Stats API
+    if not skip_mlb_api:
+        print("\nStep 4: Fetching ages from MLB Stats API...")
+        # Get all valid MLBAM IDs from projections
+        mlbam_ids = projections["MLBAMID"].dropna().astype(int).tolist()
+        if len(mlbam_ids) > 0:
+            ages_df = fetch_player_ages(mlbam_ids)
+            sync_ages_to_db(ages_df, db_path)
+        else:
+            print("  Skipped - no MLBAM IDs in projections")
+    else:
+        print("\nStep 4: Skipping MLB Stats API call (using existing DB data)")
+
     if not skip_fantrax:
-        # Step 4: Fetch Fantrax data
-        print("\nStep 4: Fetching Fantrax data...")
+        # Step 5: Fetch Fantrax data
+        print("\nStep 5: Fetching Fantrax data...")
         session = create_session()
         assert test_auth(session), "Fantrax authentication failed - update cookies"
 
         fantrax_data = fetch_all_fantrax_data(session)
 
-        # Step 5: Sync rosters
-        print("\nStep 5: Syncing rosters to database...")
+        # Step 6: Sync rosters
+        print("\nStep 6: Syncing rosters to database...")
         sync_fantrax_rosters_to_db(
             fantrax_data["roster_sets"],
             fantrax_data["rosters"],
             db_path,
         )
 
-        # Step 6: Sync ages and positions from player pool
-        print("\nStep 6: Syncing ages and positions from player pool...")
+        # Step 7: Sync positions from player pool
+        print("\nStep 7: Syncing positions from player pool...")
         if len(fantrax_data["player_pool"]) > 0:
             sync_player_pool_to_db(fantrax_data["player_pool"], db_path)
         else:
             print("  Skipped - player pool is empty")
-
-        # Step 7: Compute dynasty values (requires age data)
-        print("\nStep 7: Computing dynasty values...")
-        compute_dynasty_sgp_in_db(db_path)
 
         # Step 8: Sync standings
         print("\nStep 8: Syncing standings...")
@@ -1079,7 +1133,11 @@ def refresh_all_data(
     else:
         print("\nSkipping Fantrax API calls (using existing DB data)")
 
-    # Step 9: Return data from database
+    # Step 9: Compute dynasty values (requires age data)
+    print("\nStep 9: Computing dynasty values...")
+    compute_dynasty_sgp_in_db(db_path)
+
+    # Step 10: Return data from database
     print("\n=== Refresh Complete ===")
 
     # Query fresh data from database

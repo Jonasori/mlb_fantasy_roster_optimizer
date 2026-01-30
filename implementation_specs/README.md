@@ -258,9 +258,9 @@ These bugs were discovered during implementation and are documented here to prev
 **Fix:** Use `maxResultsPerPage=5000` in a single request. Don't paginate.
 
 ### 3. Trade Expendability Formula Sign Error
-**Problem:** Formula `-(SGP + delta_V_lose * scale)` made stars MORE expendable.  
-**Bug:** `delta_V_lose` is negative when losing hurts → double negative flipped the logic.  
-**Fix:** Use `-SGP + delta_V_lose * scale` (no outer negation on the lose cost term).
+**Problem:** Formula `-(SGP + ewa_lose * scale)` made stars MORE expendable.  
+**Bug:** `ewa_lose` is negative when losing hurts → double negative flipped the logic.  
+**Fix:** Use `-SGP + ewa_lose * scale` (no outer negation on the lose cost term).
 
 ### 4. Marimo Output vs Return
 **Problem:** Using `return mo.vstack(...)` caused syntax errors.  
@@ -268,17 +268,17 @@ These bugs were discovered during implementation and are documented here to prev
 **Fix:** Make display the last expression, use `return (var,)` only for exports.
 
 ### 5. Trade Targets with Zero Value
-**Problem:** "Best" trade target had +0.000 win probability value.  
+**Problem:** "Best" trade target had +0.00 EWA value.  
 **Bug:** No filter for positive-value players before sorting.  
-**Fix:** Filter to `delta_V_acquire > 0.001` before ranking targets.
+**Fix:** Filter to `ewa_acquire > 0.01` before ranking targets.
 
 ### 6. Defensive Programming in Notebook
 **Problem:** Cells had `if data is not None` checks everywhere.  
 **Bug:** Silent failures hid real problems; code was 50 lines longer.  
 **Fix:** Use assertions with clear messages. Fail fast, don't defend.
 
-### 7. WPA Calculation for Adds
-**Problem:** Each add's WPA was computed after removing ALL dropped players.  
+### 7. EWA Calculation for Adds
+**Problem:** Each add's EWA was computed after removing ALL dropped players.  
 **Bug:** Every add looked equally bad (adding one player to a gutted roster).  
 **Fix:** Evaluate each add in ISOLATION: "what if I add just this player to my current roster?"
 

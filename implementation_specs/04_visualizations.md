@@ -747,8 +747,8 @@ def plot_player_value_scatter(
     """
     Scatter plot of player values: generic vs contextual.
     
-    X-axis: generic_value (context-free, z-score sum)
-    Y-axis: delta_V_acquire (contextual, win probability impact)
+    X-axis: generic_value (SGP, context-free)
+    Y-axis: ewa_acquire (contextual, expected wins impact)
     
     Point styling:
         - My roster: filled circles

@@ -7,10 +7,8 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     import marimo as mo
-    refresh = mo.ui.refresh(
-      label="Refresh",
-      options=["1m", "10m", "1hr"]
-    )
+
+    refresh = mo.ui.refresh(label="Refresh", options=["1m", "10m", "1hr"])
     return mo, refresh
 
 
@@ -124,16 +122,15 @@ def config():
 
     # File paths for FanGraphs CSVs (input to database)
     DATA_DIR = "data/"
-    HITTER_PROJ_PATH = DATA_DIR + "fangraphs-steamer-projections-hitters.csv"
-    PITCHER_PROJ_PATH = DATA_DIR + "fangraphs-steamer-projections-pitchers.csv"
+    HITTER_PROJ_PATH = DATA_DIR + "fangraphs-atc-projections-hitters.csv"
+    PITCHER_PROJ_PATH = DATA_DIR + "fangraphs-atc-projections-pitchers.csv"
     DB_PATH = DATA_DIR + "optimizer.db"
 
     # =======================================================
-    # CONFIGURATION: Set to False to fetch roster data from Fantrax
+    # CONFIGURATION FLAGS
     # =======================================================
-    # First run: Set SKIP_FANTRAX = False to load rosters
-    # Subsequent runs: Set SKIP_FANTRAX = True to use cached data
-    SKIP_FANTRAX = True  # <-- CHANGE THIS TO False TO LOAD ROSTERS
+    SKIP_FANTRAX = True  # Set False to fetch rosters from Fantrax API
+    SKIP_MLB_API = True  # Set True to skip MLB API age fetching (faster)
     # =======================================================
 
     # Check if cookies exist
@@ -150,10 +147,20 @@ def config():
         SKIP_FANTRAX = True
     elif SKIP_FANTRAX:
         print("ℹ️  SKIP_FANTRAX=True — using cached database data")
-        print("   Set SKIP_FANTRAX=False to refresh from Fantrax API")
     else:
         print("✅ Fantrax cookies found — will fetch fresh roster data")
-    return DB_PATH, HITTER_PROJ_PATH, PITCHER_PROJ_PATH, SKIP_FANTRAX
+
+    if SKIP_MLB_API:
+        print("ℹ️  SKIP_MLB_API=True — using cached ages")
+    else:
+        print("✅ Will fetch ages from MLB Stats API")
+    return (
+        DB_PATH,
+        HITTER_PROJ_PATH,
+        PITCHER_PROJ_PATH,
+        SKIP_FANTRAX,
+        SKIP_MLB_API,
+    )
 
 
 @app.cell
@@ -162,17 +169,19 @@ def load_data(
     HITTER_PROJ_PATH,
     PITCHER_PROJ_PATH,
     SKIP_FANTRAX,
+    SKIP_MLB_API,
     mo,
     refresh_all_data,
 ):
     mo.md("## Data Loading")
 
-    # Refresh all data: FanGraphs + Fantrax API → database
+    # Refresh all data: FanGraphs + MLB API + Fantrax → database
     data = refresh_all_data(
         hitter_proj_path=HITTER_PROJ_PATH,
         pitcher_proj_path=PITCHER_PROJ_PATH,
         db_path=DB_PATH,
         skip_fantrax=SKIP_FANTRAX,
+        skip_mlb_api=SKIP_MLB_API,
     )
 
     # Extract what we need (all from database queries)
@@ -183,6 +192,12 @@ def load_data(
     print(f"\nProjections: {len(projections)} players")
     print(f"My roster: {len(my_roster_names)} players")
     print(f"Opponents: {len(opponent_rosters)} teams")
+
+    # Check age coverage
+    with_age = projections["age"].notna().sum()
+    print(
+        f"Players with age: {with_age}/{len(projections)} ({100 * with_age / len(projections):.0f}%)"
+    )
 
     if len(my_roster_names) == 0:
         print("\n⚠️  No roster data! Set SKIP_FANTRAX=False in the config cell above.")

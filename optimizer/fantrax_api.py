@@ -12,8 +12,8 @@ import requests
 from tqdm.auto import tqdm
 
 from .data_loader import (
+    FANTRAX_ACTIVE_STATUS_IDS,
     FANTRAX_LEAGUE_ID,
-    FANTRAX_STATUS_MAP,
     FANTRAX_TEAM_IDS,
 )
 
@@ -202,7 +202,7 @@ def fetch_team_roster(session: requests.Session, team_id: str) -> list[dict]:
                     "name": scorer.get("name"),
                     "position": pos,
                     "team": scorer.get("teamShortName"),
-                    "status": FANTRAX_STATUS_MAP.get(status_id, "unknown"),
+                    "status_id": status_id,  # Raw ID: "1"=active, "2"=reserve, "3"=minors, "4"=IR
                     "player_type": get_player_type(pos),
                     "age": get_cell(0),
                     "adp": get_cell(2, as_float=True),
@@ -551,7 +551,7 @@ def extract_roster_sets(
 
         for player in players:
             # Skip non-active players (minors, IR)
-            if player["status"] not in ("active", "reserve"):
+            if player["status_id"] not in FANTRAX_ACTIVE_STATUS_IDS:
                 continue
 
             name = player["name"]

@@ -36,6 +36,56 @@ def test_import_data_loader():
     assert "C" in SLOT_ELIGIBILITY
 
 
+def test_import_mlb_api():
+    """MLB Stats API module is importable."""
+    from optimizer.mlb_api import fetch_player_ages
+
+    assert callable(fetch_player_ages)
+
+
+def test_fetch_player_ages_real_api():
+    """Fetch player ages from real MLB Stats API."""
+    from optimizer.mlb_api import fetch_player_ages
+
+    # Known MLBAM IDs: Shohei Ohtani, Mike Trout, Aaron Judge
+    test_ids = [660271, 545361, 592450]
+
+    df = fetch_player_ages(test_ids)
+
+    # Should return DataFrame with correct columns
+    assert set(df.columns) == {"mlbam_id", "name", "birth_date", "age"}
+
+    # Should have 3 rows
+    assert len(df) == 3
+
+    # All IDs should be present
+    assert set(df["mlbam_id"].tolist()) == set(test_ids)
+
+    # All ages should be positive integers
+    assert df["age"].dtype in [np.int64, int, "int64"]
+    assert (df["age"] > 0).all()
+
+    # Verify known player names
+    names = df["name"].tolist()
+    assert "Shohei Ohtani" in names
+    assert "Mike Trout" in names
+    assert "Aaron Judge" in names
+
+
+def test_fetch_player_ages_deduplicates():
+    """Duplicate IDs are handled correctly."""
+    from optimizer.mlb_api import fetch_player_ages
+
+    # Pass same ID multiple times
+    test_ids = [660271, 660271, 660271]
+
+    df = fetch_player_ages(test_ids)
+
+    # Should return only 1 unique player
+    assert len(df) == 1
+    assert df.iloc[0]["name"] == "Shohei Ohtani"
+
+
 def test_import_roster_optimizer():
     """Roster optimizer exports are importable."""
     from optimizer.roster_optimizer import (
