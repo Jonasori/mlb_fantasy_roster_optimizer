@@ -8,6 +8,20 @@ This document defines all league configuration constants and shared utility func
 
 ---
 
+## Cross-References
+
+**Depends on:** [00_agent_guidelines.md](00_agent_guidelines.md) for code style
+
+**Used by:**
+- [01b_fangraphs_loading.md](01b_fangraphs_loading.md) — imports constants and `compute_sgp_value()`
+- [01c_fantrax_api.md](01c_fantrax_api.md) — imports `FANTRAX_LEAGUE_ID`, `FANTRAX_TEAM_IDS`, status map
+- [01d_database.md](01d_database.md) — imports constants for schema validation
+- [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — imports slot eligibility, roster bounds
+- [03_trade_engine.md](03_trade_engine.md) — imports `compute_team_totals()`, `estimate_projection_uncertainty()`
+- [04_visualizations.md](04_visualizations.md) — imports category lists, `NEGATIVE_CATEGORIES`
+
+---
+
 ## League Configuration
 
 ```python

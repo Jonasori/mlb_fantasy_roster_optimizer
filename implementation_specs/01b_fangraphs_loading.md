@@ -8,6 +8,19 @@ This document specifies loading FanGraphs Steamer projections. FanGraphs is the 
 
 ---
 
+## Cross-References
+
+**Depends on:**
+- [00_agent_guidelines.md](00_agent_guidelines.md) — code style, fail-fast philosophy
+- [01a_config.md](01a_config.md) — `compute_sgp_value()`, category constants
+
+**Used by:**
+- [01d_database.md](01d_database.md) — `load_projections()` output synced to database
+- [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — `compute_team_totals()`, `compute_quality_scores()`
+- [03_trade_engine.md](03_trade_engine.md) — `compute_team_totals()` for win probability
+
+---
+
 ## Why FanGraphs?
 
 | Data | FanGraphs | Fantrax |

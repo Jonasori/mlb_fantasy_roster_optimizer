@@ -8,18 +8,101 @@ This document specifies the Fantrax API integration for fetching live roster, st
 
 ---
 
+## Cross-References
+
+**Depends on:**
+- [00_agent_guidelines.md](00_agent_guidelines.md) — code style, no try/except
+- [01a_config.md](01a_config.md) — `FANTRAX_LEAGUE_ID`, `FANTRAX_TEAM_IDS`, `FANTRAX_STATUS_MAP`
+
+**Used by:**
+- [01d_database.md](01d_database.md) — `fetch_all_fantrax_data()` synced to database
+- [01e_dynasty_valuation.md](01e_dynasty_valuation.md) — age data from `fetch_player_pool()`
+
+---
+
+## ⚠️ Critical: getPlayerStats Pagination is Broken
+
+**DO NOT attempt to paginate `getPlayerStats`.** The API ignores all pagination parameters. Use `maxResultsPerPage=5000` in a single request (see `fetch_player_pool()` implementation below).
+
+---
+
 ## What Fantrax Provides
 
 | Data | Available | Endpoint | Notes |
 |------|-----------|----------|-------|
 | **Rosters** | ✅ | `getTeamRosterInfo` | All 7 teams with full player data |
 | **Position** | ✅ | Both | C, 1B, 2B, SS, 3B, OF, SP, RP (from `posShortNames`) |
-| **Age** | ✅ | Both endpoints | For all ~9,718 players |
-| **Standings** | ✅ | `getStandings` | Live category ranks/values |
-| **ADP** | ✅ | Both | Average Draft Position |
-| **Projections** | ⚠️ | Rostered only | Missing PA, WAR → use FanGraphs |
+| **Age** | ✅ | Both | In `cells` array (roster[0], pool[2]) |
+| **Standings** | ✅ | `getStandings` | Live category ranks/values in `tableList` |
+| **ADP** | ✅ | Both | Average Draft Position in `cells` |
+| **Fantrax Score** | ✅ | `getPlayerStats` | League-specific value formula |
+| **% Rostered** | ✅ | `getPlayerStats` | Current + trend |
+| **Rookie Status** | ✅ | Both | `scorer.rookie` boolean |
+| **Minors Eligible** | ✅ | Both | `scorer.minorsEligible` boolean |
+| **Waiver Order** | ✅ | `getStandings` | In Point Totals table cells[2] |
+| **Projected Stats** | ✅ | `getTeamRosterInfo` | AB, H, R, HR, RBI, SB, OPS for rostered players |
+| **Full Projections** | ⚠️ | N/A | Missing PA, WAR, pitching → use FanGraphs |
 
 **Key insight:** Fantrax API provides positions directly (`posShortNames` field). This eliminates the need for an external position database for roster data.
+
+**API Robustness:** The Fantrax API is undocumented and response structures vary unpredictably.
+
+**Critical lessons learned:**
+
+1. **Type checking is mandatory** - Never assume a value is a dict. Check with `isinstance(x, dict)` before calling `.get()`. The API returns strings, lists, or dicts depending on context.
+
+2. **Key name variations** - The same data appears under different keys:
+   - Tables: `tables` OR `tableList`
+   - Team ID: `id` OR `teamId`
+   - Team name: `name` OR `teamName`
+   - Rank: `rank` OR `position` OR `overallRank`
+   - Points: `fpts` OR `totalPoints` OR `pts`
+
+3. **Nested vs flat structures** - Team data may be:
+   - Nested: `row["team"]["name"]`
+   - Flat: `row["teamName"]`
+   - Mixed: varies by endpoint
+
+4. **Empty/null handling** - Players can have `None` names (empty roster slots), fields can be missing entirely.
+
+5. **Error responses** - Check for `pageError` key before accessing `data`:
+   ```python
+   if "pageError" in resp0 and "data" not in resp0:
+       # Handle error, return empty result
+   ```
+
+6. **`getPlayerStats` pagination is BROKEN** - Use `maxResultsPerPage=5000` in a single request (see `fetch_player_pool()`).
+
+7. **Two-way players already have -H/-P suffix** - Fantrax returns some player names with the suffix already attached. **Do NOT add another suffix** or you'll create names like "Shohei Ohtani-H-H" that won't match the database. Always check `if name.endswith("-H") or name.endswith("-P")` before adding a suffix.
+
+**Defensive parsing pattern:**
+```python
+def _parse_team_row(row, index: int) -> dict | None:
+    if not isinstance(row, dict):
+        return None
+    team_data = row.get("team", row)
+    if not isinstance(team_data, dict):
+        team_data = row
+    # ... extract fields with fallbacks
+```
+
+**Critical: Data is in `cells` array, not direct fields!**
+
+The API returns row data in a `cells` array. Use `tableHeader.cells` to understand column meanings.
+
+### Cell Mapping Reference
+
+**`getPlayerStats` (Player Pool):** cells[0]=Rank, cells[1]=Status, cells[2]=Age, cells[3]=Score, cells[4-7]=Drafted/ADP/Rostered/Trend
+
+**`getTeamRosterInfo` (Roster):** cells[0]=Age, cells[1-2]=Drafted/ADP, cells[3-10]=AB/H/R/HR/RBI/SB/OPS/GP (projected stats)
+
+**`getStandings`:** Table 2 (Point Totals) has cells[0]=Points, cells[2]=Waiver Order, cells[3-16]=Category values. Category tables (6-15) have cells[0]=Rank, cells[3]=Team info, cells[4]=Stat value.
+
+**Scorer object fields:** `rookie`, `minorsEligible`, `scorerId`, `posIds`, `icons`
+
+**Row fields:** `statusId` (roster status), `eligiblePosIds`, `posId` (current slot)
+
+Always check `isinstance(x, dict)` before calling `.get()` on cell values.
 
 ---
 
@@ -49,29 +132,28 @@ The league is private. Requires cookies from browser session.
 ## Configuration
 
 ```python
+import json
 from pathlib import Path
+
+import pandas as pd
 import requests
+from tqdm.auto import tqdm
 
 # Import league constants from data_loader (single source of truth)
 from .data_loader import (
     FANTRAX_LEAGUE_ID,
-    MY_TEAM_NAME,
-    MY_TEAM_ID,
-    FANTRAX_TEAM_IDS,
     FANTRAX_STATUS_MAP,
+    FANTRAX_TEAM_IDS,
 )
 
 COOKIE_FILE = Path("data/fantrax_cookies.json")
 FANTRAX_API_URL = "https://www.fantrax.com/fxpa/req"
 
-# Known name corrections: Fantrax spelling → FanGraphs spelling
-# Applied BEFORE adding -H/-P suffix
+# Exceptional name corrections for cases that normalization can't handle
+# Most matching uses normalize_name() from data_loader - this is for true edge cases only
 FANTRAX_NAME_CORRECTIONS = {
-    "Julio Rodriguez": "Julio Rodríguez",
-    "Ronald Acuna Jr.": "Ronald Acuña Jr.",
-    "Luis Garcia": "Luis García",
-    "Logan OHoppe": "Logan O'Hoppe",
-    "Leodalis De Vries": "Leo De Vries",
+    "Logan OHoppe": "Logan O'Hoppe",  # Missing apostrophe
+    "Leodalis De Vries": "Leo De Vries",  # Completely different first name
 }
 ```
 
@@ -117,6 +199,78 @@ response = session.post(
         ]
     }
 )
+```
+
+---
+
+## Observed Response Structures
+
+**Note:** These are based on actual API observations. The API is undocumented and may change.
+
+### Top-level response
+```python
+{
+    "data": {...},           # Metadata (not the main data!)
+    "roles": ["02"],
+    "pageError": {...},      # Present on errors
+    "responses": [           # Main data is here
+        {
+            "data": {...},   # The actual response data
+            "pageError": {...}  # Or error info
+        }
+    ]
+}
+```
+
+### Error response (e.g., expired cookies)
+```python
+{
+    "responses": [
+        {
+            "pageError": {
+                "code": "NOT_MEMBER_OF_LEAGUE",
+                "title": "Not Member of League / League not Found",
+                ...
+            }
+            # Note: NO "data" key when there's an error
+        }
+    ]
+}
+```
+
+### getStandings response (observed keys)
+```python
+# responses[0]["data"] contains:
+{
+    "goBackDays": ...,
+    "fantasyTeamInfo": [...],    # Can be list of strings OR dicts!
+    "displayedSelections": ...,
+    "miscData": ...,
+    "tableList": [...],          # Note: "tableList" not "tables"
+    "displayedLists": ...
+}
+```
+
+### getTeamRosterInfo response
+```python
+# responses[0]["data"] contains:
+{
+    "tables": [  # Or "tableList"
+        {
+            "rows": [
+                {
+                    "scorer": {
+                        "name": "Mike Trout",
+                        "posShortNames": "OF",
+                        "teamShortName": "LAA",
+                        "age": 32
+                    },
+                    "statusId": "1"  # Maps via FANTRAX_STATUS_MAP
+                }
+            ]
+        }
+    ]
+}
 ```
 
 ---
@@ -189,20 +343,26 @@ def fetch_team_roster(session: requests.Session, team_id: str) -> list[dict]:
     API: getTeamRosterInfo with view="STATS"
     
     Returns list of player dicts with:
-        name, position, team (MLB team), status, player_type
+        name, position, team (MLB team), status, player_type, age
     
     Implementation:
-        response = session.post(
-            FANTRAX_API_URL,
-            params={"leagueId": FANTRAX_LEAGUE_ID},
-            json={"msgs": [{"method": "getTeamRosterInfo", 
-                           "data": {"leagueId": FANTRAX_LEAGUE_ID, "teamId": team_id, "view": "STATS"}}]}
-        )
+        1. Check for pageError before accessing data
+        2. Try both "tables" and "tableList" keys
+        3. Player info is under row["scorer"]
         
-        data = response.json()["responses"][0]["data"]
+        full_response = response.json()
+        resp0 = full_response.get("responses", [{}])[0]
+        
+        # Check for API errors
+        if "pageError" in resp0 and "data" not in resp0:
+            print(f"WARNING: Roster API error: {resp0['pageError'].get('code')}")
+            return []
+        
+        data = resp0.get("data", {})
+        tables = data.get("tables", []) or data.get("tableList", [])
         
         players = []
-        for table in data.get("tables", []):
+        for table in tables:
             for row in table.get("rows", []):
                 scorer = row.get("scorer", {})
                 pos = scorer.get("posShortNames", "")
@@ -210,8 +370,9 @@ def fetch_team_roster(session: requests.Session, team_id: str) -> list[dict]:
                     "name": scorer.get("name"),
                     "position": pos,
                     "team": scorer.get("teamShortName"),
-                    "status": FANTRAX_STATUS_MAP.get(row.get("statusId"), "unknown"),
-                    "player_type": "pitcher" if pos in ("SP", "RP") else "hitter",
+                    "status": FANTRAX_STATUS_MAP.get(str(row.get("statusId", "")), "unknown"),
+                    "player_type": get_player_type(pos),
+                    "age": scorer.get("age"),
                 })
         return players
     """
@@ -242,8 +403,22 @@ def fetch_standings(session: requests.Session) -> pd.DataFrame:
         r, hr, rbi, sb, ops, w, sv, k, era, whip,  # Category values
         r_rank, hr_rank, ...                        # Category ranks (1-7)
     
+    Implementation:
+        Uses helper functions for clean separation:
+        - _empty_standings_df() - returns consistent empty DataFrame
+        - _parse_team_row(row, index) - extracts team data with type checking
+        - _parse_standings_data(data) - tries structures in priority order
+        
+        Structure priority (first match wins):
+        1. tableList[] with tableId="standings" (most complete, has category data)
+        2. "fantasyTeamInfo" key (common fallback, basic team info only)
+        3. Any table with team/teamId in rows (last resort)
+        
+        CRITICAL: Always check isinstance(x, dict) before .get() calls.
+        The API returns strings in some contexts where dicts are expected.
+    
     Print:
-        "Standings (7 teams):"
+        "Standings ({N} teams):"
         "  1. {team} - {points} pts"
     """
 
@@ -253,23 +428,29 @@ def fetch_player_pool(
     max_results: int | None = None,
 ) -> pd.DataFrame:
     """
-    Fetch ALL players in Fantrax database.
+    Fetch players from Fantrax database.
     
-    API: getPlayerStats (paginated)
+    API: getPlayerStats (single request, max 5000 players)
+    
+    ⚠️ CRITICAL: Pagination parameters are ignored. Use `maxResultsPerPage=5000` in a single request.
     
     Args:
-        max_results: Limit total players (None = all ~9,718)
+        max_results: Limit total players (None = 5000, the API max)
     
     Returns DataFrame with columns:
         name, position, mlb_team, age, adp, pct_rostered,
         fantrax_rank, fantrax_score, is_free_agent
     
-    Use this for:
-        - Player ages (for ALL players including free agents)
-        - ADP data
-        - Ownership status
+    Implementation:
+        Single request with maxResultsPerPage=5000 (max allowed).
+        The API reports 9,719 total but only 5,000 are fetchable.
+        This is sufficient since rostered players come from fetch_all_rosters()
+        and bottom ~4,700 players have Fantrax score = 0.
     
-    Print: "Fetched {N} players from Fantrax"
+    Print:
+        "Fetching player pool from Fantrax..."
+        "  API reports {N} total players (fetching top {M})"
+        "  Fetched {N} players"
     """
 ```
 
@@ -293,11 +474,16 @@ def extract_roster_sets(
     
     Implementation:
         For each player:
-            1. Apply name corrections if enabled (BEFORE suffix)
-            2. Determine suffix from player_type
-            3. Combine: name + suffix
-        
-        Filter to active/reserve status only (not minors/IR).
+            1. Skip if status not in ("active", "reserve") — excludes minors/IR
+            2. Skip if name is None — handles empty roster slots
+            3. Apply name corrections if enabled (BEFORE suffix)
+            4. Check if name already ends with -H or -P (two-way players)
+            5. If NOT already suffixed, add suffix from player_type
+            6. Add to name set
+            
+        ⚠️ CRITICAL: Fantrax returns two-way players with suffix already attached!
+        Example: "Shohei Ohtani-H" (hitter slot), "Shohei Ohtani-P" (pitcher slot)
+        If you add another suffix, you get "Shohei Ohtani-H-H" which won't match the database.
     
     Print:
         "Extracted roster sets for 7 teams"
@@ -328,19 +514,32 @@ def fetch_all_fantrax_data(session: requests.Session) -> dict:
 
 ---
 
-## Name Correction Flow
+## Name Matching Strategy
 
-Name corrections must happen BEFORE adding the `-H/-P` suffix:
+**Principle**: Use `normalize_name()` for matching, not a correction dictionary.
+
+The `normalize_name()` function (in `data_loader.py`) handles:
+- Accented characters: `Rodríguez` → `rodriguez`
+- Suffixes: `Jr.`, `Sr.`, `II`, `III` → removed
+- Case: lowercased
+- Preserves -H/-P suffix
+
+**Matching flow in `sync_fantrax_rosters_to_db`**:
 
 ```
-Fantrax: "Julio Rodriguez"
-    ↓ Apply FANTRAX_NAME_CORRECTIONS
-Corrected: "Julio Rodríguez"  
-    ↓ Add suffix based on position
-Final: "Julio Rodríguez-H"
+1. Build lookup from DB: normalized_name → actual_name
+   "eugenio suarez-h" → "Eugenio Suárez-H"
+
+2. For each Fantrax player:
+   Fantrax: "Eugenio Suarez-H"
+       ↓ normalize_name()
+   Normalized: "eugenio suarez-h"
+       ↓ Lookup in normalized_to_actual
+   DB name: "Eugenio Suárez-H"
 ```
 
-This ensures the suffixed name matches FanGraphs projections.
+The `FANTRAX_NAME_CORRECTIONS` dict is only for truly exceptional cases
+where names are fundamentally different (not just accent variations).
 
 ---
 

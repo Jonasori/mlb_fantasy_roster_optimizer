@@ -9,6 +9,23 @@ A SQLite database serves as the **primary source of truth** for all player data.
 
 ---
 
+## Cross-References
+
+**Depends on:**
+- [00_agent_guidelines.md](00_agent_guidelines.md) — code style
+- [01a_config.md](01a_config.md) — constants for validation
+- [01b_fangraphs_loading.md](01b_fangraphs_loading.md) — `load_projections()` output to sync
+- [01c_fantrax_api.md](01c_fantrax_api.md) — `fetch_all_fantrax_data()` output to sync
+- [01e_dynasty_valuation.md](01e_dynasty_valuation.md) — `compute_dynasty_sgp()` for dynasty values
+
+**Used by:**
+- [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — `get_projections()`, `get_roster_names()`
+- [03_trade_engine.md](03_trade_engine.md) — `get_projections()`, `get_roster_names()`
+- [05_notebook_integration.md](05_notebook_integration.md) — `refresh_all_data()` entry point
+- [06_streamlit_dashboard.md](06_streamlit_dashboard.md) — `refresh_all_data()` entry point
+
+---
+
 ## Design Philosophy
 
 1. **Database is primary** — All data queries pull from the database
@@ -142,9 +159,19 @@ def sync_fangraphs_to_db(
         Number of players synced
     
     Implementation:
-        INSERT OR REPLACE with FanGraphs columns.
-        This creates new players and updates projection data.
-        Preserves Fantrax columns (age, owner) if row already exists.
+        Use INSERT ... ON CONFLICT(name) DO UPDATE to:
+        - Create new players if they don't exist
+        - Update only projection columns (pa, r, hr, etc.) for existing players
+        - PRESERVE Fantrax columns (owner, roster_status, age, dynasty_sgp)
+        - PRESERVE position column (do NOT overwrite with FanGraphs position)
+        
+        CRITICAL: Do NOT use INSERT OR REPLACE - it deletes and recreates
+        the row, wiping out ownership data.
+        
+        CRITICAL: Do NOT update position in ON CONFLICT clause! FanGraphs
+        hitter CSV has no position data (defaults to UTIL). Overwriting
+        would erase good Fantrax positions. Positions should only be set
+        on initial INSERT, then updated by sync_player_pool_to_db().
     
     Print: "Synced {N} FanGraphs projections to database"
     """
@@ -183,31 +210,48 @@ def sync_fantrax_rosters_to_db(
     """
 ```
 
-### Sync Player Pool (Ages)
+### Sync Player Pool (Ages + Positions)
 
 ```python
-def sync_player_ages_to_db(
+def sync_player_pool_to_db(
     player_pool: pd.DataFrame,
     db_path: str = "data/optimizer.db",
-) -> int:
+) -> dict[str, int]:
     """
-    Sync ages from Fantrax player pool to existing players.
+    Sync age and position from Fantrax player pool to all players in database.
+    
+    This is critical for:
+    - Ages: Needed for dynasty valuation
+    - Positions: Free agents never get positions from roster sync since
+      FanGraphs hitter CSV has no position column (defaults to UTIL)
     
     Args:
-        player_pool: DataFrame from fetch_player_pool() with name, age columns
+        player_pool: DataFrame from fetch_player_pool() with name, age, position columns
         db_path: Path to SQLite database
     
     Returns:
-        Number of players with age updated
+        Dict with counts: {"age_updated": N, "position_updated": M, "not_found": K}
     
     Implementation:
-        For each player in player_pool:
-            - Add -H or -P suffix based on position
-            - UPDATE players SET age = ... WHERE name = suffixed_name
-        
+        1. Build normalized name lookup from database (handles accents, etc.)
+        2. Single pass through player_pool:
+           - Apply name corrections
+           - Add -H or -P suffix based on player_type
+           - Match to database via normalized name
+           - UPDATE players SET age = ?, position = ? WHERE name = db_name
+           
         Only updates existing rows (doesn't create new players).
+        Updates both age and position in a single query when both are available.
     
-    Print: "Updated age for {N} players"
+    Why this is needed:
+        - FanGraphs hitter CSV has no position column → defaults to "UTIL"
+        - sync_fantrax_rosters_to_db() only updates ROSTERED players
+        - Free agents (owner IS NULL) never get position updates otherwise
+        - This function syncs BOTH ages and positions for ALL players
+    
+    Print: 
+        "Synced player pool: {N} ages, {M} positions updated"
+        "  ({K} players not found in database)" (if any)
     """
 ```
 
@@ -334,7 +378,7 @@ def refresh_all_data(
            a. Create Fantrax session
            b. Fetch all Fantrax data (rosters, standings, player pool)
            c. Sync rosters to database (updates ownership)
-           d. Sync ages from player pool
+           d. Sync player pool to database (ages + positions)
            e. Compute dynasty_sgp for all players
            f. Sync standings to database
         5. Return data from database queries
@@ -355,11 +399,14 @@ def refresh_all_data(
     
     Print:
         "=== Data Refresh Pipeline ==="
-        "Step 1: Loading FanGraphs projections..."
-        "Step 2: Syncing to database..."
-        "Step 3: Fetching Fantrax data..."
-        "Step 4: Syncing rosters..."
-        "Step 5: Computing dynasty values..."
+        "Step 1: Initializing database..."
+        "Step 2: Loading FanGraphs projections..."
+        "Step 3: Syncing projections to database..."
+        "Step 4: Fetching Fantrax data..."
+        "Step 5: Syncing rosters to database..."
+        "Step 6: Syncing ages and positions from player pool..."
+        "Step 7: Computing dynasty values..."
+        "Step 8: Syncing standings..."
         "=== Refresh Complete ==="
     """
 ```
@@ -404,6 +451,18 @@ assert with_sgp == player_count, "All players should have SGP"
 
 with_age = pd.read_sql("SELECT COUNT(*) as n FROM players WHERE age IS NOT NULL", conn).iloc[0, 0]
 print(f"Players with age data: {with_age}/{player_count}")
+
+# Position validation: most hitters should have real positions, not UTIL
+hitter_count = pd.read_sql(
+    "SELECT COUNT(*) as n FROM players WHERE player_type = 'hitter'", conn
+).iloc[0, 0]
+util_count = pd.read_sql(
+    "SELECT COUNT(*) as n FROM players WHERE player_type = 'hitter' AND position = 'UTIL'", conn
+).iloc[0, 0]
+util_pct = util_count / hitter_count * 100
+print(f"Hitters with UTIL position: {util_count}/{hitter_count} ({util_pct:.1f}%)")
+# After position sync, UTIL should be <60% (only minor leaguers not in Fantrax top 5000)
+assert util_pct < 60, f"Too many UTIL hitters ({util_pct:.1f}%) - position sync may have failed"
 
 conn.close()
 ```

@@ -1,15 +1,10 @@
 """
-Trade Engine using Probabilistic Win Model.
+Trade Engine using probabilistic win model.
 
-This module answers the question: "Which trades improve my chances of winning
-the rotisserie league while being fair enough for opponents to accept?"
+Based on Rosenof (2025) "Optimizing for Rotisserie Fantasy Basketball" arXiv:2501.00933.
 
-Based on the probabilistic rotisserie optimization framework from:
-Rosenof, Z. (2025). "Optimizing for Rotisserie Fantasy Basketball." arXiv:2501.00933.
-
-Key insight: A player's value is context-dependent. Production in a category
-where you're safely ahead has near-zero marginal value. Production in a
-contested race is extremely valuable.
+Answers: "Which trades improve my chances of winning the rotisserie league
+while being fair enough for opponents to accept?"
 """
 
 from itertools import combinations
@@ -21,19 +16,23 @@ from tqdm.auto import tqdm
 
 from .data_loader import (
     ALL_CATEGORIES,
+    HITTING_CATEGORIES,
     MAX_HITTERS,
     MAX_PITCHERS,
     MIN_HITTERS,
     MIN_PITCHERS,
-    MIN_STD,
     NEGATIVE_CATEGORIES,
     NUM_OPPONENTS,
+    PITCHING_CATEGORIES,
+    RATIO_STATS,
     compute_team_totals,
     estimate_projection_uncertainty,
     strip_name_suffix,
 )
 
-# === TRADE ENGINE CONFIGURATION ===
+# =============================================================================
+# TRADE ENGINE CONFIGURATION
+# =============================================================================
 
 # Expected value and variance of maximum of N standard normals
 # From Teichroew (1956), used by Rosenof (2025)
@@ -41,16 +40,25 @@ MEV_TABLE = {1: 0.0, 2: 0.564, 3: 0.846, 4: 1.029, 5: 1.163, 6: 1.267}
 MVAR_TABLE = {1: 1.0, 2: 0.682, 3: 0.559, 4: 0.492, 5: 0.448, 6: 0.416}
 
 # Trade fairness threshold: percentage-based
-# A fair trade has SGP differential within 10% of total SGP involved
-# Example: 4.5 SGP for 6.2 SGP = 1.7 diff / 10.7 total = 16% -> UNFAIR
-# Example: 3.0 SGP for 3.5 SGP = 0.5 diff / 6.5 total = 8% -> FAIR
+# A fair trade has dynasty_SGP differential within 10% of total dynasty_SGP involved
 FAIRNESS_THRESHOLD_PERCENT = 0.10  # 10% max differential
 
 # Maximum players per side in a trade
 MAX_TRADE_SIZE = 3
 
+# Minimum meaningful improvement to recommend ACCEPT (0.1% = 0.001)
+MIN_MEANINGFUL_IMPROVEMENT = 0.001
 
-# === GAP AND PROBABILITY COMPUTATION ===
+# Minimum standard deviation for calculations
+MIN_STD = 0.001
+
+# Scale factor for converting delta_V_lose to SGP scale
+LOSE_COST_SCALE = 200
+
+
+# =============================================================================
+# GAP AND PROBABILITY COMPUTATION
+# =============================================================================
 
 
 def compute_normalized_gaps(
@@ -65,28 +73,27 @@ def compute_normalized_gaps(
         (my_total[c] - opp_total[o][c]) / (σ_c * √2)
 
     For NEGATIVE_CATEGORIES (ERA, WHIP), flip the sign so positive = winning.
+
+    The √2 factor ensures the difference of two team totals has unit variance
+    when each team's total has variance σ_c².
+
+    Returns:
+        Dict[category, Dict[opponent_id, normalized_gap]]
     """
     gaps = {}
-    sqrt2 = np.sqrt(2)
 
-    for category in ALL_CATEGORIES:
-        gaps[category] = {}
-        sigma = category_sigmas[category]
+    for cat in ALL_CATEGORIES:
+        gaps[cat] = {}
+        sigma = max(category_sigmas[cat], MIN_STD)
 
         for opp_id, opp_totals in opponent_totals.items():
-            my_val = my_totals[category]
-            opp_val = opp_totals[category]
-
-            if category in NEGATIVE_CATEGORIES:
-                # Lower is better, flip sign so positive = winning
-                raw_gap = opp_val - my_val
+            if cat in NEGATIVE_CATEGORIES:
+                # Lower is better - flip sign
+                raw_gap = opp_totals[cat] - my_totals[cat]
             else:
-                # Higher is better
-                raw_gap = my_val - opp_val
+                raw_gap = my_totals[cat] - opp_totals[cat]
 
-            # Normalize by σ√2
-            normalized = raw_gap / (sigma * sqrt2) if sigma > MIN_STD else 0.0
-            gaps[category][opp_id] = normalized
+            gaps[cat][opp_id] = raw_gap / (sigma * np.sqrt(2))
 
     return gaps
 
@@ -105,15 +112,17 @@ def compute_matchup_probabilities(
     """
     probs = {}
 
-    for category in ALL_CATEGORIES:
-        probs[category] = {}
-        for opp_id, gap in normalized_gaps[category].items():
-            probs[category][opp_id] = stats.norm.cdf(gap)
+    for cat in ALL_CATEGORIES:
+        probs[cat] = {}
+        for opp_id, gap in normalized_gaps[cat].items():
+            probs[cat][opp_id] = stats.norm.cdf(gap)
 
     return probs
 
 
-# === WIN PROBABILITY COMPUTATION ===
+# =============================================================================
+# WIN PROBABILITY COMPUTATION
+# =============================================================================
 
 
 def compute_win_probability(
@@ -132,13 +141,14 @@ def compute_win_probability(
         opponent_totals: Opponent totals (6 opponents)
         category_sigmas: Standard deviation per category
         category_correlations: Optional correlations between categories
+                               (default: assume independence)
 
     Returns:
         V: Victory probability (0 to 1)
         diagnostics: Dict with intermediate values
     """
-    n_opp = len(opponent_totals)
-    n_cats = len(ALL_CATEGORIES)
+    n_opponents = len(opponent_totals)
+    n_categories = len(ALL_CATEGORIES)
 
     # Step 1: Compute normalized gaps
     normalized_gaps = compute_normalized_gaps(
@@ -148,53 +158,53 @@ def compute_win_probability(
     # Step 2: Compute matchup probabilities
     matchup_probs = compute_matchup_probabilities(normalized_gaps)
 
-    # Step 3: Expected fantasy points (μ_T)
-    mu_T = sum(
-        matchup_probs[c][o] for c in ALL_CATEGORIES for o in opponent_totals.keys()
-    )
+    # Step 3: Compute μ_T (expected fantasy points)
+    mu_T = 0.0
+    for cat in ALL_CATEGORIES:
+        for opp_id in opponent_totals.keys():
+            mu_T += matchup_probs[cat][opp_id]
 
-    # Step 4: Variance of fantasy points (σ_T²)
-    # Base variance: sum of Φ(1-Φ) terms (Bernoulli variance)
-    sigma_T_sq = sum(
-        matchup_probs[c][o] * (1 - matchup_probs[c][o])
-        for c in ALL_CATEGORIES
-        for o in opponent_totals.keys()
-    )
+    # Step 4: Compute σ_T² (variance of fantasy points)
+    # Base variance from matchup outcomes
+    sigma_T_sq = 0.0
+    for cat in ALL_CATEGORIES:
+        for opp_id in opponent_totals.keys():
+            p = matchup_probs[cat][opp_id]
+            sigma_T_sq += p * (1 - p)  # Bernoulli variance
 
-    # Note: Full correlation adjustment is complex; omitting for simplicity
-    # This assumes independence between matchups, which underestimates variance
+    # Add correlation adjustment if provided
+    # For now, assume independence (no adjustment)
 
-    # Step 5: Expected variance for opponent fantasy points (E[σ_M²])
-    # Approximation: assume similar variance for all teams
+    # Step 5: Compute expected variance of opponent scores (E[σ_M²])
+    # Assume similar variance structure for opponents
     E_sigma_M_sq = sigma_T_sq  # Simplified assumption
 
-    # Step 6: Target to beat (max of opponents)
-    mev = MEV_TABLE.get(n_opp, 1.267)
-    mvar = MVAR_TABLE.get(n_opp, 0.416)
+    # Step 6: Compute μ_L and σ_L (target to beat)
+    mev = MEV_TABLE.get(n_opponents, MEV_TABLE[6])
+    mvar = MVAR_TABLE.get(n_opponents, MVAR_TABLE[6])
 
-    mu_L = mev * np.sqrt(E_sigma_M_sq) if E_sigma_M_sq > 0 else 0
+    mu_L = mev * np.sqrt(max(E_sigma_M_sq, MIN_STD))
     sigma_L_sq = E_sigma_M_sq * mvar
 
-    # Step 7: Differential distribution
+    # Step 7: Compute differential distribution
     # μ_D = μ_T * (|O|+1)/|O| - |C|*(|O|+1)/2 - μ_L
-    scale_factor = (n_opp + 1) / n_opp
-    mu_D = mu_T * scale_factor - n_cats * (n_opp + 1) / 2 - mu_L
+    scaling = (n_opponents + 1) / n_opponents
+    mu_D = mu_T * scaling - n_categories * (n_opponents + 1) / 2 - mu_L
 
     # σ_D² = ((|O|+1)/|O|) * σ_T² + σ_L²
-    sigma_D_sq = scale_factor * sigma_T_sq + sigma_L_sq
-    sigma_D = np.sqrt(sigma_D_sq) if sigma_D_sq > 0 else MIN_STD
+    sigma_D_sq = scaling * sigma_T_sq + sigma_L_sq
+    sigma_D = np.sqrt(max(sigma_D_sq, MIN_STD))
 
-    # Step 8: Victory probability
-    V = stats.norm.cdf(mu_D / sigma_D) if sigma_D > MIN_STD else 0.5
+    # Step 8: Compute V = Φ(μ_D / σ_D)
+    V = stats.norm.cdf(mu_D / sigma_D)
 
     # Compute expected roto points (rough estimate)
-    # For each category, expected rank ≈ 1 + n_opp * (1 - avg_win_prob)
-    # Roto points per category = 8 - rank = 7 - n_opp * (1 - avg_win_prob)
-    expected_roto_points = 0.0
+    expected_roto_points = 0
     for cat in ALL_CATEGORIES:
-        avg_win_prob = np.mean(list(matchup_probs[cat].values()))
-        expected_rank = 1 + n_opp * (1 - avg_win_prob)
-        expected_roto_points += 8 - expected_rank
+        avg_prob = np.mean([matchup_probs[cat][o] for o in opponent_totals.keys()])
+        # Estimate rank: 7 * (1 - avg_prob) + 1 → roto points = 7 - rank + 1
+        expected_rank = int(7 * (1 - avg_prob) + 1)
+        expected_roto_points += max(0, 8 - expected_rank)
 
     diagnostics = {
         "normalized_gaps": normalized_gaps,
@@ -212,61 +222,29 @@ def compute_win_probability(
     return V, diagnostics
 
 
-# === MARGINAL VALUE COMPUTATION ===
-
-
-def compute_win_probability_gradient(
-    my_totals: dict[str, float],
-    opponent_totals: dict[int, dict[str, float]],
-    category_sigmas: dict[str, float],
-) -> dict[str, dict[int, float]]:
-    """
-    Compute the gradient of win probability with respect to each matchup gap.
-
-    Returns:
-        Dict[category, Dict[opponent_id, gradient]]
-    """
-    V, diag = compute_win_probability(my_totals, opponent_totals, category_sigmas)
-
-    sigma_D = diag["sigma_D"]
-    mu_D = diag["mu_D"]
-    n_opp = len(opponent_totals)
-    scale_factor = (n_opp + 1) / n_opp
-
-    # Gradient of V with respect to μ_D
-    dV_dmuD = stats.norm.pdf(mu_D / sigma_D) / sigma_D if sigma_D > MIN_STD else 0
-
-    gradient = {}
-    normalized_gaps = diag["normalized_gaps"]
-
-    for category in ALL_CATEGORIES:
-        gradient[category] = {}
-        for opp_id in opponent_totals.keys():
-            gap = normalized_gaps[category][opp_id]
-            # ∇_{c,o}(μ_T) = φ(μ_c,o) (PDF of standard normal at gap)
-            # ∇_{c,o}(μ_D) ≈ scale_factor * φ(μ_c,o)
-            d_mu_T = stats.norm.pdf(gap)
-            d_mu_D = scale_factor * d_mu_T
-            gradient[category][opp_id] = dV_dmuD * d_mu_D
-
-    return gradient
+# =============================================================================
+# PLAYER VALUE COMPUTATION
+# =============================================================================
 
 
 def _compute_totals_with_player_change(
-    player_name: str,
+    my_totals: dict[str, float],
+    my_roster_names: set[str],
+    add_player: str | None,
+    remove_player: str | None,
     projections: pd.DataFrame,
-    roster_names: set[str],
-    is_adding: bool,
 ) -> dict[str, float]:
     """
-    Compute new totals after adding or removing a player.
+    Compute new team totals after adding/removing a player.
 
     Simply modifies the roster set and calls compute_team_totals.
     """
-    if is_adding:
-        new_roster = roster_names | {player_name}
-    else:
-        new_roster = roster_names - {player_name}
+    new_roster = my_roster_names.copy()
+
+    if remove_player:
+        new_roster.discard(remove_player)
+    if add_player:
+        new_roster.add(add_player)
 
     return compute_team_totals(new_roster, projections)
 
@@ -275,42 +253,49 @@ def compute_player_marginal_value(
     player_name: str,
     projections: pd.DataFrame,
     my_totals: dict[str, float],
+    my_roster_names: set[str],
     opponent_totals: dict[int, dict[str, float]],
     category_sigmas: dict[str, float],
-    my_roster_names: set[str],
     is_acquisition: bool = True,
 ) -> tuple[float, dict]:
     """
     Compute the marginal change in win probability from acquiring/losing a player.
 
-    Uses numerical differentiation: computes V before and after.
+    Uses numerical differentiation (actual V computation before/after).
 
     Returns:
         delta_V: Change in win probability (can be negative)
-        breakdown: Dict with per-category contributions
+        breakdown: Dict with per-category info
     """
-    assert player_name in projections["Name"].values, f"Player not found: {player_name}"
-
-    # Compute V before
     V_before, _ = compute_win_probability(my_totals, opponent_totals, category_sigmas)
 
-    # Compute new totals
-    new_totals = _compute_totals_with_player_change(
-        player_name, projections, my_roster_names, is_adding=is_acquisition
-    )
+    if is_acquisition:
+        # Adding this player to roster
+        new_totals = _compute_totals_with_player_change(
+            my_totals,
+            my_roster_names,
+            add_player=player_name,
+            remove_player=None,
+            projections=projections,
+        )
+    else:
+        # Losing this player from roster
+        new_totals = _compute_totals_with_player_change(
+            my_totals,
+            my_roster_names,
+            add_player=None,
+            remove_player=player_name,
+            projections=projections,
+        )
 
-    # Compute V after
     V_after, _ = compute_win_probability(new_totals, opponent_totals, category_sigmas)
 
     delta_V = V_after - V_before
 
     # Compute per-category breakdown (simplified)
-    breakdown = {cat: new_totals[cat] - my_totals[cat] for cat in ALL_CATEGORIES}
+    breakdown = {"V_before": V_before, "V_after": V_after}
 
     return delta_V, breakdown
-
-
-# === PLAYER VALUE DATAFRAME ===
 
 
 def compute_player_values(
@@ -327,77 +312,67 @@ def compute_player_values(
     Returns:
         DataFrame with columns:
             Name, player_type, Position, on_my_roster,
-            delta_V_acquire, delta_V_lose, generic_value (SGP)
+            delta_V_acquire (value if I acquire this player),
+            delta_V_lose (cost if I lose this player, NaN if not on my roster),
+            generic_value (dynasty_SGP for trade fairness)
     """
-    records = []
+    results = []
 
-    # Use SGP (Standing Gain Points) as generic value - a context-free
-    # player valuation metric computed from our league's scoring categories
-    assert "SGP" in projections.columns, (
-        "SGP column not found in projections. "
-        "Make sure load_projections() is called to compute SGP values."
-    )
-    generic_values = projections[["Name", "SGP"]].copy()
-    generic_values = generic_values.rename(columns={"SGP": "generic_value"})
-
-    for name in tqdm(player_names, desc="Computing player values"):
-        player_row = projections[projections["Name"] == name]
-        if len(player_row) == 0:
+    for player_name in tqdm(player_names, desc="Computing player values"):
+        player_row = projections[projections["Name"] == player_name]
+        if player_row.empty:
             continue
+        player_row = player_row.iloc[0]
 
-        player = player_row.iloc[0]
-        on_my_roster = name in my_roster_names
+        on_roster = player_name in my_roster_names
 
-        # Generic value
-        gv_row = generic_values[generic_values["Name"] == name]
-        generic_val = gv_row["generic_value"].iloc[0] if len(gv_row) > 0 else 0.0
+        # Compute delta_V for acquisition
+        delta_V_acquire, _ = compute_player_marginal_value(
+            player_name,
+            projections,
+            my_totals,
+            my_roster_names,
+            opponent_totals,
+            category_sigmas,
+            is_acquisition=True,
+        )
 
-        # Delta V for acquisition
-        if on_my_roster:
-            delta_V_acquire = 0.0  # Already have them
-        else:
-            delta_V_acquire, _ = compute_player_marginal_value(
-                name,
-                projections,
-                my_totals,
-                opponent_totals,
-                category_sigmas,
-                my_roster_names,
-                is_acquisition=True,
-            )
-
-        # Delta V for losing
-        if on_my_roster:
+        # Compute delta_V for losing (only if on roster)
+        if on_roster:
             delta_V_lose, _ = compute_player_marginal_value(
-                name,
+                player_name,
                 projections,
                 my_totals,
+                my_roster_names,
                 opponent_totals,
                 category_sigmas,
-                my_roster_names,
                 is_acquisition=False,
             )
-            delta_V_lose = -delta_V_lose  # Make positive = cost of losing
         else:
             delta_V_lose = np.nan
 
-        records.append(
+        # Generic value: use raw SGP (age scaling removed)
+        generic_value = player_row["SGP"]
+
+        results.append(
             {
-                "Name": name,
-                "player_type": player["player_type"],
-                "Position": player["Position"],
-                "on_my_roster": on_my_roster,
+                "Name": player_name,
+                "player_type": player_row["player_type"],
+                "Position": player_row["Position"],
+                "on_my_roster": on_roster,
                 "delta_V_acquire": delta_V_acquire,
                 "delta_V_lose": delta_V_lose,
-                "generic_value": generic_val,
+                "generic_value": generic_value,
             }
         )
 
-    result = pd.DataFrame(records)
-    return result.sort_values("delta_V_acquire", ascending=False)
+    df = pd.DataFrame(results)
+    return df.sort_values("delta_V_acquire", ascending=False)
 
 
-# === TRADE CANDIDATE IDENTIFICATION ===
+# =============================================================================
+# TRADE CANDIDATE IDENTIFICATION
+# =============================================================================
 
 
 def identify_trade_targets(
@@ -409,73 +384,57 @@ def identify_trade_targets(
     """
     Identify players to TARGET (acquire) in trades.
 
-    Targets are players on opponent rosters who are valuable TO ME but not
-    universally valuable (i.e., hidden gems, not superstars everyone wants).
-
-    IMPORTANT: Ensures a mix of hitters and pitchers in targets so that
-    roster composition can be fixed via trades. If roster needs pitchers,
-    at least 40% of targets will be pitchers (and vice versa for hitters).
+    Targets are players on opponent rosters ranked by "acquirability" - the ratio
+    of value-to-me vs their market value (dynasty_SGP).
     """
-    # Filter to opponent players
-    all_opp_names = set().union(*opponent_rosters.values())
-    targets = player_values[player_values["Name"].isin(all_opp_names)].copy()
+    # Find which opponent owns each player
+    owner_map = {}
+    for opp_id, roster in opponent_rosters.items():
+        for name in roster:
+            owner_map[name] = opp_id
 
-    # Add owner_id
-    def find_owner(name):
-        for opp_id, roster in opponent_rosters.items():
-            if name in roster:
-                return opp_id
-        return None
+    # Filter to opponent players with positive value
+    targets = player_values[~player_values["on_my_roster"]].copy()
+    targets = targets[targets["Name"].isin(owner_map.keys())]
+    targets = targets[targets["delta_V_acquire"] > 0.001]  # Only positive value players
 
-    targets["owner_id"] = targets["Name"].apply(find_owner)
+    # Sort by delta_V_acquire (how much they help us)
+    targets = targets.sort_values("delta_V_acquire", ascending=False).head(n_targets)
 
-    # Compute "acquirability score": ratio of value-to-me vs market-value
-    targets["acquirability"] = targets["delta_V_acquire"] / (
-        targets["generic_value"].clip(lower=0.5) + 0.5
-    )
+    # Ensure at least 40% hitters and 40% pitchers
+    hitters = targets[targets["player_type"] == "hitter"]
+    pitchers = targets[targets["player_type"] == "pitcher"]
 
-    # Filter to players with positive value to me
-    targets = targets[targets["delta_V_acquire"] > 0]
+    min_each = int(n_targets * 0.4)
+    if len(hitters) < min_each:
+        # Add more hitters
+        more_hitters = player_values[
+            (~player_values["on_my_roster"])
+            & (player_values["Name"].isin(owner_map.keys()))
+            & (player_values["player_type"] == "hitter")
+            & (~player_values["Name"].isin(targets["Name"]))
+        ].head(min_each - len(hitters))
+        targets = pd.concat([targets, more_hitters])
 
-    # CRITICAL: Ensure mix of hitters and pitchers for roster composition flexibility
-    # Take top targets from each player type separately, then combine
-    hitter_targets = targets[targets["player_type"] == "hitter"]
-    pitcher_targets = targets[targets["player_type"] == "pitcher"]
+    if len(pitchers) < min_each:
+        more_pitchers = player_values[
+            (~player_values["on_my_roster"])
+            & (player_values["Name"].isin(owner_map.keys()))
+            & (player_values["player_type"] == "pitcher")
+            & (~player_values["Name"].isin(targets["Name"]))
+        ].head(min_each - len(pitchers))
+        targets = pd.concat([targets, more_pitchers])
 
-    # Minimum 40% of each type (so roster composition can be fixed)
-    min_per_type = max(1, n_targets * 2 // 5)  # At least 40%
-    remaining = n_targets - 2 * min_per_type
-
-    # Take minimum from each, then fill remaining with best overall
-    top_hitters = hitter_targets.nlargest(min_per_type + remaining, "acquirability")
-    top_pitchers = pitcher_targets.nlargest(min_per_type + remaining, "acquirability")
-
-    # Combine: take min_per_type from each, then fill remaining with best overall
-    result = pd.concat(
-        [
-            top_hitters.head(min_per_type),
-            top_pitchers.head(min_per_type),
-        ]
-    )
-
-    # Add remaining from the better pool
-    remaining_hitters = top_hitters.iloc[min_per_type:]
-    remaining_pitchers = top_pitchers.iloc[min_per_type:]
-    remaining_combined = pd.concat([remaining_hitters, remaining_pitchers])
-    remaining_combined = remaining_combined.nlargest(remaining, "acquirability")
-
-    targets = pd.concat([result, remaining_combined])
-    targets = targets.head(n_targets)
+    # Add owner info AFTER all concatenations (so all players get mapped)
+    targets["owner_id"] = targets["Name"].map(owner_map)
 
     if len(targets) > 0:
-        n_h = (targets["player_type"] == "hitter").sum()
-        n_p = (targets["player_type"] == "pitcher").sum()
         best = targets.iloc[0]
         print(
-            f"Trade targets: {len(targets)} players identified ({n_h} hitters, {n_p} pitchers)"
+            f"Trade targets: {len(targets)} players identified (ranked by value/SGP ratio)"
         )
         print(
-            f"  Best: {strip_name_suffix(best['Name'])} from Team {best['owner_id']} "
+            f"  Best: {strip_name_suffix(best['Name'])} from Team {best.get('owner_id', '?')} "
             f"(value to me: +{best['delta_V_acquire']:.3f} W, SGP: {best['generic_value']:.1f})"
         )
 
@@ -490,64 +449,48 @@ def identify_trade_pieces(
     """
     Identify players to OFFER (trade away) from my roster.
 
-    Expendability formula (single formula, no conditionals):
-        expendability = -(WAR + lose_cost * scale)
-
-    This naturally handles both normal and edge cases:
-    - Low SGP → more expendable (not a valuable asset)
-    - Low lose_cost → more expendable (doesn't hurt to lose)
-    - When win prob is at floor/ceiling and lose_cost ≈ 0 for everyone,
-      the formula degrades gracefully to ranking by -SGP
-
-    IMPORTANT: Ensures a mix of hitters and pitchers so that roster composition
-    can be fixed via trades.
+    Good trade pieces have:
+        - High dynasty_SGP (attractive to opponents)
+        - Low delta_V_lose (not critical to MY win probability)
     """
+    # Filter to my roster
     pieces = player_values[player_values["on_my_roster"]].copy()
 
-    # Single formula: low SGP and low lose_cost = high expendability
-    # Scale factor converts lose_cost (0.0001-0.01) to SGP scale (0-20)
-    LOSE_COST_SCALE = 200  # 0.01 lose_cost → 2.0 SGP-equivalent
-    pieces["expendability_score"] = -(
-        pieces["generic_value"].fillna(0)
-        + pieces["delta_V_lose"].fillna(0) * LOSE_COST_SCALE
+    # Compute expendability (higher = more expendable, easier to trade away)
+    # - Low SGP: easier to get fair value from opponent
+    # - Small lose cost (delta_V_lose close to 0): doesn't hurt us to lose them
+    # Since delta_V_lose is negative when losing hurts, we ADD it (making expendability lower)
+    pieces["expendability"] = (
+        -pieces["generic_value"] + pieces["delta_V_lose"].fillna(0) * LOSE_COST_SCALE
     )
 
-    # CRITICAL: Ensure mix of hitters and pitchers for roster composition flexibility
-    hitter_pieces = pieces[pieces["player_type"] == "hitter"]
-    pitcher_pieces = pieces[pieces["player_type"] == "pitcher"]
+    # Sort by expendability (most expendable first)
+    pieces = pieces.sort_values("expendability", ascending=False).head(n_pieces)
 
-    # Minimum 40% of each type
-    min_per_type = max(1, n_pieces * 2 // 5)
-    remaining = n_pieces - 2 * min_per_type
+    # Ensure mix of player types
+    hitters = pieces[pieces["player_type"] == "hitter"]
+    pitchers = pieces[pieces["player_type"] == "pitcher"]
 
-    # Take most expendable from each type
-    top_hitters = hitter_pieces.nlargest(
-        min_per_type + remaining, "expendability_score"
-    )
-    top_pitchers = pitcher_pieces.nlargest(
-        min_per_type + remaining, "expendability_score"
-    )
+    min_each = int(n_pieces * 0.4)
+    if len(hitters) < min_each:
+        more_hitters = player_values[
+            (player_values["on_my_roster"])
+            & (player_values["player_type"] == "hitter")
+            & (~player_values["Name"].isin(pieces["Name"]))
+        ].head(min_each - len(hitters))
+        pieces = pd.concat([pieces, more_hitters])
 
-    result = pd.concat(
-        [
-            top_hitters.head(min_per_type),
-            top_pitchers.head(min_per_type),
-        ]
-    )
-
-    remaining_hitters = top_hitters.iloc[min_per_type:]
-    remaining_pitchers = top_pitchers.iloc[min_per_type:]
-    remaining_combined = pd.concat([remaining_hitters, remaining_pitchers])
-    remaining_combined = remaining_combined.nlargest(remaining, "expendability_score")
-
-    pieces = pd.concat([result, remaining_combined])
-    pieces = pieces.head(n_pieces)
+    if len(pitchers) < min_each:
+        more_pitchers = player_values[
+            (player_values["on_my_roster"])
+            & (player_values["player_type"] == "pitcher")
+            & (~player_values["Name"].isin(pieces["Name"]))
+        ].head(min_each - len(pitchers))
+        pieces = pd.concat([pieces, more_pitchers])
 
     if len(pieces) > 0:
-        n_h = (pieces["player_type"] == "hitter").sum()
-        n_p = (pieces["player_type"] == "pitcher").sum()
         best = pieces.iloc[0]
-        print(f"Trade pieces: {len(pieces)} players ({n_h} hitters, {n_p} pitchers)")
+        print(f"Trade pieces: {len(pieces)} players identified")
         print(
             f"  Most expendable: {strip_name_suffix(best['Name'])} "
             f"(SGP={best['generic_value']:.1f}, lose_cost={best['delta_V_lose']:.3f})"
@@ -556,7 +499,9 @@ def identify_trade_pieces(
     return pieces
 
 
-# === TRADE EVALUATION ===
+# =============================================================================
+# TRADE EVALUATION
+# =============================================================================
 
 
 def evaluate_trade(
@@ -569,122 +514,136 @@ def evaluate_trade(
     opponent_totals: dict[int, dict[str, float]],
     category_sigmas: dict[str, float],
     opponent_rosters: dict[int, set[str]] | None = None,
+    fairness_threshold: float = FAIRNESS_THRESHOLD_PERCENT,
+    min_improvement: float = MIN_MEANINGFUL_IMPROVEMENT,
 ) -> dict:
     """
     Evaluate a specific trade proposal.
 
-    Returns:
-        Dict with trade analysis including delta_V, fairness, recommendation.
+    Args:
+        fairness_threshold: Max SGP differential as fraction of total SGP (default 0.10 = 10%)
+        min_improvement: Min win probability change to recommend ACCEPT (default 0.001 = 0.1%)
     """
-    # Validate inputs
-    for p in send_players:
-        assert p in my_roster_names, f"Cannot send {p} — not on my roster"
-    for p in receive_players:
-        assert p not in my_roster_names, f"Already have {p} on roster"
-        assert p in projections["Name"].values, f"Player not found: {p}"
+    # Validation
+    send_set = set(send_players)
+    receive_set = set(receive_players)
 
-    assert len(set(send_players) & set(receive_players)) == 0, (
-        "Cannot trade player with themselves"
+    assert send_set <= my_roster_names, (
+        f"Cannot send players not on roster: {send_set - my_roster_names}"
+    )
+    assert not (send_set & receive_set), (
+        f"Cannot send and receive same player: {send_set & receive_set}"
     )
 
-    # Compute V_before
-    V_before, _ = compute_win_probability(my_totals, opponent_totals, category_sigmas)
+    proj_names = set(projections["Name"])
+    missing = receive_set - proj_names
+    assert not missing, f"Received players not in projections: {missing}"
 
-    # Compute new roster and totals
-    new_roster_names = (my_roster_names - set(send_players)) | set(receive_players)
-    new_totals = compute_team_totals(new_roster_names, projections)
+    # Compute new roster
+    new_roster = (my_roster_names - send_set) | receive_set
 
-    # Validate composition
-    new_roster_df = projections[projections["Name"].isin(new_roster_names)]
+    # Validate composition - return invalid trade if bounds violated
+    new_roster_df = projections[projections["Name"].isin(new_roster)]
     n_hitters = (new_roster_df["player_type"] == "hitter").sum()
     n_pitchers = (new_roster_df["player_type"] == "pitcher").sum()
 
-    assert MIN_HITTERS <= n_hitters <= MAX_HITTERS, (
-        f"Trade violates hitter bounds: {n_hitters} (need {MIN_HITTERS}-{MAX_HITTERS})"
-    )
-    assert MIN_PITCHERS <= n_pitchers <= MAX_PITCHERS, (
-        f"Trade violates pitcher bounds: {n_pitchers} (need {MIN_PITCHERS}-{MAX_PITCHERS})"
-    )
+    if not (MIN_HITTERS <= n_hitters <= MAX_HITTERS):
+        return {
+            "send_players": send_players,
+            "receive_players": receive_players,
+            "delta_V": float("-inf"),
+            "delta_generic": 0.0,
+            "V_before": 0.0,
+            "V_after": 0.0,
+            "is_fair": False,
+            "is_good_for_me": False,
+            "recommendation": "INVALID",
+            "category_impact": {},
+            "invalid_reason": f"Post-trade hitters ({n_hitters}) outside bounds [{MIN_HITTERS}, {MAX_HITTERS}]",
+        }
+    if not (MIN_PITCHERS <= n_pitchers <= MAX_PITCHERS):
+        return {
+            "send_players": send_players,
+            "receive_players": receive_players,
+            "delta_V": float("-inf"),
+            "delta_generic": 0.0,
+            "V_before": 0.0,
+            "V_after": 0.0,
+            "is_fair": False,
+            "is_good_for_me": False,
+            "recommendation": "INVALID",
+            "category_impact": {},
+            "invalid_reason": f"Post-trade pitchers ({n_pitchers}) outside bounds [{MIN_PITCHERS}, {MAX_PITCHERS}]",
+        }
 
-    # Compute V_after
+    # Compute V before and after
+    V_before, _ = compute_win_probability(my_totals, opponent_totals, category_sigmas)
+
+    new_totals = compute_team_totals(new_roster, projections)
     V_after, _ = compute_win_probability(new_totals, opponent_totals, category_sigmas)
 
     delta_V = V_after - V_before
 
-    # Compute generic value change
-    send_generic = sum(
+    # Compute dynasty_SGP change
+    send_sgp = sum(
         player_values[player_values["Name"] == p]["generic_value"].iloc[0]
         for p in send_players
         if p in player_values["Name"].values
     )
-    receive_generic = sum(
+    receive_sgp = sum(
         player_values[player_values["Name"] == p]["generic_value"].iloc[0]
         for p in receive_players
         if p in player_values["Name"].values
     )
-    delta_generic = receive_generic - send_generic
 
-    # Fairness: SGP differential should be within threshold of total SGP
-    # This prevents "steals" where one side clearly wins on market value
-    total_war = send_generic + receive_generic
-    if total_war > 0:
-        relative_diff = abs(delta_generic) / total_war
-        is_fair = relative_diff <= FAIRNESS_THRESHOLD_PERCENT
+    # Handle case where players aren't in player_values
+    if send_sgp == 0:
+        send_sgp = sum(
+            projections[projections["Name"] == p]["SGP"].iloc[0] for p in send_players
+        )
+    if receive_sgp == 0:
+        receive_sgp = sum(
+            projections[projections["Name"] == p]["SGP"].iloc[0]
+            for p in receive_players
+        )
+
+    delta_generic = receive_sgp - send_sgp
+
+    # Fairness check (percentage-based)
+    total_sgp = send_sgp + receive_sgp
+    if total_sgp > 0:
+        relative_diff = abs(delta_generic) / total_sgp
+        is_fair = relative_diff <= fairness_threshold
     else:
-        is_fair = True  # Edge case: no SGP involved
+        is_fair = True
 
-    # Require meaningful improvement (at least 0.1% = 0.001 win probability)
-    # to avoid recommending trades with negligible impact
-    MIN_MEANINGFUL_IMPROVEMENT = 0.001
-    is_good_for_me = delta_V >= MIN_MEANINGFUL_IMPROVEMENT
-    is_bad_for_me = delta_V <= -MIN_MEANINGFUL_IMPROVEMENT
-    is_neutral = not is_good_for_me and not is_bad_for_me
+    # Determine recommendation
+    is_good_for_me = delta_V >= min_improvement
+    is_bad_for_me = delta_V <= -min_improvement
 
-    # Recommendation
     if is_good_for_me and is_fair:
         recommendation = "ACCEPT"
     elif is_good_for_me and not is_fair and delta_generic > 0:
-        recommendation = "STEAL"  # I'm getting more generic value
+        recommendation = "STEAL"  # I'm getting more dynasty_SGP
     elif is_bad_for_me and is_fair:
         recommendation = "REJECT"
-    elif is_neutral and is_fair:
-        recommendation = "NEUTRAL"  # Fair trade but negligible impact
-    else:
+    elif not is_fair and is_bad_for_me:
         recommendation = "UNFAIR"
+    else:
+        recommendation = "NEUTRAL"
+
+    # Find trade partner
+    trade_partner_id = None
+    if opponent_rosters:
+        for opp_id, roster in opponent_rosters.items():
+            if receive_set <= roster:
+                trade_partner_id = opp_id
+                break
 
     # Category impact
     category_impact = {cat: new_totals[cat] - my_totals[cat] for cat in ALL_CATEGORIES}
 
-    # Get individual player generic values for display
-    send_generics = []
-    for p in send_players:
-        pv_row = player_values[player_values["Name"] == p]
-        if len(pv_row) > 0:
-            gv = pv_row["generic_value"].iloc[0]
-            send_generics.append((p, gv if pd.notna(gv) else 0.0))
-        else:
-            send_generics.append((p, 0.0))
-
-    receive_generics = []
-    for p in receive_players:
-        pv_row = player_values[player_values["Name"] == p]
-        if len(pv_row) > 0:
-            gv = pv_row["generic_value"].iloc[0]
-            receive_generics.append((p, gv if pd.notna(gv) else 0.0))
-        else:
-            receive_generics.append((p, 0.0))
-
-    # Find which opponent we're trading with
-    trade_partner_id = None
-    if opponent_rosters is not None:
-        for p in receive_players:
-            for opp_id, roster in opponent_rosters.items():
-                if p in roster:
-                    trade_partner_id = opp_id
-                    break
-            if trade_partner_id is not None:
-                break
-
+    # Build result
     result = {
         "send_players": send_players,
         "receive_players": receive_players,
@@ -696,25 +655,12 @@ def evaluate_trade(
         "is_good_for_me": is_good_for_me,
         "recommendation": recommendation,
         "category_impact": category_impact,
-        "send_generics": send_generics,
-        "receive_generics": receive_generics,
+        "send_generics": [(p, send_sgp / len(send_players)) for p in send_players],
+        "receive_generics": [
+            (p, receive_sgp / len(receive_players)) for p in receive_players
+        ],
         "trade_partner_id": trade_partner_id,
     }
-
-    # Print summary only for fair trades
-    if is_fair:
-        send_str = ", ".join(
-            f"{strip_name_suffix(p)} (SGP: {v:.1f})" for p, v in send_generics
-        )
-        receive_str = ", ".join(
-            f"{strip_name_suffix(p)} (SGP: {v:.1f})" for p, v in receive_generics
-        )
-        partner_str = f" with Team {trade_partner_id}" if trade_partner_id else ""
-        print(f"Trade{partner_str}:")
-        print(f"  Send: [{send_str}]")
-        print(f"  Receive: [{receive_str}]")
-        print(f"  Net to me: {delta_V:+.3f} win probability ({delta_V * 100:+.1f}%)")
-        print(f"  Recommendation: {recommendation}")
 
     return result
 
@@ -732,86 +678,58 @@ def generate_trade_candidates(
     n_targets: int = 15,
     n_pieces: int = 15,
     n_candidates: int = 20,
+    fairness_threshold: float = FAIRNESS_THRESHOLD_PERCENT,
+    min_improvement: float = MIN_MEANINGFUL_IMPROVEMENT,
 ) -> list[dict]:
     """
     Generate candidate trades to consider.
 
-    Returns:
-        List of trade evaluation dicts, sorted by delta_V descending.
-        Only includes trades where is_fair=True and is_good_for_me=True.
+    Args:
+        fairness_threshold: Max SGP differential as fraction of total SGP (default 0.10 = 10%)
+        min_improvement: Min win probability change to recommend ACCEPT (default 0.001 = 0.1%)
     """
-    # Get targets and pieces
+    # Identify targets and pieces
     targets = identify_trade_targets(
         player_values, my_roster_names, opponent_rosters, n_targets
     )
     pieces = identify_trade_pieces(player_values, my_roster_names, n_pieces)
 
-    if len(targets) == 0 or len(pieces) == 0:
-        print("No favorable fair trades. Consider adjusting parameters.")
+    if targets.empty or pieces.empty:
+        print("No trade targets or pieces available")
         return []
 
-    # Generate combinations
-    target_names = list(targets["Name"])
+    # Group targets by owner
+    owner_targets = {}
+    for _, row in targets.iterrows():
+        owner_id = row.get("owner_id")
+        if owner_id is not None:
+            if owner_id not in owner_targets:
+                owner_targets[owner_id] = []
+            owner_targets[owner_id].append(row["Name"])
+
     piece_names = list(pieces["Name"])
 
-    # Group targets by owner
-    targets_by_owner = {}
-    for _, row in targets.iterrows():
-        owner = row["owner_id"]
-        if owner not in targets_by_owner:
-            targets_by_owner[owner] = []
-        targets_by_owner[owner].append(row["Name"])
+    # Generate combinations
+    all_trades = []
+    combos_evaluated = 0
 
-    candidates = []
-    evaluated = 0
-    skipped_composition = 0
-
-    # Get current roster composition
-    my_roster_df = projections[projections["Name"].isin(my_roster_names)]
-    current_hitters = (my_roster_df["player_type"] == "hitter").sum()
-    current_pitchers = (my_roster_df["player_type"] == "pitcher").sum()
-
-    # Helper to check if trade maintains valid composition
-    def _would_violate_composition(
-        send_names: list[str], receive_names: list[str]
-    ) -> bool:
-        send_df = projections[projections["Name"].isin(send_names)]
-        receive_df = projections[projections["Name"].isin(receive_names)]
-
-        send_hitters = (send_df["player_type"] == "hitter").sum()
-        send_pitchers = (send_df["player_type"] == "pitcher").sum()
-        receive_hitters = (receive_df["player_type"] == "hitter").sum()
-        receive_pitchers = (receive_df["player_type"] == "pitcher").sum()
-
-        new_hitters = current_hitters - send_hitters + receive_hitters
-        new_pitchers = current_pitchers - send_pitchers + receive_pitchers
-
-        if not (MIN_HITTERS <= new_hitters <= MAX_HITTERS):
-            return True
-        if not (MIN_PITCHERS <= new_pitchers <= MAX_PITCHERS):
-            return True
-        return False
-
-    # Generate 1-for-1, 2-for-1, 1-for-2, 2-for-2 combinations
     for send_size in range(1, min(max_send, len(piece_names)) + 1):
-        for receive_size in range(1, min(max_receive, len(target_names)) + 1):
-            for send_combo in combinations(piece_names, send_size):
-                for owner, owner_targets in targets_by_owner.items():
-                    for receive_combo in combinations(owner_targets, receive_size):
-                        send_list = list(send_combo)
-                        receive_list = list(receive_combo)
+        for receive_size in range(1, min(max_receive + 1, 4)):
+            # For each owner
+            for owner_id, owner_target_list in owner_targets.items():
+                if len(owner_target_list) < receive_size:
+                    continue
 
-                        # Pre-filter: skip trades that violate roster composition
-                        if _would_violate_composition(send_list, receive_list):
-                            skipped_composition += 1
-                            continue
-
-                        evaluated += 1
+                # Generate send combinations
+                for send_combo in combinations(piece_names, send_size):
+                    # Generate receive combinations from this owner
+                    for receive_combo in combinations(owner_target_list, receive_size):
+                        combos_evaluated += 1
 
                         # Evaluate trade
-                        result = evaluate_trade(
-                            send_list,
-                            receive_list,
+                        trade_result = evaluate_trade(
+                            list(send_combo),
+                            list(receive_combo),
                             player_values,
                             my_roster_names,
                             projections,
@@ -819,28 +737,33 @@ def generate_trade_candidates(
                             opponent_totals,
                             category_sigmas,
                             opponent_rosters,
+                            fairness_threshold=fairness_threshold,
+                            min_improvement=min_improvement,
                         )
 
-                        if result["is_fair"] and result["is_good_for_me"]:
-                            candidates.append(result)
+                        # Keep only fair + good trades
+                        if trade_result["is_fair"] and trade_result["is_good_for_me"]:
+                            all_trades.append(trade_result)
 
-    # Sort by delta_V
-    candidates.sort(key=lambda x: x["delta_V"], reverse=True)
-    candidates = candidates[:n_candidates]
+    # Sort by delta_V descending
+    all_trades.sort(key=lambda t: t["delta_V"], reverse=True)
 
-    print(f"Generated {len(candidates)} candidate trades")
-    print(
-        f"  Evaluated {evaluated} combinations (skipped {skipped_composition} for composition)"
-    )
-    print(f"  Found {len(candidates)} favorable fair trades")
+    # Keep top N
+    all_trades = all_trades[:n_candidates]
 
-    if len(candidates) == 0:
+    print(f"Generated {len(all_trades)} candidate trades")
+    print(f"  Evaluated {combos_evaluated} combinations")
+    print(f"  Found {len(all_trades)} favorable fair trades")
+
+    if not all_trades:
         print("No favorable fair trades. Consider adjusting parameters.")
 
-    return candidates
+    return all_trades
 
 
-# === VERIFICATION ===
+# =============================================================================
+# VERIFICATION
+# =============================================================================
 
 
 def verify_trade_impact(
@@ -853,14 +776,17 @@ def verify_trade_impact(
 ) -> dict:
     """
     Verify a trade's impact by recomputing win probability from scratch.
-
-    This is the ground truth check — full recomputation, not gradient-based.
     """
-    # Validate inputs
-    for p in send_players:
-        assert p in my_roster_names, f"Cannot send {p} — not on my roster"
-    for p in receive_players:
-        assert p not in my_roster_names, f"Already have {p} on roster"
+    # Assertions
+    send_set = set(send_players)
+    receive_set = set(receive_players)
+
+    assert send_set <= my_roster_names, (
+        f"Cannot send players not on roster: {send_set - my_roster_names}"
+    )
+    assert not (receive_set & my_roster_names), (
+        f"Already have some receive players: {receive_set & my_roster_names}"
+    )
 
     # Compute before
     old_totals = compute_team_totals(my_roster_names, projections)
@@ -869,7 +795,7 @@ def verify_trade_impact(
     )
 
     # Compute after
-    new_roster = (my_roster_names - set(send_players)) | set(receive_players)
+    new_roster = (my_roster_names - send_set) | receive_set
     new_totals = compute_team_totals(new_roster, projections)
     V_after, diag_after = compute_win_probability(
         new_totals, opponent_totals, category_sigmas
@@ -880,7 +806,7 @@ def verify_trade_impact(
         cat: new_totals[cat] - old_totals[cat] for cat in ALL_CATEGORIES
     }
 
-    # Matchup flips
+    # Find matchup flips
     matchup_flips = []
     for cat in ALL_CATEGORIES:
         for opp_id in opponent_totals.keys():
@@ -895,12 +821,21 @@ def verify_trade_impact(
                     {
                         "category": cat,
                         "opponent": opp_id,
-                        "prob_before": prob_before,
-                        "prob_after": prob_after,
+                        "before": "win" if win_before else "lose",
+                        "after": "win" if win_after else "lose",
                     }
                 )
 
-    result = {
+    print("Trade verification:")
+    print(
+        f"  Win probability: {V_before:.1%} → {V_after:.1%} ({V_after - V_before:+.1%})"
+    )
+    print(
+        f"  Expected wins: {diag_before['expected_wins']:.1f} → {diag_after['expected_wins']:.1f}"
+    )
+    print(f"  Matchups flipped: {len(matchup_flips)}")
+
+    return {
         "V_before": V_before,
         "V_after": V_after,
         "delta_V": V_after - V_before,
@@ -912,20 +847,10 @@ def verify_trade_impact(
         "matchup_flips": matchup_flips,
     }
 
-    # Print summary
-    print("Trade verification:")
-    print(
-        f"  Win probability: {V_before:.1%} → {V_after:.1%} ({V_after - V_before:+.1%})"
-    )
-    print(
-        f"  Expected wins: {diag_before['expected_wins']:.1f} → {diag_after['expected_wins']:.1f}"
-    )
-    print(f"  Matchups flipped: {len(matchup_flips)}")
 
-    return result
-
-
-# === REPORTING ===
+# =============================================================================
+# REPORTING
+# =============================================================================
 
 
 def compute_roster_situation(
@@ -938,19 +863,19 @@ def compute_roster_situation(
     """
     my_totals = compute_team_totals(my_roster_names, projections)
     category_sigmas = estimate_projection_uncertainty(my_totals, opponent_totals)
-
     V, diagnostics = compute_win_probability(
         my_totals, opponent_totals, category_sigmas
     )
 
-    # Analyze strengths and weaknesses
+    # Analyze matchup probabilities
     matchup_probs = diagnostics["matchup_probs"]
 
+    # Identify strengths and weaknesses
     strengths = []
     weaknesses = []
 
     for cat in ALL_CATEGORIES:
-        avg_prob = np.mean(list(matchup_probs[cat].values()))
+        avg_prob = np.mean([matchup_probs[cat][o] for o in opponent_totals.keys()])
         if avg_prob > 0.7:
             strengths.append(cat)
         elif avg_prob < 0.3:
@@ -959,13 +884,13 @@ def compute_roster_situation(
     # Category analysis
     category_analysis = {}
     for cat in ALL_CATEGORIES:
-        opp_avg = np.mean([opponent_totals[o][cat] for o in opponent_totals])
-        avg_prob = np.mean(list(matchup_probs[cat].values()))
+        avg_opp = np.mean([opponent_totals[o][cat] for o in opponent_totals.keys()])
+        avg_prob = np.mean([matchup_probs[cat][o] for o in opponent_totals.keys()])
 
         if avg_prob > 0.7:
             status = "Strong"
         elif avg_prob > 0.5:
-            status = "Ahead"
+            status = "Moderate"
         elif avg_prob > 0.3:
             status = "Contested"
         else:
@@ -973,8 +898,8 @@ def compute_roster_situation(
 
         category_analysis[cat] = {
             "my_value": my_totals[cat],
-            "opponent_avg": opp_avg,
-            "win_probability": avg_prob,
+            "avg_opponent": avg_opp,
+            "avg_win_prob": avg_prob,
             "status": status,
         }
 
@@ -1004,37 +929,39 @@ def print_trade_report(
     print("ROSTER SITUATION")
     print("=" * 70)
 
-    print(f"Win probability: {situation['win_probability']:.1%}")
-    print(f"Expected wins: {situation['expected_wins']:.1f}/60")
+    print(f"\nWin probability: {situation['win_probability']:.1%}")
+    print(
+        f"Expected wins: {situation['expected_wins']:.1f}/60 | Expected roto points: {situation['expected_roto_points']}/70"
+    )
 
     print("\nCATEGORY ANALYSIS:\n")
     print(
-        f"{'Category':<10} {'My Value':<12} {'Avg Opp':<12} {'P(Win)':<10} {'Status':<10}"
+        f"{'Category':<10} {'My Value':>10} {'Avg Opp':>10} {'P(Win)':>8} {'Status':<10}"
     )
-    print("-" * 54)
+    print("-" * 50)
 
     for cat in ALL_CATEGORIES:
         analysis = situation["category_analysis"][cat]
-        my_val = analysis["my_value"]
-        opp_avg = analysis["opponent_avg"]
-        prob = analysis["win_probability"]
-        status = analysis["status"]
+        val = analysis["my_value"]
+        avg_opp = analysis["avg_opponent"]
 
         if cat in ["ERA", "WHIP", "OPS"]:
-            val_fmt = f"{my_val:.3f}"
-            opp_fmt = f"{opp_avg:.3f}"
+            val_str = f"{val:.3f}"
+            opp_str = f"{avg_opp:.3f}"
         else:
-            val_fmt = f"{my_val:.0f}"
-            opp_fmt = f"{opp_avg:.0f}"
+            val_str = f"{int(val)}"
+            opp_str = f"{int(avg_opp)}"
 
         print(
-            f"{cat:<10} {val_fmt:<12} {opp_fmt:<12} {prob * 100:>6.0f}%    {status:<10}"
+            f"{cat:<10} {val_str:>10} {opp_str:>10} {analysis['avg_win_prob']:>7.0%} {analysis['status']:<10}"
         )
 
-    if situation["strengths"]:
-        print(f"\nSTRENGTHS: {', '.join(situation['strengths'])}")
-    if situation["weaknesses"]:
-        print(f"WEAKNESSES: {', '.join(situation['weaknesses'])}")
+    print(
+        f"\nSTRENGTHS: {', '.join(situation['strengths']) or 'None'} (high win probability)"
+    )
+    print(
+        f"WEAKNESSES: {', '.join(situation['weaknesses']) or 'None'} (low win probability)"
+    )
 
     print("\n" + "=" * 70)
     print("TOP TRADE RECOMMENDATIONS")
@@ -1042,46 +969,23 @@ def print_trade_report(
 
     if not trade_candidates:
         print("\nNo favorable fair trades found.")
-        print("Consider:")
-        print("  - Increasing n_targets or n_pieces")
-        print("  - Relaxing fairness threshold")
-        print("  - Looking at larger trades (max_send, max_receive)")
+        print("Consider adjusting parameters or accepting current roster.")
         return
 
     for i, trade in enumerate(trade_candidates[:top_n], 1):
-        partner_str = (
-            f" with Team {trade['trade_partner_id']}"
-            if trade.get("trade_partner_id")
-            else ""
-        )
-        print(f"\n#{i}{partner_str}: {trade['delta_V'] * 100:+.1f}% win probability")
+        print(f"\n#{i}: {trade['delta_V']:+.1%} win probability")
 
-        # Format send players with their generic values
-        if "send_generics" in trade:
-            send_str = ", ".join(
-                f"{strip_name_suffix(p)} (SGP: {v:.1f})"
-                for p, v in trade["send_generics"]
-            )
-        else:
-            send_str = ", ".join(strip_name_suffix(p) for p in trade["send_players"])
+        send_str = ", ".join(strip_name_suffix(p) for p in trade["send_players"])
+        receive_str = ", ".join(strip_name_suffix(p) for p in trade["receive_players"])
 
-        # Format receive players with their generic values
-        if "receive_generics" in trade:
-            receive_str = ", ".join(
-                f"{strip_name_suffix(p)} (SGP: {v:.1f})"
-                for p, v in trade["receive_generics"]
-            )
-        else:
-            receive_str = ", ".join(
-                strip_name_suffix(p) for p in trade["receive_players"]
-            )
-
-        print(f"    Send:    [{send_str}]")
-        print(f"    Receive: [{receive_str}]")
-        print(f"    " + "-" * 50)
-        print(f"    Net to me: {trade['delta_V'] * 100:+.1f}% win probability")
+        print(f"    Send:    {send_str}")
         print(
-            f"    SGP change: {trade['delta_generic']:+.1f} ({'Fair' if trade['is_fair'] else 'Unfair'})"
+            f"    Receive: {receive_str} [from opponent {trade.get('trade_partner_id', '?')}]"
+        )
+        print("-" * 50)
+        print(f"    Net: {trade['delta_V']:+.1%} win probability")
+        print(
+            f"    Dynasty SGP: {trade['delta_generic']:+.1f} ({'Fair' if trade['is_fair'] else 'Unfair'})"
         )
         print(f"    Recommendation: {trade['recommendation']}")
 

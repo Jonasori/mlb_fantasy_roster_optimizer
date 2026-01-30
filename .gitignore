@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project-specific
+data/*.db
+data/*.json
+data/*.csv
+!data/.gitkeep
+
+# Marimo session files
+__marimo__/
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary/debug scripts
+explore_*.py
+debug_*.py
+test_*.py
+!tests/test_*.py
