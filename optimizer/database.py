@@ -1039,8 +1039,8 @@ def get_standings(db_path: str = "data/optimizer.db") -> pd.DataFrame:
 
 
 def refresh_all_data(
-    hitter_proj_path: str = "data/fangraphs-steamer-projections-hitters.csv",
-    pitcher_proj_path: str = "data/fangraphs-steamer-projections-pitchers.csv",
+    hitter_proj_path: str | None = None,
+    pitcher_proj_path: str | None = None,
     db_path: str = "data/optimizer.db",
     skip_fantrax: bool = False,
     skip_mlb_api: bool = False,
@@ -1063,8 +1063,8 @@ def refresh_all_data(
         6. Return data from database queries
 
     Args:
-        hitter_proj_path: Path to FanGraphs hitter projections CSV
-        pitcher_proj_path: Path to FanGraphs pitcher projections CSV
+        hitter_proj_path: Path to FanGraphs hitter projections CSV (if None, uses config)
+        pitcher_proj_path: Path to FanGraphs pitcher projections CSV (if None, uses config)
         db_path: Path to SQLite database
         skip_fantrax: If True, skip Fantrax API calls (use existing DB data)
         skip_mlb_api: If True, skip MLB Stats API call for ages
@@ -1077,6 +1077,15 @@ def refresh_all_data(
             "standings": pd.DataFrame,             # From get_standings()
         }
     """
+    # Use config defaults if paths not provided
+    if hitter_proj_path is None or pitcher_proj_path is None:
+        from .config import HITTER_PROJ_PATH, PITCHER_PROJ_PATH
+
+        if hitter_proj_path is None:
+            hitter_proj_path = HITTER_PROJ_PATH
+        if pitcher_proj_path is None:
+            pitcher_proj_path = PITCHER_PROJ_PATH
+
     print("=== Data Refresh Pipeline ===")
 
     # Step 1: Initialize database
@@ -1085,7 +1094,7 @@ def refresh_all_data(
 
     # Step 2: Load FanGraphs projections
     print("\nStep 2: Loading FanGraphs projections...")
-    projections = load_projections(hitter_proj_path, pitcher_proj_path)
+    projections = load_projections(hitter_proj_path, pitcher_proj_path, db_path)
 
     # Step 3: Sync to database
     print("\nStep 3: Syncing projections to database...")

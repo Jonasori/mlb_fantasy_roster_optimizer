@@ -43,25 +43,35 @@ def init_session_state():
 
 def load_data():
     """Load all data from database."""
+    from optimizer.config import HITTER_PROJ_PATH, PITCHER_PROJ_PATH
     from optimizer.database import refresh_all_data
 
-    with st.spinner("Loading data..."):
-        data = refresh_all_data(skip_fantrax=True)
+    try:
+        with st.spinner("Loading data..."):
+            data = refresh_all_data(
+                hitter_proj_path=HITTER_PROJ_PATH,
+                pitcher_proj_path=PITCHER_PROJ_PATH,
+                skip_fantrax=True,
+            )
 
-        st.session_state.projections = data["projections"]
-        st.session_state.my_roster = data["my_roster"]
-        st.session_state.opponent_rosters = data["opponent_rosters"]
-        st.session_state.standings = data["standings"]
-        st.session_state.data_loaded = True
-        st.session_state.last_refresh = datetime.now()
-        # Clear cached results when data refreshes
-        st.session_state.trade_results = None
-        st.session_state.player_values = None
-        st.session_state.situation = None
-        st.session_state.trade_targets = None
-        st.session_state.trade_pieces = None
+            st.session_state.projections = data["projections"]
+            st.session_state.my_roster = data["my_roster"]
+            st.session_state.opponent_rosters = data["opponent_rosters"]
+            st.session_state.standings = data["standings"]
+            st.session_state.data_loaded = True
+            st.session_state.last_refresh = datetime.now()
+            # Clear cached results when data refreshes
+            st.session_state.trade_results = None
+            st.session_state.player_values = None
+            st.session_state.situation = None
+            st.session_state.trade_targets = None
+            st.session_state.trade_pieces = None
 
-    st.success("Data loaded successfully!")
+        st.success("Data loaded successfully!")
+    except Exception as e:
+        # Show error but don't crash - allow navigation to still work
+        st.error(f"Error loading data: {str(e)}")
+        # Don't set data_loaded = True, so user can try again
 
 
 PAGES = [
@@ -635,9 +645,7 @@ def show_trades():
                         "Player": st.column_config.TextColumn("Player", width="medium"),
                         "Pos": st.column_config.TextColumn("Pos", width="small"),
                         "Owner": st.column_config.TextColumn("Owner", width="medium"),
-                        "EWA": st.column_config.TextColumn(
-                            "EWA", width="small"
-                        ),
+                        "EWA": st.column_config.TextColumn("EWA", width="small"),
                         "SGP": st.column_config.TextColumn("SGP", width="small"),
                     },
                 )
@@ -808,9 +816,7 @@ def show_trades():
 
                     with detail_col2:
                         st.metric("Expected Wins Added", f"{trade['ewa']:+.2f}")
-                        st.markdown(
-                            f"**SGP Change:** {trade['delta_generic']:+.1f}"
-                        )
+                        st.markdown(f"**SGP Change:** {trade['delta_generic']:+.1f}")
                         st.markdown(
                             f"**Fairness:** {'✅ Fair' if trade['is_fair'] else '⚠️ Unfair'}"
                         )
@@ -1017,7 +1023,6 @@ def _compute_trade_targets(
 
 def _evaluate_custom_trade(send_names: list[str], receive_names: list[str]):
     """Evaluate a custom trade from the Trade Builder with radar chart visualization."""
-    from dashboard.components import radar_chart_with_overlay
     from optimizer.data_loader import (
         ALL_CATEGORIES,
         compute_team_totals,
@@ -1386,7 +1391,6 @@ def show_simulator():
 
 def _run_simulation(add_selections, drop_selections, fa_name_map, roster_name_map):
     """Run roster simulation with radar chart visualization."""
-    from dashboard.components import radar_chart_with_overlay
     from optimizer.data_loader import (
         ALL_CATEGORIES,
         compute_all_opponent_totals,

@@ -25,6 +25,7 @@ ENV/
 Thumbs.db
 
 # Project-specific
+config.json  # Contains sensitive Fantrax cookies
 data/*.db
 data/*.json
 data/*.csv

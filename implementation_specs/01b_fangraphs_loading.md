@@ -164,16 +164,16 @@ def load_pitcher_projections(filepath: str) -> pd.DataFrame:
 
 ```python
 def load_projections(
-    hitter_path: str,
-    pitcher_path: str,
+    hitter_path: str | None = None,
+    pitcher_path: str | None = None,
     db_path: str | None = None,
 ) -> pd.DataFrame:
     """
     Load and combine all projections.
     
     Args:
-        hitter_path: Path to hitter projections CSV
-        pitcher_path: Path to pitcher projections CSV
+        hitter_path: Path to hitter projections CSV (if None, uses config)
+        pitcher_path: Path to pitcher projections CSV (if None, uses config)
         db_path: Optional path to external position database
     
     Returns DataFrame with columns:
@@ -183,11 +183,13 @@ def load_projections(
         WAR, SGP
     
     Implementation:
-        1. Load positions from DB (if path provided)
-        2. Load hitters and pitchers
-        3. Align columns (fill missing with 0)
-        4. Concatenate vertically
-        5. Compute SGP for each player using compute_sgp_value()
+        1. If hitter_path/pitcher_path are None, load from config:
+           from optimizer.config import HITTER_PROJ_PATH, PITCHER_PROJ_PATH
+        2. Load positions from DB (if path provided)
+        3. Load hitters and pitchers
+        4. Align columns (fill missing with 0)
+        5. Concatenate vertically
+        6. Compute SGP for each player using compute_sgp_value()
     
     Two-way players appear as two rows:
         "Shohei Ohtani-H" with hitting stats

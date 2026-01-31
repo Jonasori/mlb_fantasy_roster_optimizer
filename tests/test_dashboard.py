@@ -803,9 +803,54 @@ def dashboard_with_data(page: Page, streamlit_server):
     refresh_btn = page.locator('button:has-text("Refresh Data")')
     refresh_btn.click()
 
-    # Wait for data to load (longer timeout for API calls)
-    # Look for data-loaded indicators
-    page.wait_for_timeout(5000)
+    # Wait for data loading to complete - look for success message or error
+    # The dashboard shows "Data loaded successfully!" when done
+    # Wait up to 30 seconds for data loading (can be slow with API calls)
+    try:
+        # Wait for either success message or error indicator
+        page.wait_for_selector(
+            '[data-testid="stSuccess"], [data-testid="stError"], [data-testid="stException"]',
+            timeout=30000,
+            state="visible",
+        )
+    except Exception:
+        # If no success/error message appears, wait a bit more for page to stabilize
+        page.wait_for_timeout(2000)
+
+    # Ensure sidebar is visible and navigation buttons are rendered
+    sidebar = page.locator('[data-testid="stSidebar"]')
+    sidebar.wait_for(timeout=10000, state="visible")
+
+    # Wait for navigation buttons to be rendered - check for at least one nav button
+    # The navigation buttons should be visible after the page reruns
+    # We expect 5 navigation buttons + Refresh Data = 6 total
+    # But also check for the specific navigation button text to ensure they're fully rendered
+    nav_button_texts = [
+        "🏠 Overview",
+        "📊 My Team",
+        "🔄 Trades",
+        "🔍 Free Agents",
+        "📋 All Players",
+    ]
+    for _ in range(30):  # Try for up to 15 seconds
+        # Check if at least one navigation button is visible
+        found_nav_button = False
+        for nav_text in nav_button_texts:
+            nav_button = sidebar.locator(f'button:has-text("{nav_text}")')
+            if nav_button.count() > 0 and nav_button.first.is_visible():
+                found_nav_button = True
+                break
+
+        if found_nav_button:
+            break
+        page.wait_for_timeout(500)
+    else:
+        # If buttons didn't appear, log what we found for debugging
+        sidebar_text = sidebar.inner_text()
+        button_count = sidebar.locator("button").count()
+        print(f"DEBUG: Sidebar text after refresh: {sidebar_text[:500]}")
+        print(f"DEBUG: Found {button_count} buttons in sidebar")
+        # Don't fail here - let the test handle it
 
     return page
 

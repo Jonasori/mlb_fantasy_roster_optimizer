@@ -55,6 +55,14 @@ import pandas as pd
 from scipy import stats
 from tqdm.auto import tqdm
 
+from .config import (
+    SGP_METRIC,
+    TRADE_FAIRNESS_THRESHOLD_PERCENT,
+    TRADE_LOSE_COST_SCALE,
+    TRADE_MAX_SIZE,
+    TRADE_MIN_MEANINGFUL_IMPROVEMENT,
+    MIN_STAT_STANDARD_DEVIATION,
+)
 from .data_loader import (
     HITTING_CATEGORIES,
     PITCHING_CATEGORIES,
@@ -80,24 +88,21 @@ from .data_loader import (
 MEV_TABLE = {1: 0.0, 2: 0.564, 3: 0.846, 4: 1.029, 5: 1.163, 6: 1.267}
 MVAR_TABLE = {1: 1.0, 2: 0.682, 3: 0.559, 4: 0.492, 5: 0.448, 6: 0.416}
 
-# Trade fairness threshold: percentage-based
-# A fair trade has SGP differential within 10% of total SGP involved
-# Example: 45.0 SGP for 62.0 SGP = 17 diff / 107 total = 16% -> UNFAIR
-# Example: 30.0 SGP for 35.0 SGP = 5 diff / 65 total = 8% -> FAIR
-FAIRNESS_THRESHOLD_PERCENT = 0.10  # 10% max differential
+# Trade engine configuration loaded from config.json
+# These values are defined in the "trade_engine" section of config.json
+FAIRNESS_THRESHOLD_PERCENT = TRADE_FAIRNESS_THRESHOLD_PERCENT
+MAX_TRADE_SIZE = TRADE_MAX_SIZE
+MIN_MEANINGFUL_IMPROVEMENT = TRADE_MIN_MEANINGFUL_IMPROVEMENT
+MIN_STD = MIN_STAT_STANDARD_DEVIATION
+LOSE_COST_SCALE = TRADE_LOSE_COST_SCALE
 
-# Note: generic_value uses raw single-season SGP (simpler, more reliable).
-# Dynasty leagues can optionally switch to dynasty_SGP for age-adjusted values.
-
-# Maximum players per side in a trade
-MAX_TRADE_SIZE = 3
-
-# Minimum meaningful EWA improvement to recommend ACCEPT (0.1 expected wins)
-# Trades with smaller EWA are marked NEUTRAL even if positive
-MIN_MEANINGFUL_IMPROVEMENT = 0.1
-
-# Minimum standard deviation for calculations
-MIN_STD = 0.001
+# SGP metric selection: loaded from config.json
+# The trade engine uses SGP_METRIC to select which column to use:
+# - SGP_METRIC == "raw": use projections["SGP"] (single-season, default)
+# - SGP_METRIC == "dynasty": use projections["dynasty_SGP"] (age-adjusted)
+# 
+# Raw SGP is simpler and more predictable. Dynasty SGP accounts for aging
+# curves and is useful for dynasty leagues that value future production.
 ```
 
 ---
@@ -389,22 +394,27 @@ def compute_player_values(
         Sorted by ewa_acquire descending.
     
     Implementation:
-        1. Use raw SGP as generic_value (simpler, avoids age-scaling complexity)
-        2. For each player, compute EWA for acquisition using compute_player_marginal_value
-        3. For players in my_roster_names, also compute EWA for losing
-        4. For players NOT in my_roster_names, ewa_lose = NaN
+        1. Select SGP column based on config: 
+           - If SGP_METRIC == "raw": use projections["SGP"]
+           - If SGP_METRIC == "dynasty": use projections["dynasty_SGP"]
+        2. Use selected SGP column as generic_value
+        3. For each player, compute EWA for acquisition using compute_player_marginal_value
+        4. For players in my_roster_names, also compute EWA for losing
+        5. For players NOT in my_roster_names, ewa_lose = NaN
     
     Note:
-        generic_value uses raw single-season SGP, not dynasty_SGP.
+        generic_value uses the SGP metric selected in config.json (SGP_METRIC).
         
-        **Why raw SGP instead of dynasty_SGP:**
+        **Raw SGP (default):**
         - Simpler: no aging curve complexity
         - More predictable: managers understand SGP intuitively
         - Avoids bugs: age-scaling can produce unexpected results
         - Trade fairness is about this season, not 5-year projections
         
-        Dynasty leagues that want age-adjusted values can modify this,
-        but the default implementation uses raw SGP for reliability.
+        **Dynasty SGP:**
+        - Accounts for player age and future production decline
+        - Useful for dynasty leagues that value long-term value
+        - Requires age data to be computed (falls back to raw SGP if missing)
     """
 ```
 

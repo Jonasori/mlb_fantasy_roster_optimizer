@@ -4,13 +4,11 @@ Fantrax API integration for roster, standings, and player age data.
 The API is the single source of truth for roster ownership and provides player positions.
 """
 
-import json
-from pathlib import Path
-
 import pandas as pd
 import requests
 from tqdm.auto import tqdm
 
+from .config import FANTRAX_COOKIES
 from .data_loader import (
     FANTRAX_ACTIVE_STATUS_IDS,
     FANTRAX_LEAGUE_ID,
@@ -21,7 +19,6 @@ from .data_loader import (
 # CONFIGURATION
 # =============================================================================
 
-COOKIE_FILE = Path("data/fantrax_cookies.json")
 FANTRAX_API_URL = "https://www.fantrax.com/fxpa/req"
 
 # Exceptional name corrections for cases that normalization can't handle
@@ -62,21 +59,15 @@ def get_player_type(position: str) -> str:
 
 def load_cookies() -> dict[str, str]:
     """
-    Load cookies from file.
+    Load cookies from config.
 
     Returns: Dict with JSESSIONID and FX_RM.
     """
-    assert COOKIE_FILE.exists(), (
-        f"Cookie file not found: {COOKIE_FILE}\n"
-        f"To fix:\n"
-        f"  1. Log into https://www.fantrax.com\n"
-        f"  2. Open DevTools → Application → Cookies\n"
-        f"  3. Copy JSESSIONID and FX_RM\n"
-        f"  4. Save to {COOKIE_FILE}"
+    assert "JSESSIONID" in FANTRAX_COOKIES, (
+        "Config must have 'fantrax.cookies.JSESSIONID'"
     )
-
-    with open(COOKIE_FILE) as f:
-        return json.load(f)
+    assert "FX_RM" in FANTRAX_COOKIES, "Config must have 'fantrax.cookies.FX_RM'"
+    return FANTRAX_COOKIES
 
 
 def create_session() -> requests.Session:

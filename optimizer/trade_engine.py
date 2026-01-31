@@ -14,6 +14,14 @@ import pandas as pd
 from scipy import stats
 from tqdm.auto import tqdm
 
+from .config import (
+    SGP_METRIC,
+    TRADE_FAIRNESS_THRESHOLD_PERCENT,
+    TRADE_LOSE_COST_SCALE,
+    TRADE_MAX_SIZE,
+    TRADE_MIN_MEANINGFUL_IMPROVEMENT,
+    MIN_STAT_STANDARD_DEVIATION,
+)
 from .data_loader import (
     ALL_CATEGORIES,
     HITTING_CATEGORIES,
@@ -39,21 +47,12 @@ from .data_loader import (
 MEV_TABLE = {1: 0.0, 2: 0.564, 3: 0.846, 4: 1.029, 5: 1.163, 6: 1.267}
 MVAR_TABLE = {1: 1.0, 2: 0.682, 3: 0.559, 4: 0.492, 5: 0.448, 6: 0.416}
 
-# Trade fairness threshold: percentage-based
-# A fair trade has dynasty_SGP differential within 10% of total dynasty_SGP involved
-FAIRNESS_THRESHOLD_PERCENT = 0.10  # 10% max differential
-
-# Maximum players per side in a trade
-MAX_TRADE_SIZE = 3
-
-# Minimum meaningful EWA improvement to recommend ACCEPT (0.1 expected wins)
-MIN_MEANINGFUL_IMPROVEMENT = 0.1
-
-# Minimum standard deviation for calculations
-MIN_STD = 0.001
-
-# Scale factor for converting ewa_lose to SGP scale for expendability calculation
-LOSE_COST_SCALE = 2
+# Trade engine configuration loaded from config.json
+FAIRNESS_THRESHOLD_PERCENT = TRADE_FAIRNESS_THRESHOLD_PERCENT
+MAX_TRADE_SIZE = TRADE_MAX_SIZE
+MIN_MEANINGFUL_IMPROVEMENT = TRADE_MIN_MEANINGFUL_IMPROVEMENT
+MIN_STD = MIN_STAT_STANDARD_DEVIATION
+LOSE_COST_SCALE = TRADE_LOSE_COST_SCALE
 
 
 # =============================================================================
@@ -267,7 +266,9 @@ def compute_player_marginal_value(
         ewa: Expected Wins Added (change in expected category matchup wins out of 60)
         breakdown: Dict with V_before, V_after, ew_before, ew_after
     """
-    _, diag_before = compute_win_probability(my_totals, opponent_totals, category_sigmas)
+    _, diag_before = compute_win_probability(
+        my_totals, opponent_totals, category_sigmas
+    )
     ew_before = diag_before["expected_wins"]
 
     if is_acquisition:
@@ -289,7 +290,9 @@ def compute_player_marginal_value(
             projections=projections,
         )
 
-    _, diag_after = compute_win_probability(new_totals, opponent_totals, category_sigmas)
+    _, diag_after = compute_win_probability(
+        new_totals, opponent_totals, category_sigmas
+    )
     ew_after = diag_after["expected_wins"]
 
     ewa = ew_after - ew_before
@@ -358,8 +361,13 @@ def compute_player_values(
         else:
             ewa_lose = np.nan
 
-        # Generic value: use raw SGP (age scaling removed)
-        generic_value = player_row["SGP"]
+        # Generic value: use SGP metric from config (raw or dynasty)
+        sgp_column = "dynasty_SGP" if SGP_METRIC == "dynasty" else "SGP"
+        # Fall back to SGP if dynasty_SGP not available
+        if sgp_column not in player_row or pd.isna(player_row[sgp_column]):
+            generic_value = player_row["SGP"]
+        else:
+            generic_value = player_row[sgp_column]
 
         results.append(
             {
@@ -436,9 +444,7 @@ def identify_trade_targets(
 
     if len(targets) > 0:
         best = targets.iloc[0]
-        print(
-            f"Trade targets: {len(targets)} players identified (ranked by EWA)"
-        )
+        print(f"Trade targets: {len(targets)} players identified (ranked by EWA)")
         print(
             f"  Best: {strip_name_suffix(best['Name'])} from Team {best.get('owner_id', '?')} "
             f"(EWA: +{best['ewa_acquire']:.2f}, SGP: {best['generic_value']:.1f})"
@@ -583,11 +589,15 @@ def evaluate_trade(
         }
 
     # Compute expected wins before and after
-    _, diag_before = compute_win_probability(my_totals, opponent_totals, category_sigmas)
+    _, diag_before = compute_win_probability(
+        my_totals, opponent_totals, category_sigmas
+    )
     ew_before = diag_before["expected_wins"]
 
     new_totals = compute_team_totals(new_roster, projections)
-    _, diag_after = compute_win_probability(new_totals, opponent_totals, category_sigmas)
+    _, diag_after = compute_win_probability(
+        new_totals, opponent_totals, category_sigmas
+    )
     ew_after = diag_after["expected_wins"]
 
     ewa = ew_after - ew_before

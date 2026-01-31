@@ -12,7 +12,7 @@ This document specifies the Fantrax API integration for fetching live roster, st
 
 **Depends on:**
 - [00_agent_guidelines.md](00_agent_guidelines.md) — code style, no try/except
-- [01a_config.md](01a_config.md) — `FANTRAX_LEAGUE_ID`, `FANTRAX_TEAM_IDS`, `FANTRAX_STATUS_MAP`
+- [01a_config.md](01a_config.md) — `FANTRAX_LEAGUE_ID`, `FANTRAX_TEAM_IDS`
 
 **Used by:**
 - [01d_database.md](01d_database.md) — `fetch_all_fantrax_data()` synced to database
@@ -118,12 +118,16 @@ The league is private. Requires cookies from browser session.
 1. Log into https://www.fantrax.com
 2. Open DevTools → Application → Cookies → fantrax.com
 3. Copy `JSESSIONID` and `FX_RM` values
-4. Save to `data/fantrax_cookies.json`:
+4. Add to `config.json` under `fantrax.cookies`:
 
 ```json
 {
-    "JSESSIONID": "node0rb32jtbscpp0mcgmjh03qggo152156.node0",
-    "FX_RM": "_qpxzU1kSFh5dARIORBFCA1lFAgIKAwUdEhsVBxwcBlRCAQU="
+    "fantrax": {
+        "cookies": {
+            "JSESSIONID": "node0rb32jtbscpp0mcgmjh03qggo152156.node0",
+            "FX_RM": "_qpxzU1kSFh5dARIORBFCA1lFAgIKAwUdEhsVBxwcBlRCAQU="
+        }
+    }
 }
 ```
 
@@ -139,14 +143,13 @@ import pandas as pd
 import requests
 from tqdm.auto import tqdm
 
-# Import league constants from data_loader (single source of truth)
+# Import league constants from config (single source of truth)
+from .config import FANTRAX_COOKIES
 from .data_loader import (
     FANTRAX_LEAGUE_ID,
-    FANTRAX_STATUS_MAP,
     FANTRAX_TEAM_IDS,
 )
 
-COOKIE_FILE = Path("data/fantrax_cookies.json")
 FANTRAX_API_URL = "https://www.fantrax.com/fxpa/req"
 
 # Exceptional name corrections for cases that normalization can't handle
@@ -265,7 +268,7 @@ response = session.post(
                         "teamShortName": "LAA",
                         "age": 32
                     },
-                    "statusId": "1"  # Maps via FANTRAX_STATUS_MAP
+                    "statusId": "1"  # "1" = active, "2" = reserve, "3" = minors, "4" = IR
                 }
             ]
         }
@@ -282,19 +285,14 @@ response = session.post(
 ```python
 def load_cookies() -> dict[str, str]:
     """
-    Load cookies from file.
+    Load cookies from config.
     
     Returns: Dict with JSESSIONID and FX_RM.
     
     Assertion (with actionable message):
-        assert COOKIE_FILE.exists(), (
-            f"Cookie file not found: {COOKIE_FILE}\\n"
-            f"To fix:\\n"
-            f"  1. Log into https://www.fantrax.com\\n"
-            f"  2. Open DevTools → Application → Cookies\\n"
-            f"  3. Copy JSESSIONID and FX_RM\\n"
-            f"  4. Save to {COOKIE_FILE}"
-        )
+        assert "JSESSIONID" in FANTRAX_COOKIES, "Config must have 'fantrax.cookies.JSESSIONID'"
+        assert "FX_RM" in FANTRAX_COOKIES, "Config must have 'fantrax.cookies.FX_RM'"
+        return FANTRAX_COOKIES
     """
 
 
@@ -370,7 +368,9 @@ def fetch_team_roster(session: requests.Session, team_id: str) -> list[dict]:
                     "name": scorer.get("name"),
                     "position": pos,
                     "team": scorer.get("teamShortName"),
-                    "status": FANTRAX_STATUS_MAP.get(str(row.get("statusId", "")), "unknown"),
+                    "status": {"1": "active", "2": "reserve", "3": "minors", "4": "IR"}.get(
+                        str(row.get("statusId", "")), "unknown"
+                    ),
                     "player_type": get_player_type(pos),
                     "age": scorer.get("age"),
                 })

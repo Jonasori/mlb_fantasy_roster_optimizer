@@ -16,9 +16,11 @@ Read the documents in numerical order:
 | 01c | [Fantrax API](01c_fantrax_api.md) | Roster/age/standings data from API. |
 | 01d | [Database](01d_database.md) | SQLite schema, sync functions, queries. |
 | 01e | [Dynasty Valuation](01e_dynasty_valuation.md) | Aging curves, dynasty SGP, multi-year value. |
+| 01f | [MLB Stats API](01f_mlb_stats_api.md) | Player age data from MLB Stats API. |
 | 02 | [Free Agent Optimizer](02_free_agent_optimizer.md) | MILP formulation for optimal roster construction. |
 | 02a | [Variance-Penalized Objective](02a_variance_penalized_objective.md) | Balance incentive extension to MILP (optional). |
 | 02b | [Position Sensitivity](02b_position_sensitivity.md) | EWA-based position analysis, SGP limitations. |
+| 02c | [Playing Time Adjustment](02c_playing_time_adjustment.md) | ATC projection adjustments for playing time bias. |
 | 03 | [Trade Engine](03_trade_engine.md) | Probabilistic win model and trade evaluation. |
 | 04 | [Visualizations](04_visualizations.md) | All plotting functions. |
 | 05 | [Notebook Integration](05_notebook_integration.md) | Marimo notebook workflow examples. |

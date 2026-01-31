@@ -114,8 +114,8 @@ mlb_fantasy_roster_optimizer/
 ├── data/
 │   ├── fangraphs-steamer-projections-hitters.csv
 │   ├── fangraphs-steamer-projections-pitchers.csv
-│   ├── fantrax_cookies.json  # API authentication (not in git)
 │   └── optimizer.db          # SQLite database (generated, PRIMARY DATA SOURCE)
+├── config.json               # All configuration including Fantrax cookies (not in git)
 ├── implementation_specs/     # This documentation
 ├── notebook.py               # Marimo notebook (at project root)
 └── pyproject.toml

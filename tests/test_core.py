@@ -808,7 +808,7 @@ def test_trade_fairness_threshold():
     )
 
     assert FAIRNESS_THRESHOLD_PERCENT == 0.10
-    assert MIN_MEANINGFUL_IMPROVEMENT == 0.001
+    assert MIN_MEANINGFUL_IMPROVEMENT == 0.1
 
 
 # =============================================================================

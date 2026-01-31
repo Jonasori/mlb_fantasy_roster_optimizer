@@ -73,17 +73,18 @@ def imports():
         plot_constraint_analysis,
         plot_percentile_ewa_curves,
         plot_player_contribution_radar,
-        plot_player_sensitivity,
         plot_player_value_scatter,
         plot_position_distributions,
         plot_position_sensitivity_dashboard,
         plot_roster_changes,
+        plot_team_dashboard,
         plot_team_radar,
         plot_trade_impact,
         plot_upgrade_opportunities,
         plot_win_matrix,
         plot_win_probability_breakdown,
     )
+
     return (
         build_and_solve_milp,
         compute_all_opponent_totals,
@@ -106,6 +107,7 @@ def imports():
         plot_position_distributions,
         plot_position_sensitivity_dashboard,
         plot_roster_changes,
+        plot_team_dashboard,
         plot_team_radar,
         plot_upgrade_opportunities,
         plot_win_matrix,
@@ -120,10 +122,17 @@ def imports():
 def config():
     from pathlib import Path
 
-    # File paths for FanGraphs CSVs (input to database)
-    DATA_DIR = "data/"
-    HITTER_PROJ_PATH = DATA_DIR + "fangraphs-atc-projections-hitters.csv"
-    PITCHER_PROJ_PATH = DATA_DIR + "fangraphs-atc-projections-pitchers.csv"
+    from optimizer.config import (
+        DATA_DIR,
+        FANTRAX_COOKIES,
+        HITTER_PROJ_PATH,
+        PITCHER_PROJ_PATH,
+        RAW_HITTERS_PATH,
+        RAW_PITCHERS_PATH,
+        USE_ADJUSTED_PROJECTIONS,
+    )
+    from optimizer.playing_time import adjust_projections
+
     DB_PATH = DATA_DIR + "optimizer.db"
 
     # =======================================================
@@ -133,17 +142,31 @@ def config():
     SKIP_MLB_API = True  # Set True to skip MLB API age fetching (faster)
     # =======================================================
 
-    # Check if cookies exist
-    cookie_file = Path(DATA_DIR) / "fantrax_cookies.json"
-    if not cookie_file.exists():
-        print("⚠️  WARNING: Fantrax cookies file not found!")
-        print(f"   Expected at: {cookie_file}")
+    # Generate adjusted projections if enabled in config
+    if USE_ADJUSTED_PROJECTIONS:
+        adjust_projections(
+            hitters_input=RAW_HITTERS_PATH,
+            pitchers_input=RAW_PITCHERS_PATH,
+            hitters_output=HITTER_PROJ_PATH,
+            pitchers_output=PITCHER_PROJ_PATH,
+        )
+    else:
+        print("ℹ️  USE_ADJUSTED_PROJECTIONS=False — using raw projections")
+
+    # Check if cookies exist in config
+    if not FANTRAX_COOKIES.get("JSESSIONID") or not FANTRAX_COOKIES.get("FX_RM"):
+        print("⚠️  WARNING: Fantrax cookies not found in config.json!")
         print("   To set up cookies:")
         print("   1. Log into https://www.fantrax.com")
         print("   2. Open DevTools → Application → Cookies")
         print("   3. Copy JSESSIONID and FX_RM values")
-        print(f"   4. Save to {cookie_file} as JSON:")
-        print('      {"JSESSIONID": "...", "FX_RM": "..."}')
+        print("   4. Add to config.json under 'fantrax.cookies':")
+        print('      "fantrax": {')
+        print('        "cookies": {')
+        print('          "JSESSIONID": "...",')
+        print('          "FX_RM": "..."')
+        print("        }")
+        print("      }")
         SKIP_FANTRAX = True
     elif SKIP_FANTRAX:
         print("ℹ️  SKIP_FANTRAX=True — using cached database data")
@@ -341,6 +364,30 @@ def roster_summary(
         solution_info=solution_info,
     )
     return (optimal_totals,)
+
+
+@app.cell
+def optimized_roster_dashboard(
+    mo,
+    opponent_totals,
+    optimal_roster_names,
+    optimal_totals,
+    plot_team_dashboard,
+    projections,
+):
+    """Display the triptych dashboard comparing current vs optimized roster."""
+    mo.vstack(
+        [
+            mo.md("### Optimized Roster Dashboard"),
+            plot_team_dashboard(
+                my_totals=optimal_totals,
+                opponent_totals=opponent_totals,
+                optimal_roster_names=list(optimal_roster_names),
+                projections=projections,
+            ),
+        ]
+    )
+    return
 
 
 @app.cell
