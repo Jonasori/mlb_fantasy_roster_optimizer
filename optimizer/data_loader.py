@@ -166,7 +166,7 @@ def load_hitter_projections(filepath: str, positions: dict[int, str]) -> pd.Data
     Returns:
         DataFrame with columns:
             Name (with -H suffix), Team, Position, PA, R, HR, RBI, SB, OPS,
-            player_type='hitter'
+            player_type='hitter', WAR, MLBAMID
     """
     df = pd.read_csv(filepath)
 
@@ -216,12 +216,16 @@ def load_hitter_projections(filepath: str, positions: dict[int, str]) -> pd.Data
     else:
         df["WAR"] = 0.0
 
+    # Preserve MLBAMID if it exists (needed for MLB API age lookups)
+    if "MLBAMID" not in df.columns:
+        df["MLBAMID"] = None
+
     print(
         f"Loaded {len(df)} hitter projections ({n_with_pos} with positions from DB, {n_dh_default} defaulted to DH)"
     )
 
-    # Include WAR in output
-    return_cols = required_cols + ["WAR"]
+    # Include WAR and MLBAMID in output
+    return_cols = required_cols + ["WAR", "MLBAMID"]
     return df[return_cols].copy()
 
 
@@ -235,7 +239,7 @@ def load_pitcher_projections(filepath: str) -> pd.DataFrame:
     Returns:
         DataFrame with columns:
             Name (with -P suffix), Team, Position, IP, W, SV, K, ERA, WHIP,
-            player_type='pitcher'
+            player_type='pitcher', WAR, MLBAMID
     """
     df = pd.read_csv(filepath)
 
@@ -285,13 +289,17 @@ def load_pitcher_projections(filepath: str) -> pd.DataFrame:
     # Add WAR column if available (for generic player value)
     if "WAR" in df.columns:
         df["WAR"] = df["WAR"].fillna(0.0)
-        return_cols = required_cols + ["WAR"]
     else:
         df["WAR"] = 0.0
-        return_cols = required_cols + ["WAR"]
+
+    # Preserve MLBAMID if it exists (needed for MLB API age lookups)
+    if "MLBAMID" not in df.columns:
+        df["MLBAMID"] = None
 
     print(f"Loaded {len(df)} pitcher projections ({n_sp} SP, {n_rp} RP)")
 
+    # Include WAR and MLBAMID in output
+    return_cols = required_cols + ["WAR", "MLBAMID"]
     return df[return_cols].copy()
 
 
@@ -312,7 +320,8 @@ def load_projections(
         Combined DataFrame with columns:
             Name, Team, Position, player_type,
             PA, R, HR, RBI, SB, OPS,    (hitting - 0 for pitchers)
-            IP, W, SV, K, ERA, WHIP     (pitching - 0 for hitters)
+            IP, W, SV, K, ERA, WHIP,    (pitching - 0 for hitters)
+            WAR, MLBAMID
 
         Two-way players (e.g., Ohtani) appear as separate rows:
         - "Shohei Ohtani-H" with hitting stats, pitching cols = 0
@@ -341,12 +350,12 @@ def load_projections(
     for col in hitting_stat_cols:
         pitchers[col] = 0.0
 
-    # Align column order (include WAR for generic player value)
+    # Align column order (include WAR and MLBAMID)
     all_cols = (
         ["Name", "Team", "Position", "player_type"]
         + hitting_stat_cols
         + pitching_stat_cols
-        + ["WAR"]
+        + ["WAR", "MLBAMID"]
     )
     hitters = hitters[all_cols]
     pitchers = pitchers[all_cols]

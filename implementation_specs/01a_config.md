@@ -19,8 +19,23 @@ This document defines all league configuration constants and shared utility func
 - [01c_fantrax_api.md](01c_fantrax_api.md) — imports `FANTRAX_LEAGUE_ID`, `FANTRAX_TEAM_IDS`
 - [01d_database.md](01d_database.md) — imports constants for schema validation
 - [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — imports slot eligibility, roster bounds
-- [03_trade_engine.md](03_trade_engine.md) — imports `compute_team_totals()`, `estimate_projection_uncertainty()`, SGP metric selection, trade engine config
+- [03_trade_engine.md](03_trade_engine.md) — imports `estimate_projection_uncertainty()`, SGP metric selection, trade engine config
 - [04_visualizations.md](04_visualizations.md) — imports category lists, `NEGATIVE_CATEGORIES`
+
+---
+
+## Key Design Concept: Lineup-Aware Totals
+
+**In weekly rotisserie scoring, only starters generate fantasy points.** Bench players contribute nothing during a given week.
+
+The system computes team totals from optimal starting lineups, not full rosters:
+
+1. `compute_optimal_lineup()` solves an assignment problem to fill slots defined by `HITTING_SLOTS` and `PITCHING_SLOTS`, maximizing total SGP
+2. `compute_team_totals()` calls `compute_optimal_lineup()` first, then sums stats from starters only
+3. Opponent totals are computed the same way
+4. The roster optimizer MILP sums stats over starters (see [02_free_agent_optimizer.md](02_free_agent_optimizer.md))
+
+This means a player's value is their **marginal improvement over the incumbent starter they'd displace**—not their absolute SGP. A high-SGP player who wouldn't start has near-zero value.
 
 ---
 
@@ -497,6 +512,8 @@ assert len(ALL_CATEGORIES) == 10, "Must have exactly 10 scoring categories"
 assert len(FANTRAX_TEAM_IDS) == 7, "Must have exactly 7 teams"
 assert sum(HITTING_SLOTS.values()) == 9, "Must have 9 hitting slots"
 assert sum(PITCHING_SLOTS.values()) == 7, "Must have 7 pitching slots"
+num_starters = sum(HITTING_SLOTS.values()) + sum(PITCHING_SLOTS.values())
+assert num_starters < ROSTER_SIZE, f"Must have bench spots ({num_starters} starters < {ROSTER_SIZE} roster)"
 assert MIN_HITTERS + MIN_PITCHERS <= ROSTER_SIZE, "Composition bounds must fit roster"
 assert SGP_METRIC in ["raw", "dynasty"], "SGP_METRIC must be 'raw' or 'dynasty'"
 ```

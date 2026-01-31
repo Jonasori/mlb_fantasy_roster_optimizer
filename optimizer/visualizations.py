@@ -1898,3 +1898,175 @@ def plot_player_value_scatter(
 
     plt.tight_layout()
     return fig
+
+
+def plot_roster_ewa_by_position(
+    my_roster_names: set[str],
+    projections: pd.DataFrame,
+    my_totals: dict[str, float],
+    opponent_totals: dict[int, dict[str, float]],
+    category_sigmas: dict[str, float],
+) -> plt.Figure:
+    """
+    Plot stacked bar chart showing EWA by position for current roster.
+
+    Each position gets a bar showing total EWA from all players at that position.
+    Bars are stacked by individual player, sorted by EWA descending within each position.
+
+    Args:
+        my_roster_names: Set of player names on my roster
+        projections: Projections DataFrame
+        my_totals: My team's category totals
+        opponent_totals: Dict mapping opponent ID to their totals
+        category_sigmas: Category uncertainty estimates
+
+    Returns:
+        matplotlib.Figure with stacked bar chart
+    """
+    from .trade_engine import compute_player_values
+
+    # Compute player values for my roster
+    player_values = compute_player_values(
+        player_names=my_roster_names,
+        my_roster_names=my_roster_names,
+        projections=projections,
+        my_totals=my_totals,
+        opponent_totals=opponent_totals,
+        category_sigmas=category_sigmas,
+    )
+
+    # Filter to only my roster players
+    roster_values = player_values[player_values["on_my_roster"]].copy()
+
+    # Extract primary position (first position if multi-position)
+    roster_values["primary_position"] = roster_values["Position"].apply(
+        lambda x: str(x).split(",")[0].strip() if pd.notna(x) else "UNK"
+    )
+
+    # Use ewa_lose but flip sign (losing them hurts, so their value is negative)
+    # We want positive EWA showing their contribution
+    roster_values["ewa_contribution"] = -roster_values["ewa_lose"].fillna(0)
+
+    # Sort players within each position by EWA descending
+    roster_values = roster_values.sort_values(
+        ["primary_position", "ewa_contribution"], ascending=[True, False]
+    )
+
+    # Group by position and prepare data for stacked bar chart
+    position_groups = {}
+    for pos in roster_values["primary_position"].unique():
+        pos_players = roster_values[roster_values["primary_position"] == pos]
+        position_groups[pos] = pos_players[["Name", "ewa_contribution"]].copy()
+
+    # Define position order (hitting then pitching)
+    hitting_positions = ["C", "1B", "2B", "SS", "3B", "OF", "UTIL", "DH"]
+    pitching_positions = ["SP", "RP"]
+
+    ordered_positions = []
+    for pos in hitting_positions + pitching_positions:
+        if pos in position_groups:
+            ordered_positions.append(pos)
+    # Add any other positions not in the standard list
+    for pos in sorted(position_groups.keys()):
+        if pos not in ordered_positions:
+            ordered_positions.append(pos)
+
+    # Create figure
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    # Prepare data for stacked bars
+    position_totals = []
+    player_segments = []
+    player_labels = []
+    position_labels = []
+
+    # Use a colormap for player segments
+    cmap = plt.cm.get_cmap("tab20")
+
+    for pos in ordered_positions:
+        pos_data = position_groups[pos]
+        if len(pos_data) == 0:
+            continue
+
+        # Sort by EWA descending
+        pos_data = pos_data.sort_values("ewa_contribution", ascending=False)
+
+        # Store segments for this position
+        segments = []
+        labels = []
+        for _, row in pos_data.iterrows():
+            ewa = row["ewa_contribution"]
+            if ewa > 0:  # Only show positive contributions
+                segments.append(ewa)
+                # Truncate long names for display
+                display_name = strip_name_suffix(row["Name"])
+                if len(display_name) > 20:
+                    display_name = display_name[:17] + "..."
+                labels.append(display_name)
+
+        if segments:
+            position_totals.append(sum(segments))
+            player_segments.append(segments)
+            player_labels.append(labels)
+            position_labels.append(pos)
+
+    # Create stacked bars
+    bottom = np.zeros(len(position_labels))
+
+    for i, (pos, segments, labels) in enumerate(
+        zip(position_labels, player_segments, player_labels)
+    ):
+        for j, (ewa, label) in enumerate(zip(segments, labels)):
+            color_idx = j % 20
+            color = cmap(color_idx)
+            ax.barh(
+                i,
+                ewa,
+                left=bottom[i],
+                height=0.7,
+                color=color,
+                alpha=0.8,
+                edgecolor="white",
+                linewidth=0.5,
+            )
+
+            # Add label for significant contributions (>0.5 EWA)
+            if ewa > 0.5:
+                ax.text(
+                    bottom[i] + ewa / 2,
+                    i,
+                    label,
+                    ha="center",
+                    va="center",
+                    fontsize=8,
+                    fontweight="bold",
+                    color="white" if ewa > position_totals[i] * 0.3 else "black",
+                )
+
+            bottom[i] += ewa
+
+    # Customize axes
+    ax.set_yticks(range(len(position_labels)))
+    ax.set_yticklabels(position_labels)
+    ax.set_xlabel("Expected Wins Added (EWA)", fontsize=12, fontweight="bold")
+    ax.set_title(
+        "Roster EWA by Position\n(Stacked by Player)", fontsize=14, fontweight="bold"
+    )
+    ax.grid(axis="x", alpha=0.3, linestyle="--")
+
+    # Add total EWA annotation
+    total_ewa = sum(position_totals)
+    ax.text(
+        0.98,
+        0.02,
+        f"Total EWA: {total_ewa:.1f}",
+        transform=ax.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=11,
+        fontweight="bold",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.8),
+    )
+
+    plt.tight_layout()
+    return fig

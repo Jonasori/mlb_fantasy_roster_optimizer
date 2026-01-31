@@ -77,6 +77,7 @@ def imports():
         plot_position_distributions,
         plot_position_sensitivity_dashboard,
         plot_roster_changes,
+        plot_roster_ewa_by_position,
         plot_team_dashboard,
         plot_team_radar,
         plot_trade_impact,
@@ -107,6 +108,7 @@ def imports():
         plot_position_distributions,
         plot_position_sensitivity_dashboard,
         plot_roster_changes,
+        plot_roster_ewa_by_position,
         plot_team_dashboard,
         plot_team_radar,
         plot_upgrade_opportunities,
@@ -138,8 +140,8 @@ def config():
     # =======================================================
     # CONFIGURATION FLAGS
     # =======================================================
-    SKIP_FANTRAX = True  # Set False to fetch rosters from Fantrax API
-    SKIP_MLB_API = True  # Set True to skip MLB API age fetching (faster)
+    SKIP_FANTRAX = False  # Set False to fetch rosters from Fantrax API
+    SKIP_MLB_API = False  # Set True to skip MLB API age fetching (faster)
     # =======================================================
 
     # Generate adjusted projections if enabled in config
@@ -284,6 +286,36 @@ def category_margins(mo, my_totals, opponent_totals, plot_category_margins):
         [
             mo.md("## Category Margins"),
             plot_category_margins(my_totals, opponent_totals),
+        ]
+    )
+    return
+
+
+@app.cell
+def roster_ewa_by_position(
+    category_sigmas,
+    mo,
+    my_roster_names,
+    my_totals,
+    opponent_totals,
+    plot_roster_ewa_by_position,
+    projections,
+):
+    mo.vstack(
+        [
+            mo.md("## Roster EWA by Position"),
+            mo.md(
+                "Expected Wins Added (EWA) contribution from each position. "
+                "Bars are stacked by individual player, showing which positions "
+                "and players contribute most to your team's expected wins."
+            ),
+            plot_roster_ewa_by_position(
+                my_roster_names=my_roster_names,
+                projections=projections,
+                my_totals=my_totals,
+                opponent_totals=opponent_totals,
+                category_sigmas=category_sigmas,
+            ),
         ]
     )
     return

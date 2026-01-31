@@ -10,13 +10,16 @@ Unlike the Free Agent Optimizer which uses MILP for global optimization, the Tra
 
 **Key insight:** In rotisserie scoring, a player's value is *context-dependent*. Production in a category where you're safely ahead has near-zero marginal value. Production in a category where you're in a close race is extremely valuable. The trade engine exploits this asymmetry.
 
+**Note:** Team totals are computed from optimal starting lineups only (see [01a_config.md](01a_config.md#key-design-concept-lineup-aware-totals)).
+
 ---
 
 ## Cross-References
 
 **Depends on:**
 - [00_agent_guidelines.md](00_agent_guidelines.md) — code style, fail-fast philosophy
-- [01a_config.md](01a_config.md) — `compute_team_totals()`, `estimate_projection_uncertainty()`, category constants
+- [01a_config.md](01a_config.md) — `estimate_projection_uncertainty()`, category constants
+- [01b_fangraphs_loading.md](01b_fangraphs_loading.md) — `compute_team_totals()` (lineup-aware)
 - [01d_database.md](01d_database.md) — `get_projections()`, `get_roster_names()`
 - [01e_dynasty_valuation.md](01e_dynasty_valuation.md) — `dynasty_SGP` for trade fairness
 

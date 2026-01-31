@@ -47,6 +47,7 @@ Quick reference for key terms used throughout these specifications:
 | **dynasty_SGP** | Age-adjusted SGP representing net present value of future production. |
 | **Big-M** | Large constant used in MILP indicator constraints (10000 for counting, 5000 for ratio). |
 | **ε (epsilon)** | Small constant for strict inequality (0.5 for counting, 0.001 for ratio). |
+| **Lineup-aware totals** | Team totals computed from the optimal starting lineup only. Bench players contribute zero to category scoring. |
 
 ## Architecture Overview
 
@@ -119,7 +120,17 @@ All code uses module-level functions and plain data structures. No classes.
 | **Free Agent Optimizer** | "What's my optimal roster?" | MILP (global optimum) |
 | **Trade Engine** | "Which trades should I propose?" | Probabilistic model |
 
-### 5. Probabilistic Win Model (Trade Engine)
+### 5. Lineup-Aware Totals (Starters Only)
+
+In weekly rotisserie scoring, only **starters generate fantasy points**—bench players contribute nothing.
+
+- `compute_optimal_lineup()` solves an assignment problem to fill each slot optimally
+- `compute_team_totals()` sums stats from the optimal starting lineup, not the full roster
+- Opponent totals are computed from their optimal lineups too
+- The MILP sums stats over starters only
+- A player's value is their improvement over the starter they'd displace
+
+### 6. Probabilistic Win Model (Trade Engine)
 
 Based on Rosenof (2025):
 
@@ -134,13 +145,13 @@ Where:
 
 Marginal value computed via **numerical differentiation** (simple, accurate).
 
-### 6. Player Name Uniqueness
+### 7. Player Name Uniqueness
 
 All names include `-H` or `-P` suffix:
 - `"Mike Trout-H"`, `"Gerrit Cole-P"`
 - Display functions use `strip_name_suffix()` (single source in data_loader)
 
-### 7. Raw SGP for Trade Fairness
+### 8. Raw SGP for Trade Fairness
 
 Trade fairness uses raw single-season `SGP`, not dynasty_SGP:
 - Simpler and more predictable
@@ -148,15 +159,15 @@ Trade fairness uses raw single-season `SGP`, not dynasty_SGP:
 - Trade fairness = SGP differential within 10%
 - Dynasty leagues can optionally enable age-adjusted values
 
-### 8. SGP Weights Rate Stats by Playing Time
+### 9. SGP Weights Rate Stats by Playing Time
 
 Following the canonical SGP methodology (Smart Fantasy Baseball), rate stats are weighted by playing time. A .850 OPS player with 600 PA contributes more to team OPS than the same player with 100 PA.
 
-### 9. Fail Fast
+### 10. Fail Fast
 
 No try/except blocks. No fallback logic. Assert with descriptive messages.
 
-### 10. SGP vs EWA: Context-Free vs Context-Dependent Value
+### 11. SGP vs EWA: Context-Free vs Context-Dependent Value
 
 Two different value metrics serve different purposes:
 
@@ -172,6 +183,7 @@ Two different value metrics serve different purposes:
 - A high-SGP player may have low EWA if you're already dominant in their categories
 - A lower-SGP player may have high EWA if they fill contested category gaps
 - More intuitive than league win probability (V): "you gain 1.5 expected wins" vs "you gain 0.3%"
+- **Lineup-aware:** EWA measures value over the starter they'd displace—a player who wouldn't start has near-zero EWA
 
 **Standardization:** All team-specific value metrics use EWA (expected category wins out of 60), not WPA (league win probability). EWA is more linear, more intuitive, and avoids the non-linearities of the league probability model.
 

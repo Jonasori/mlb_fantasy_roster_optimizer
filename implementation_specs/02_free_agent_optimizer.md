@@ -8,7 +8,7 @@ This module uses Mixed-Integer Linear Programming (MILP) to find the globally op
 
 **Module:** `optimizer/roster_optimizer.py`
 
-**Key Design Decision:** All rostered players' stats count toward team totals (not just starters). The starting lineup slots exist only to enforce positional requirements—a valid roster must be able to field a legal starting lineup. Bench players contribute stats equally to starters.
+**Key Design Decision:** Only starters' stats count toward team totals. In weekly rotisserie scoring, bench players generate zero fantasy points. The MILP sums stats over players assigned to starting slots (`starts[i] = Σ_s a[i,s]`), not all rostered players (`x[i]`). This means player value is measured as marginal improvement over the incumbent starter they would displace—a high-SGP player who wouldn't crack the starting lineup has near-zero value.
 
 ---
 
@@ -16,8 +16,8 @@ This module uses Mixed-Integer Linear Programming (MILP) to find the globally op
 
 **Depends on:**
 - [00_agent_guidelines.md](00_agent_guidelines.md) — code style, PuLP variable naming
-- [01a_config.md](01a_config.md) — `SLOT_ELIGIBILITY`, roster bounds, category lists
-- [01b_fangraphs_loading.md](01b_fangraphs_loading.md) — `compute_team_totals()`, `compute_quality_scores()`
+- [01a_config.md](01a_config.md) — `SLOT_ELIGIBILITY`, `HITTING_SLOTS`, `PITCHING_SLOTS`, roster bounds, category lists
+- [01b_fangraphs_loading.md](01b_fangraphs_loading.md) — `compute_team_totals()` (used for opponent totals), `compute_quality_scores()`
 - [01d_database.md](01d_database.md) — `get_projections()`, `get_roster_names()`
 
 **Used by:**
@@ -157,7 +157,7 @@ S     = S_H ∪ S_P = all slot types
 ```
 x[i] ∈ {0, 1}    for all i ∈ I
 ```
-`x[i] = 1` means player i is on my roster.
+`x[i] = 1` means player i is on my 26-man roster.
 
 **Slot assignment:**
 ```
@@ -170,6 +170,15 @@ Only create `a[i,s]` variables for eligible (player, slot) pairs:
 player_position = candidates.iloc[i]['Position']
 is_eligible = player_position in SLOT_ELIGIBILITY[s]
 ```
+
+**Derived: Starter indicator:**
+```
+starts[i] = Σ_{s : (i,s) ∈ a} a[i,s]    for all i ∈ I
+```
+`starts[i] = 1` means player i is in the starting lineup (assigned to exactly one slot).
+`starts[i] = 0` means player i is on the bench (rostered but not starting).
+
+**Implementation note:** `starts[i]` is not a separate variable—it's computed inline as `lpSum(a[i, s] for s in eligibility[i])`. Since C3 ensures each player is in at most one slot, `starts[i]` is effectively binary.
 
 **Beat indicators:**
 ```
@@ -220,58 +229,65 @@ MIN_PITCHERS ≤ Σ_{i ∈ I_P} x[i] ≤ MAX_PITCHERS
 For counting stats (R, HR, RBI, SB, W, SV, K) where higher is better:
 
 ```
-Σ_{i ∈ I_relevant} M[i,c] * x[i]  ≥  O[j,c] + ε - B * (1 - y[j,c])
+Σ_{i ∈ I_relevant} M[i,c] * starts[i]  ≥  O[j,c] + ε - B * (1 - y[j,c])
 ```
 
 Where:
 - `I_relevant` = `I_H` for hitting categories, `I_P` for pitching categories
 - `M[i,c]` = player i's projected value in category c
-- `O[j,c]` = opponent j's total in category c
+- `O[j,c]` = opponent j's total in category c (from their starters only!)
+- `starts[i] = Σ_s a[i,s]` = 1 if player i is starting, 0 if on bench
 - `ε = EPSILON_COUNTING = 0.5`
 - `B = BIG_M_COUNTING = 10000`
 
+**CRITICAL:** We sum over `starts[i]`, NOT `x[i]`. Only starters contribute stats.
+
 **How it works:**
-- If `y[j,c] = 1`: constraint becomes `my_total ≥ O[j,c] + 0.5` (must beat them)
-- If `y[j,c] = 0`: constraint becomes `my_total ≥ O[j,c] - 9999.5` (always satisfied)
+- If `y[j,c] = 1`: constraint becomes `my_starter_total ≥ O[j,c] + 0.5` (must beat them)
+- If `y[j,c] = 0`: constraint becomes `my_starter_total ≥ O[j,c] - 9999.5` (always satisfied)
 
 #### C7: Beat Constraints for OPS (Higher is Better)
 
 OPS requires linearization since it's a weighted average.
 
-**Goal:** I beat opponent j if `my_OPS > opponent_OPS[j]`
+**Goal:** I beat opponent j if `my_OPS > opponent_OPS[j]` (comparing starter OPS only)
 
 **Linearization:**
 ```
-my_OPS > O[j, OPS]
-⟺  Σ(PA[i] * OPS[i] * x[i]) / Σ(PA[i] * x[i]) > O[j, OPS]
-⟺  Σ(PA[i] * OPS[i] * x[i]) > O[j, OPS] * Σ(PA[i] * x[i])
-⟺  Σ PA[i] * (OPS[i] - O[j, OPS]) * x[i] > 0
+my_starter_OPS > O[j, OPS]
+⟺  Σ(PA[i] * OPS[i] * starts[i]) / Σ(PA[i] * starts[i]) > O[j, OPS]
+⟺  Σ(PA[i] * OPS[i] * starts[i]) > O[j, OPS] * Σ(PA[i] * starts[i])
+⟺  Σ PA[i] * (OPS[i] - O[j, OPS]) * starts[i] > 0
 ```
 
 **Constraint:**
 ```
-Σ_{i ∈ I_H} PA[i] * (OPS[i] - O[j, OPS]) * x[i]  ≥  ε - B * (1 - y[j, OPS])
+Σ_{i ∈ I_H} PA[i] * (OPS[i] - O[j, OPS]) * starts[i]  ≥  ε - B * (1 - y[j, OPS])
 ```
+
+Where `starts[i] = Σ_s a[i,s]` for player i's eligible slots.
 
 #### C8: Beat Constraints for ERA and WHIP (Lower is Better)
 
-For ERA, I beat opponent j if `my_ERA < opponent_ERA[j]`.
+For ERA, I beat opponent j if `my_ERA < opponent_ERA[j]` (comparing starter ERA only).
 
 **Linearization (note the sign flip!):**
 ```
-my_ERA < O[j, ERA]
-⟺  Σ(IP[i] * ERA[i] * x[i]) < O[j, ERA] * Σ(IP[i] * x[i])
-⟺  Σ IP[i] * (O[j, ERA] - ERA[i]) * x[i] > 0
+my_starter_ERA < O[j, ERA]
+⟺  Σ(IP[i] * ERA[i] * starts[i]) < O[j, ERA] * Σ(IP[i] * starts[i])
+⟺  Σ IP[i] * (O[j, ERA] - ERA[i]) * starts[i] > 0
 ```
 
 **Constraint:**
 ```
-Σ_{i ∈ I_P} IP[i] * (O[j, ERA] - ERA[i]) * x[i]  ≥  ε - B * (1 - y[j, ERA])
+Σ_{i ∈ I_P} IP[i] * (O[j, ERA] - ERA[i]) * starts[i]  ≥  ε - B * (1 - y[j, ERA])
 ```
 
 Same pattern for WHIP.
 
 **Critical:** The coefficient is `(opponent_value - player_value)` for ERA/WHIP, but `(player_value - opponent_value)` for OPS.
+
+**Also critical:** `O[j,c]` (opponent totals) must be computed from their starters only, using `compute_team_totals()` which calls `compute_optimal_lineup()` internally.
 
 ---
 
@@ -670,8 +686,10 @@ Before the optimizer is complete:
 - [ ] print() for status at each stage
 - [ ] Uses `pulp.HiGHS_CMD()` with `highspy` package installed
 - [ ] Ratio stat linearization has correct signs
-- [ ] Beat constraints filter by player_type
+- [ ] Beat constraints sum over `starts[i] = Σ_s a[i,s]`, NOT `x[i]` (only starters contribute)
+- [ ] Beat constraints filter by player_type (I_H for hitting, I_P for pitching)
+- [ ] Opponent totals computed via `compute_team_totals()` (lineup-aware, starters only)
 - [ ] `compute_slot_eligibility()` parses multi-position strings correctly
 - [ ] `validate_slot_coverage()` runs before MILP solve
 - [ ] `a[i,s]` variables created only for eligible (player, slot) pairs
-- [ ] sum(PA) > 0 and sum(IP) > 0 asserted for all teams
+- [ ] sum(PA) > 0 and sum(IP) > 0 asserted for starting lineups

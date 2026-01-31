@@ -12,12 +12,12 @@ This document specifies loading FanGraphs Steamer projections. FanGraphs is the 
 
 **Depends on:**
 - [00_agent_guidelines.md](00_agent_guidelines.md) — code style, fail-fast philosophy
-- [01a_config.md](01a_config.md) — `compute_sgp_value()`, category constants
+- [01a_config.md](01a_config.md) — `compute_sgp_value()`, category constants, `SLOT_ELIGIBILITY`, `HITTING_SLOTS`, `PITCHING_SLOTS`
 
 **Used by:**
 - [01d_database.md](01d_database.md) — `load_projections()` output synced to database
-- [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — `compute_team_totals()`, `compute_quality_scores()`
-- [03_trade_engine.md](03_trade_engine.md) — `compute_team_totals()` for win probability
+- [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — `compute_team_totals()`, `compute_optimal_lineup()`, `compute_quality_scores()`
+- [03_trade_engine.md](03_trade_engine.md) — `compute_team_totals()` for win probability (lineup-aware)
 
 ---
 
@@ -203,39 +203,108 @@ def load_projections(
 
 ---
 
+## Optimal Lineup Computation
+
+**Key function** that determines which players should start, given positional constraints. This is called by `compute_team_totals()` to ensure only starters contribute to category totals.
+
+```python
+def compute_optimal_lineup(
+    roster_names: set[str],
+    projections: pd.DataFrame,
+) -> set[str]:
+    """
+    Given a roster, determine the optimal starting lineup.
+
+    Solves an assignment problem: assign players to starting slots to maximize
+    total SGP of starters. Multi-position players can fill any eligible slot.
+
+    Args:
+        roster_names: Set of player names on the roster (with -H/-P suffix)
+        projections: Combined projections DataFrame (must have SGP, Position)
+
+    Returns:
+        Set of player names who should start.
+        Size = sum(HITTING_SLOTS.values()) + sum(PITCHING_SLOTS.values())
+        Bench players are NOT included in the returned set.
+
+    Implementation:
+        Uses a small MILP (solves in milliseconds):
+
+        Decision variables:
+            a[i,s] ∈ {0,1} = 1 if player i starts in slot s
+
+        Objective:
+            maximize Σ_{i,s} SGP[i] * a[i,s]
+
+        Constraints:
+            1. Each slot type filled to required count:
+               Σ_i a[i,s] = HITTING_SLOTS[s]  for hitting slots
+               Σ_i a[i,s] = PITCHING_SLOTS[s]  for pitching slots
+               (e.g., OF needs 3 players, SP needs 5)
+
+            2. Each player in at most one slot:
+               Σ_s a[i,s] <= 1  for each player i
+
+            3. Eligibility enforced by variable creation:
+               Only create a[i,s] for (player, slot) pairs where player is eligible.
+               Hitters can only fill hitting slots; pitchers can only fill pitching slots.
+               Multi-position players (e.g., "SS,2B") can fill any eligible slot.
+
+        If the roster cannot fill all slots, raise AssertionError with message
+        indicating which slot cannot be filled. This can happen when evaluating
+        hypothetical roster changes (e.g., dropping the only catcher).
+
+    Assertions:
+        - len(return) == sum(HITTING_SLOTS.values()) + sum(PITCHING_SLOTS.values())
+        - All returned names are in roster_names
+        - Returned lineup satisfies all slot constraints (each slot filled exactly once)
+
+    Print: (none - this is called frequently)
+    """
+```
+
+---
+
 ## Team Total Computation
 
-**Critical shared function** used by optimizer and trade engine.
+**Critical shared function** used by optimizer and trade engine. Computes totals from **starters only** (not full roster).
 
 ```python
 def compute_team_totals(
-    player_names: Iterable[str],
+    roster_names: Iterable[str],
     projections: pd.DataFrame,
 ) -> dict[str, float]:
     """
     Compute a team's projected totals in all 10 scoring categories.
-    
+
+    IMPORTANT: Only starters contribute to totals. This function first
+    computes the optimal starting lineup, then sums stats from starters only.
+    Bench players do not contribute.
+
     Args:
-        player_names: Iterable of player names (must include -H/-P suffix)
+        roster_names: Iterable of player names on roster (must include -H/-P suffix)
         projections: Combined projections DataFrame
-    
+
     Returns:
-        Dict mapping category to team total.
+        Dict mapping category to team total (from starters only).
         Example: {'R': 823, 'HR': 245, ..., 'ERA': 3.85, ...}
-    
+
     Implementation:
-        1. Filter projections to players on team
-        2. Separate hitters (player_type == 'hitter') from pitchers
-        3. Counting stats for hitters: sum(R, HR, RBI, SB)
-        4. OPS: sum(PA * OPS) / sum(PA)  # PA-weighted average
-        5. Counting stats for pitchers: sum(W, SV, K)
-        6. ERA: sum(IP * ERA) / sum(IP)  # IP-weighted average
-        7. WHIP: sum(IP * WHIP) / sum(IP)
-    
+        1. Convert roster_names to set
+        2. Call compute_optimal_lineup(roster_names, projections) → starters
+        3. Filter projections to starters only (NOT full roster)
+        4. Separate hitters (player_type == 'hitter') from pitchers
+        5. Counting stats for hitters: sum(R, HR, RBI, SB)
+        6. OPS: sum(PA * OPS) / sum(PA)  # PA-weighted average
+        7. Counting stats for pitchers: sum(W, SV, K)
+        8. ERA: sum(IP * ERA) / sum(IP)  # IP-weighted average
+        9. WHIP: sum(IP * WHIP) / sum(IP)
+
     Assertions (with messages):
-        - All player_names found in projections
-        - sum(PA) > 0 for hitters
-        - sum(IP) > 0 for pitchers
+        - All roster_names found in projections
+        - len(starters) == sum(HITTING_SLOTS.values()) + sum(PITCHING_SLOTS.values())
+        - sum(PA) > 0 for starting hitters
+        - sum(IP) > 0 for starting pitchers
     """
 
 
@@ -245,16 +314,23 @@ def compute_all_opponent_totals(
 ) -> dict[int, dict[str, float]]:
     """
     Compute totals for all 6 opponents.
-    
+
+    Each opponent's totals are computed from their optimal starting lineup,
+    not their full roster. This ensures fair comparison since only starters
+    generate fantasy points.
+
     Args:
         opponent_rosters: Dict mapping team_id to set of player names
         projections: Combined projections DataFrame
-    
+
     Returns:
-        Dict mapping team_id to their category totals.
+        Dict mapping team_id to their category totals (from starters only).
         {1: {'R': 800, 'HR': 230, ...}, 2: {...}, ...}
-    
+
     Implementation:
+        For each opponent:
+            compute_team_totals(opponent_roster, projections)
+
         Use tqdm for progress: "Computing opponent totals"
     """
 ```

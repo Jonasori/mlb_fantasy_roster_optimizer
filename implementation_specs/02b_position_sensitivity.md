@@ -10,6 +10,8 @@ Unlike SGP-based rankings (which are context-free), this analysis uses **Expecte
 
 **Key Insight:** SGP is a poor proxy for value at certain positions, especially relief pitchers. See [Why SGP Fails for Relief Pitchers](#why-sgp-fails-for-relief-pitchers) below.
 
+**Note:** EWA uses lineup-aware totals (see [01a_config.md](01a_config.md#key-design-concept-lineup-aware-totals)).
+
 ---
 
 ## Cross-References
@@ -17,6 +19,7 @@ Unlike SGP-based rankings (which are context-free), this analysis uses **Expecte
 **Depends on:**
 - [00_agent_guidelines.md](00_agent_guidelines.md) — code style
 - [01a_config.md](01a_config.md) — `SLOT_ELIGIBILITY`, category constants
+- [01b_fangraphs_loading.md](01b_fangraphs_loading.md) — `compute_team_totals()` (lineup-aware)
 - [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — optimizer infrastructure
 - [03_trade_engine.md](03_trade_engine.md) — `compute_win_probability()` for EWA calculation
 
