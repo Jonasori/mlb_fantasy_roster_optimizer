@@ -10,6 +10,22 @@ This document shows how to use the optimizer in a marimo notebook. It demonstrat
 
 ---
 
+## Cross-References
+
+**Depends on:**
+- [00_agent_guidelines.md](00_agent_guidelines.md) — code style
+- [01d_database.md](01d_database.md) — `refresh_all_data()` entry point
+- [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — `build_and_solve_milp()`, roster functions
+- [02a_variance_penalized_objective.md](02a_variance_penalized_objective.md) — optional `balance_lambda`
+- [02b_position_sensitivity.md](02b_position_sensitivity.md) — position analysis functions
+- [03_trade_engine.md](03_trade_engine.md) — trade analysis functions
+- [04_visualizations.md](04_visualizations.md) — all plot functions
+
+**Used by:**
+- [07_testing.md](07_testing.md) — notebook serves as integration test
+
+---
+
 ## Notebook Structure
 
 1. **Setup** - Imports and configuration
@@ -56,6 +72,8 @@ from optimizer.roster_optimizer import (
     compute_standings,
     print_roster_summary,
     compute_roster_change_values,
+    compute_position_sensitivity,
+    compute_percentile_sensitivity,
 )
 
 # Trade engine
@@ -84,6 +102,10 @@ from optimizer.visualizations import (
     plot_player_value_scatter,
     plot_trade_impact,
     plot_constraint_analysis,
+    plot_position_sensitivity_dashboard,
+    plot_percentile_ewa_curves,
+    plot_position_distributions,
+    plot_upgrade_opportunities,
 )
 ```
 
@@ -131,6 +153,9 @@ opponent_rosters_indexed = {
     i+1: names for i, (team, names) in enumerate(opponent_rosters.items())
 }
 opponent_totals = compute_all_opponent_totals(opponent_rosters_indexed, projections)
+
+# Compute category sigmas for win probability and position sensitivity analysis
+category_sigmas = estimate_projection_uncertainty(my_totals, opponent_totals)
 ```
 
 ### Cell 5: Team Comparison Radar
@@ -332,20 +357,78 @@ fig = plot_constraint_analysis(optimal_roster_names, projections)
 fig
 ```
 
-### Cell 21: Sensitivity Analysis (Optional)
+### Cell 21: Position Sensitivity Analysis
 
 ```python
-mo.md("""
-### Sensitivity Analysis (Optional - Slow)
+mo.md("## Position Sensitivity Analysis")
 
-*Uncomment the code below to run sensitivity analysis. Takes 5-15 minutes.*
-""")
+# Compute position-by-position EWA analysis
+sensitivity_results = compute_position_sensitivity(
+    my_roster_names=my_roster_names,
+    opponent_roster_names=opponent_roster_names,
+    projections=projections,
+    opponent_totals=opponent_totals,
+    category_sigmas=category_sigmas,
+)
 
-# Uncomment to run:
-# from optimizer.roster_optimizer import compute_player_sensitivity
-# sensitivity = compute_player_sensitivity(optimal_roster_names, candidates, opponent_totals)
-# fig = plot_player_sensitivity(sensitivity)
-# fig
+slot_data = sensitivity_results["slot_data"]
+ewa_df = sensitivity_results["ewa_df"]
+sensitivity_df = sensitivity_results["sensitivity_df"]
+baseline_ew = sensitivity_results["baseline_expected_wins"]
+
+# Compute percentile sensitivity curves
+pctl_ewa_df = compute_percentile_sensitivity(
+    my_roster_names=my_roster_names,
+    projections=projections,
+    opponent_totals=opponent_totals,
+    category_sigmas=category_sigmas,
+    slot_data=slot_data,
+    baseline_expected_wins=baseline_ew,
+)
+
+print(f"Baseline expected wins: {baseline_ew:.1f} / 60")
+print("\nPosition Upgrade Opportunities:")
+print(sensitivity_df[["slot", "my_worst_name", "better_fas_count", "best_fa_sgp_gap", "best_fa_ewa"]].to_string(index=False))
+```
+
+### Cell 22: Position Sensitivity Dashboard
+
+```python
+mo.vstack([
+    mo.md("### Position Sensitivity Dashboard"),
+    mo.md("Shows which positions offer the most EWA per SGP, best FA upgrades, and position scarcity."),
+    plot_position_sensitivity_dashboard(ewa_df, sensitivity_df, slot_data),
+])
+```
+
+### Cell 23: Upgrade Opportunities
+
+```python
+mo.vstack([
+    mo.md("### Upgrade Opportunities by Position"),
+    mo.md("SGP gap between best available FA and your worst rostered player."),
+    plot_upgrade_opportunities(slot_data),
+])
+```
+
+### Cell 24: Percentile EWA Curves
+
+```python
+mo.vstack([
+    mo.md("### EWA vs Percentile Curves"),
+    mo.md("How much EWA you gain from upgrading to different percentile levels. Star shows your current player."),
+    plot_percentile_ewa_curves(pctl_ewa_df),
+])
+```
+
+### Cell 25: Position Distributions
+
+```python
+mo.vstack([
+    mo.md("### Player Distribution by Position"),
+    mo.md("SGP distributions for each position. Red dots = your rostered players."),
+    plot_position_distributions(slot_data),
+])
 ```
 
 ---
@@ -368,3 +451,68 @@ mo.md("""
 4. **Visualizations return figures:** Never call `plt.show()` — marimo handles display.
 
 5. **Progress reporting:** Long operations use `print()` for status and `tqdm` for progress bars.
+
+---
+
+## ⚠️ CRITICAL: Marimo Output Pattern
+
+In marimo, the **last expression before `return`** is the cell's visual output. The `return` statement is ONLY for exporting variables to other cells.
+
+### Correct Pattern (display + export):
+```python
+@app.cell
+def my_cell(mo, data):
+    # Computation
+    result = process(data)
+    
+    # Display output (MUST be last expression before return)
+    mo.vstack([
+        mo.md("## Results"),
+        plot_results(result),
+    ])
+    
+    # Export variables (NOT for display)
+    return (result,)
+```
+
+### Correct Pattern (display only, no export):
+```python
+@app.cell
+def viz_cell(mo, data):
+    mo.vstack([
+        mo.md("## Visualization"),
+        plot_data(data),
+    ])
+    return  # Empty return = no exports
+```
+
+### WRONG - `return mo.vstack(...)` causes syntax errors:
+```python
+@app.cell  
+def bad_cell(mo, data):
+    # ❌ WRONG: This causes "'return' outside function" errors
+    if condition:
+        return mo.vstack([...])  # DON'T DO THIS
+    else:
+        return mo.md("...")
+```
+
+### Correct Pattern for Conditional Display:
+```python
+@app.cell
+def conditional_cell(mo, data):
+    if condition:
+        output = mo.vstack([mo.md("## Title"), plot_data(data)])
+    else:
+        output = mo.md("## Title\n\n*No data available*")
+    
+    output  # Last expression = displayed
+    return  # No exports
+```
+
+### Key Rules:
+1. **Last expression** = visual output (displayed above the cell)
+2. **`return (var1, var2)`** = export variables to other cells (NOT for display)
+3. **`return`** (empty) = no exports, but last expression still displays
+4. **Never use `return mo.vstack(...)`** - it confuses display with export
+5. For conditional display, assign to a variable and make it the last expression

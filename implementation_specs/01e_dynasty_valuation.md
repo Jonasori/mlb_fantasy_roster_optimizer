@@ -8,6 +8,19 @@ Dynasty value is the **net present value (NPV)** of a player's expected future S
 
 ---
 
+## Cross-References
+
+**Depends on:**
+- [00_agent_guidelines.md](00_agent_guidelines.md) — code style
+- [01a_config.md](01a_config.md) — SGP values to adjust
+- [01c_fantrax_api.md](01c_fantrax_api.md) — age data from `fetch_player_pool()`
+
+**Used by:**
+- [01d_database.md](01d_database.md) — `compute_dynasty_sgp()` called during sync
+- [03_trade_engine.md](03_trade_engine.md) — `dynasty_SGP` for trade fairness evaluation
+
+---
+
 ## Sources
 
 The aging curves are based on empirical research:
@@ -164,11 +177,11 @@ def add_dynasty_sgp_to_projections(
 
 ## Trade Engine Integration
 
-The trade engine uses `dynasty_SGP` for fairness:
+The trade engine uses `SGP` for fairness:
 
 - **Trade fairness:** SGP differential within 10% of total SGP involved
-- **Acquirability:** `delta_V_acquire / (dynasty_SGP + 0.5)`
-- **Expendability:** `-(dynasty_SGP + lose_cost × scale)`
+- **Trade targets:** Ranked by `ewa_acquire` descending
+- **Expendability:** `-SGP + ewa_lose × LOSE_COST_SCALE`
 
 Both `SGP` and `dynasty_SGP` remain in DataFrame for analysis.
 

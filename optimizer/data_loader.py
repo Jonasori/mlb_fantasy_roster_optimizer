@@ -19,101 +19,32 @@ import numpy as np
 import pandas as pd
 from tqdm.auto import tqdm
 
-# === LEAGUE CONFIGURATION ===
-
-# Scoring categories
-HITTING_CATEGORIES = ["R", "HR", "RBI", "SB", "OPS"]
-PITCHING_CATEGORIES = ["W", "SV", "K", "ERA", "WHIP"]
-ALL_CATEGORIES = HITTING_CATEGORIES + PITCHING_CATEGORIES
-
-# Categories where lower is better
-NEGATIVE_CATEGORIES = {"ERA", "WHIP"}
-
-# Ratio stats and their weighting denominators
-RATIO_STATS = {
-    "OPS": "PA",  # Team OPS = sum(PA * OPS) / sum(PA)
-    "ERA": "IP",  # Team ERA = sum(IP * ERA) / sum(IP)
-    "WHIP": "IP",  # Team WHIP = sum(IP * WHIP) / sum(IP)
-}
-
-# Roster construction
-ROSTER_SIZE = 26  # Active roster only
-
-# Starting lineup slots (for positional validity checking)
-HITTING_SLOTS = {
-    "C": 1,
-    "1B": 1,
-    "2B": 1,
-    "SS": 1,
-    "3B": 1,
-    "OF": 3,
-    "UTIL": 1,
-}  # Total: 9 hitting slots
-
-PITCHING_SLOTS = {
-    "SP": 5,
-    "RP": 2,
-}  # Total: 7 pitching slots
-
-# Position eligibility: which player positions can fill which lineup slots
-SLOT_ELIGIBILITY = {
-    "C": {"C"},
-    "1B": {"1B"},
-    "2B": {"2B"},
-    "SS": {"SS"},
-    "3B": {"3B"},
-    "OF": {"OF"},
-    "UTIL": {"C", "1B", "2B", "SS", "3B", "OF", "DH"},
-    "SP": {"SP"},
-    "RP": {"RP"},
-}
-
-# Roster composition bounds
-MIN_HITTERS = 12
-MAX_HITTERS = 16
-MIN_PITCHERS = 10
-MAX_PITCHERS = 14
-
-# League structure
-NUM_OPPONENTS = 6  # 7-team league (me + 6 opponents)
-
-# Status mapping for Fantrax exports
-FANTRAX_STATUS_MAP = {
-    "Act": "active",
-    "Res": "active",  # Reserve still counts toward 26-man
-    "Min": "prospect",
-    "IR": "IR",
-}
-
-# Minimum standard deviation for z-score calculation
-MIN_STD = 0.001
-
-# === SGP (STANDING GAIN POINTS) CONFIGURATION ===
-# SGP denominators represent "how much of stat X gains one standing point"
-# Based on Smart Fantasy Baseball analysis of 14 sources (12-team leagues),
-# adjusted for 7-team league with OPS instead of BA.
-# See: https://www.smartfantasybaseball.com/2016/01/how-to-analyze-sgp-denominators-from-different-sources/
-
-SGP_DENOMINATORS = {
-    # Hitting counting stats
-    "R": 20.0,
-    "HR": 8.0,
-    "RBI": 20.0,
-    "SB": 7.0,
-    # Pitching counting stats
-    "W": 3.5,
-    "SV": 8.0,
-    "K": 35.0,
-}
-
-# Rate stat SGP config: (denominator, league_average, higher_is_better)
-# Note: Rate stats are NOT weighted by playing time for SGP calculation.
-# Playing time value is already captured in counting stats.
-SGP_RATE_STATS = {
-    "OPS": (0.010, 0.750, True),  # Higher OPS is better
-    "ERA": (0.18, 4.00, False),  # Lower ERA is better
-    "WHIP": (0.030, 1.25, False),  # Lower WHIP is better
-}
+# Import all configuration constants from config module
+from .config import (
+    ALL_CATEGORIES,
+    BALANCE_LAMBDA_DEFAULT,
+    FANTRAX_ACTIVE_STATUS_IDS,
+    FANTRAX_LEAGUE_ID,
+    FANTRAX_TEAM_IDS,
+    HITTING_CATEGORIES,
+    HITTING_SLOTS,
+    MAX_HITTERS,
+    MAX_PITCHERS,
+    MIN_HITTERS,
+    MIN_PITCHERS,
+    MIN_STAT_STANDARD_DEVIATION,
+    MY_TEAM_ID,
+    MY_TEAM_NAME,
+    NEGATIVE_CATEGORIES,
+    NUM_OPPONENTS,
+    PITCHING_CATEGORIES,
+    PITCHING_SLOTS,
+    RATIO_STATS,
+    ROSTER_SIZE,
+    SGP_DENOMINATORS,
+    SGP_RATE_STATS,
+    SLOT_ELIGIBILITY,
+)
 
 
 # === UTILITY FUNCTIONS ===
@@ -185,18 +116,39 @@ def load_positions_from_db(db_path: str) -> dict[int, str]:
     Load player positions from SQLite database.
 
     Args:
-        db_path: Path to mlb_stats.db
+        db_path: Path to optimizer.db
 
     Returns:
         Dict mapping MLBAMID (int) to position (str).
         Example: {592450: 'OF', 677951: 'SS', ...}
+
+    Note:
+        If database is empty or positions don't exist yet, returns empty dict.
+        Positions will default to "DH" for hitters in load_hitter_projections().
     """
     conn = sqlite3.connect(db_path)
-    cursor = conn.execute("SELECT player_id, position FROM players")
-    positions = {int(row[0]): row[1] for row in cursor.fetchall()}
+    cursor = conn.cursor()
+
+    # Check if players table exists
+    cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='players'"
+    )
+    if not cursor.fetchone():
+        conn.close()
+        print("  No players table found - positions will default to 'DH'")
+        return {}
+
+    # Query mlbamid and position from optimizer.db
+    cursor.execute("SELECT mlbamid, position FROM players WHERE mlbamid IS NOT NULL")
+    rows = cursor.fetchall()
+    positions = {int(row[0]): row[1] for row in rows if row[0] is not None}
     conn.close()
 
-    print(f"Loaded positions for {len(positions)} players from database")
+    if len(positions) > 0:
+        print(f"Loaded positions for {len(positions)} players from database")
+    else:
+        print("  No positions found in database - positions will default to 'DH'")
+
     return positions
 
 
@@ -343,9 +295,18 @@ def load_pitcher_projections(filepath: str) -> pd.DataFrame:
     return df[return_cols].copy()
 
 
-def load_projections(hitter_path: str, pitcher_path: str, db_path: str) -> pd.DataFrame:
+def load_projections(
+    hitter_path: str | None = None,
+    pitcher_path: str | None = None,
+    db_path: str | None = None,
+) -> pd.DataFrame:
     """
     Load and combine hitter and pitcher projections.
+
+    Args:
+        hitter_path: Path to hitter projections CSV (if None, uses config)
+        pitcher_path: Path to pitcher projections CSV (if None, uses config)
+        db_path: Optional path to external position database
 
     Returns:
         Combined DataFrame with columns:
@@ -357,7 +318,16 @@ def load_projections(hitter_path: str, pitcher_path: str, db_path: str) -> pd.Da
         - "Shohei Ohtani-H" with hitting stats, pitching cols = 0
         - "Shohei Ohtani-P" with pitching stats, hitting cols = 0
     """
-    positions = load_positions_from_db(db_path)
+    # Use config defaults if paths not provided
+    if hitter_path is None or pitcher_path is None:
+        from .config import HITTER_PROJ_PATH, PITCHER_PROJ_PATH
+
+        if hitter_path is None:
+            hitter_path = HITTER_PROJ_PATH
+        if pitcher_path is None:
+            pitcher_path = PITCHER_PROJ_PATH
+
+    positions = load_positions_from_db(db_path) if db_path else {}
     hitters = load_hitter_projections(hitter_path, positions)
     pitchers = load_pitcher_projections(pitcher_path)
 
@@ -465,7 +435,7 @@ def parse_fantrax_roster(filepath: str) -> pd.DataFrame:
 
         player_name = row_dict.get("Player", "")
         team = row_dict.get("Team", "")
-        status_raw = row_dict.get("Status", "Act")
+        status = row_dict.get("Status", "Act")
 
         if not player_name:
             continue
@@ -473,9 +443,6 @@ def parse_fantrax_roster(filepath: str) -> pd.DataFrame:
         # Add suffix based on section
         suffix = "-H" if current_section == "hitter" else "-P"
         name_with_suffix = player_name + suffix
-
-        # Map status
-        status = FANTRAX_STATUS_MAP.get(status_raw, "active")
 
         records.append(
             {
@@ -1008,7 +975,9 @@ def compute_quality_scores(projections: pd.DataFrame) -> pd.DataFrame:
     hitter_z_scores = pd.DataFrame()
     for stat in hitter_stats:
         std = hitters[stat].std()
-        assert std > MIN_STD, f"Standard deviation of {stat} is too low: {std}"
+        assert std > MIN_STAT_STANDARD_DEVIATION, (
+            f"Standard deviation of {stat} is too low: {std}"
+        )
         hitter_z_scores[stat] = (hitters[stat] - hitters[stat].mean()) / std
 
     hitters["quality_score"] = hitter_z_scores.mean(axis=1)
@@ -1017,12 +986,16 @@ def compute_quality_scores(projections: pd.DataFrame) -> pd.DataFrame:
     pitchers_z = pd.DataFrame()
     for stat in ["W", "SV", "K"]:
         std = pitchers[stat].std()
-        assert std > MIN_STD, f"Standard deviation of {stat} is too low: {std}"
+        assert std > MIN_STAT_STANDARD_DEVIATION, (
+            f"Standard deviation of {stat} is too low: {std}"
+        )
         pitchers_z[stat] = (pitchers[stat] - pitchers[stat].mean()) / std
 
     for stat in ["ERA", "WHIP"]:
         std = pitchers[stat].std()
-        assert std > MIN_STD, f"Standard deviation of {stat} is too low: {std}"
+        assert std > MIN_STAT_STANDARD_DEVIATION, (
+            f"Standard deviation of {stat} is too low: {std}"
+        )
         # Negate so lower is better -> higher z-score
         pitchers_z[stat] = -(pitchers[stat] - pitchers[stat].mean()) / std
 
@@ -1075,8 +1048,8 @@ def estimate_projection_uncertainty(
         sigma = np.std(values, ddof=0)  # Population std (all teams)
 
         # Ensure minimum to avoid division by zero
-        if sigma < MIN_STD:
-            sigma = MIN_STD
+        if sigma < MIN_STAT_STANDARD_DEVIATION:
+            sigma = MIN_STAT_STANDARD_DEVIATION
 
         category_sigmas[category] = sigma
 

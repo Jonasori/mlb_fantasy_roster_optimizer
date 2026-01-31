@@ -12,6 +12,22 @@ This module uses Mixed-Integer Linear Programming (MILP) to find the globally op
 
 ---
 
+## Cross-References
+
+**Depends on:**
+- [00_agent_guidelines.md](00_agent_guidelines.md) — code style, PuLP variable naming
+- [01a_config.md](01a_config.md) — `SLOT_ELIGIBILITY`, roster bounds, category lists
+- [01b_fangraphs_loading.md](01b_fangraphs_loading.md) — `compute_team_totals()`, `compute_quality_scores()`
+- [01d_database.md](01d_database.md) — `get_projections()`, `get_roster_names()`
+
+**Used by:**
+- [02a_variance_penalized_objective.md](02a_variance_penalized_objective.md) — extends `build_and_solve_milp()`
+- [02b_position_sensitivity.md](02b_position_sensitivity.md) — uses optimizer infrastructure
+- [05_notebook_integration.md](05_notebook_integration.md) — optimizer workflow
+- [06_streamlit_dashboard.md](06_streamlit_dashboard.md) — roster simulation
+
+---
+
 ## Imports and Constants
 
 ```python
@@ -357,11 +373,14 @@ def compute_roster_change_values(
     opponent_totals: dict[int, dict[str, float]],
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
-    Compute win probability value and SGP for each roster change.
+    Compute Expected Wins Added (EWA) and SGP for each roster change.
+    
+    EWA = change in expected category matchup wins (out of 60 total matchups).
+    This is more intuitive and linear than league win probability (V).
     
     This is used for waiver wire prioritization:
-    - Additions sorted by WPA descending (most valuable first)
-    - Drops sorted by WPA descending (least harmful to drop first)
+    - Additions sorted by EWA descending (most valuable first)
+    - Drops sorted by EWA descending (least harmful to drop first)
     
     Args:
         added_names: Set of player names being added
@@ -372,27 +391,41 @@ def compute_roster_change_values(
     
     Returns:
         Tuple of (added_df, dropped_df) DataFrames with columns:
-            Name, Position, Team, player_type, WPA (win prob added), SGP
+            Name, Position, Team, player_type, EWA (expected wins added), SGP
         
-        added_df is sorted by WPA descending (highest value first)
-        dropped_df is sorted by WPA descending (negative WPA means loss;
+        added_df is sorted by EWA descending (highest value first)
+        dropped_df is sorted by EWA descending (negative EWA means loss;
             first entry = closest to 0 = least harmful to drop)
     
     Implementation:
         1. Import compute_win_probability from trade_engine (local import to avoid circular)
         2. Compute category_sigmas using estimate_projection_uncertainty
-        3. Compute baseline win probability with old_roster_names
+        3. Compute baseline expected_wins with old_roster_names
         4. For each added player:
-           - Compute win probability if we add them to current roster
-           - WPA = V_with_player - V_baseline (positive = helps)
+           - Compute expected_wins if we add JUST this player to current roster
+           - ⚠️ Do NOT remove dropped players - evaluate each add in ISOLATION
+           - EWA = new_expected_wins - baseline_expected_wins (positive = helps)
         5. For each dropped player:
-           - Compute win probability if we remove them from current roster
-           - WPA = V_without_player - V_baseline (negative = hurts to lose)
-        6. Return DataFrames sorted by WPA descending
+           - Compute expected_wins if we remove JUST this player from current roster
+           - EWA = new_expected_wins - baseline_expected_wins (negative = hurts to lose)
+        6. Return DataFrames sorted by EWA descending
+    
+    ⚠️ CRITICAL: Each add/drop is evaluated in isolation against the baseline roster.
+    Do NOT compute add EWA while removing all drops - this makes all adds look
+    equally bad because you're measuring "add one player to a gutted roster."
     
     Note:
-        This uses the same probabilistic win model as the trade engine,
+        This uses expected_wins from compute_win_probability diagnostics,
         ensuring consistent player valuations across the codebase.
+    
+    Understanding the output:
+        - SGP = context-free value (how good is this player generally)
+        - EWA = context-dependent value (how many more category matchups
+          do you win if you add this player to YOUR team against YOUR opponents)
+        
+        A high-SGP player may have low EWA if your team is already dominant in
+        the categories they contribute to. A lower-SGP player may have high EWA
+        if they fill gaps in categories where you're losing matchups.
     """
 
 
@@ -413,18 +446,18 @@ def print_roster_summary(
        Show: position, name (suffix stripped), team, relevant stats.
        
     2. WAIVER PRIORITY LIST (if old_roster_names provided)
-       Calls compute_roster_change_values() to get WPA and SGP for each change.
+       Calls compute_roster_change_values() to get EWA and SGP for each change.
        
-       FREE AGENTS TO ADD - sorted by WPA descending:
-         #   Name                      Pos  Team   WPA      SGP
-         1   Luis Castillo             SP   SEA   +2.35%   18.2
-         2   Willy Adames              SS   SFG   +1.89%   15.4
+       FREE AGENTS TO ADD - sorted by EWA descending:
+         #   Name                      Pos  Team    EWA      SGP
+         1   Luis Castillo             SP   SEA   +2.35    18.2
+         2   Willy Adames              SS   SFG   +1.89    15.4
          ...
        
        PLAYERS TO DROP - sorted by expendability (least harmful first):
-         #   Name                      Pos  Team   WPA      SGP
-         1   Tanner Houck              RP   BOS   -0.12%    8.3
-         2   Matt Brash                RP   SEA   -0.25%    6.1
+         #   Name                      Pos  Team    EWA      SGP
+         1   Tanner Houck              RP   BOS   -0.12     8.3
+         2   Matt Brash                RP   SEA   -0.25     6.1
          ...
     
     3. STANDINGS PROJECTION
@@ -589,31 +622,40 @@ for slot, count in {**HITTING_SLOTS, **PITCHING_SLOTS}.items():
 
 3. **Pitcher positions:** From Fantrax API or `'SP' if GS >= 3 else 'RP'` for FanGraphs.
 
-4. **Hitter position:** From Fantrax API `posShortNames` field. Default to `'DH'` if unavailable.
+4. **Hitter position:** From Fantrax API `posShortNames` field. Default to `'UTIL'` if unavailable.
 
 5. **Ratio stat linearization signs:**
    - OPS: `PA * (OPS_player - OPS_opponent)`
    - ERA: `IP * (ERA_opponent - ERA_player)` — note flipped order!
    - WHIP: `IP * (WHIP_opponent - WHIP_player)`
 
-6. **Filter by player_type:** Hitting constraints sum only over I_H. Pitching constraints sum only over I_P. Common bug: accidentally including pitchers in OPS calculation.
+6. **Filter by player_type:** Hitting constraints sum only over I_H. Pitching constraints sum only over I_P.
 
-7. **Big-M values:**
-   - Counting stats: 10000
-   - Ratio stats: 5000
-   - Too small = falsely constrains; too large = numerical issues
+7. **Big-M values:** Counting stats: 10000, Ratio stats: 5000
 
-8. **Epsilon values:**
-   - Counting stats: 0.5 (ensures strict inequality for integers)
-   - Ratio stats: 0.001 (small positive for continuous values)
+8. **Epsilon values:** Counting stats: 0.5, Ratio stats: 0.001
 
-9. **Variable naming:** Use `f"x_{i}"` with integer index i. Never put player names in variable names (special characters break PuLP).
+9. **Variable naming:** Use `f"x_{i}"` with integer index i. Never put player names in variable names.
 
-10. **Zero PA or IP:** Assert `sum(PA) > 0` for hitters, `sum(IP) > 0` for pitchers for ALL teams including opponents.
+10. **Zero PA or IP:** Assert `sum(PA) > 0` for hitters, `sum(IP) > 0` for pitchers for ALL teams.
 
-11. **Infeasibility:** With `validate_slot_coverage()`, you'll catch most infeasibility before solving. If solver still returns non-optimal, report status and check constraint feasibility.
+11. **Infeasibility:** `validate_slot_coverage()` catches most issues before solving.
 
-12. **Data comes from database:** All projections and roster data should come from `get_projections()` and `get_roster_names()` database queries, not direct CSV loading.
+12. **Data comes from database:** All projections and roster data should come from database queries, not direct CSV loading.
+
+---
+
+---
+
+## Extension: Variance-Penalized Objective
+
+The standard objective maximizes total opponent-category wins, which can produce "punting" strategies that dominate some categories while abandoning others. For rotisserie leagues, this may be suboptimal.
+
+**See [02a_variance_penalized_objective.md](02a_variance_penalized_objective.md)** for an optional extension that adds a balance incentive:
+
+$$\text{maximize} \quad \sum_{j,c} y_{j,c} + \lambda \cdot w_{min} - \lambda \cdot w_{max}$$
+
+This discourages extreme category imbalance while remaining computationally tractable (adds 2 variables and 20 constraints).
 
 ---
 

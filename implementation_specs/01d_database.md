@@ -9,14 +9,32 @@ A SQLite database serves as the **primary source of truth** for all player data.
 
 ---
 
+## Cross-References
+
+**Depends on:**
+- [00_agent_guidelines.md](00_agent_guidelines.md) — code style
+- [01a_config.md](01a_config.md) — constants for validation
+- [01b_fangraphs_loading.md](01b_fangraphs_loading.md) — `load_projections()` output to sync
+- [01c_fantrax_api.md](01c_fantrax_api.md) — `fetch_all_fantrax_data()` output to sync
+- [01e_dynasty_valuation.md](01e_dynasty_valuation.md) — `compute_dynasty_sgp()` for dynasty values
+- [01f_mlb_stats_api.md](01f_mlb_stats_api.md) — `fetch_player_ages()` for age data
+
+**Used by:**
+- [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — `get_projections()`, `get_roster_names()`
+- [03_trade_engine.md](03_trade_engine.md) — `get_projections()`, `get_roster_names()`
+- [05_notebook_integration.md](05_notebook_integration.md) — `refresh_all_data()` entry point
+- [06_streamlit_dashboard.md](06_streamlit_dashboard.md) — `refresh_all_data()` entry point
+
+---
+
 ## Design Philosophy
 
 1. **Database is primary** — All data queries pull from the database
 2. **DataFrames are views** — Any DataFrame in the optimizer is a query result
-3. **One wide `players` table** — Merges FanGraphs projections + Fantrax metadata
+3. **One wide `players` table** — Merges FanGraphs projections + API metadata
 4. **Separate `standings` table** — Fantasy league standings
 5. **No historical tracking** — Current state only (overwrite on refresh)
-6. **FanGraphs creates players** — Fantrax updates metadata (age, owner, etc.)
+6. **Data sources**: FanGraphs (projections), MLB API (ages), Fantrax (ownership, positions)
 
 ---
 
@@ -30,6 +48,9 @@ CREATE TABLE IF NOT EXISTS players (
     name TEXT PRIMARY KEY,              -- With -H/-P suffix: "Mike Trout-H"
     display_name TEXT NOT NULL,         -- Without suffix: "Mike Trout"
     player_type TEXT NOT NULL,          -- 'hitter' or 'pitcher'
+    
+    -- MLB identifiers
+    mlbamid INTEGER,                    -- MLBAM ID from FanGraphs (for MLB API lookups)
     
     -- Position (from Fantrax API or derived)
     position TEXT NOT NULL,             -- C, 1B, 2B, SS, 3B, OF, DH, SP, RP
@@ -74,6 +95,7 @@ CREATE INDEX IF NOT EXISTS idx_players_owner ON players(owner);
 CREATE INDEX IF NOT EXISTS idx_players_position ON players(position);
 CREATE INDEX IF NOT EXISTS idx_players_sgp ON players(sgp DESC);
 CREATE INDEX IF NOT EXISTS idx_players_player_type ON players(player_type);
+CREATE INDEX IF NOT EXISTS idx_players_mlbamid ON players(mlbamid);
 ```
 
 ### Standings Table
@@ -134,7 +156,7 @@ def sync_fangraphs_to_db(
     
     Args:
         projections: DataFrame from load_projections() with columns:
-            Name, Team, Position, player_type, PA, R, HR, RBI, SB, OPS,
+            Name, Team, Position, player_type, MLBAMID, PA, R, HR, RBI, SB, OPS,
             IP, W, SV, K, ERA, WHIP, WAR, SGP
         db_path: Path to SQLite database
     
@@ -142,9 +164,22 @@ def sync_fangraphs_to_db(
         Number of players synced
     
     Implementation:
-        INSERT OR REPLACE with FanGraphs columns.
-        This creates new players and updates projection data.
-        Preserves Fantrax columns (age, owner) if row already exists.
+        Use INSERT ... ON CONFLICT(name) DO UPDATE to:
+        - Create new players if they don't exist
+        - Update projection columns (pa, r, hr, etc.) AND mlbamid for existing players
+        - PRESERVE Fantrax columns (owner, roster_status, age, dynasty_sgp)
+        - PRESERVE position column (do NOT overwrite with FanGraphs position)
+        
+        CRITICAL: Do NOT use INSERT OR REPLACE - it deletes and recreates
+        the row, wiping out ownership data.
+        
+        CRITICAL: Do NOT update position in ON CONFLICT clause! FanGraphs
+        hitter CSV has no position data (defaults to UTIL). Overwriting
+        would erase good Fantrax positions. Positions should only be set
+        on initial INSERT, then updated by sync_player_pool_to_db().
+        
+        NOTE: mlbamid IS updated on conflict - it comes from FanGraphs and
+        is needed for MLB API age lookups (see 01f_mlb_stats_api.md).
     
     Print: "Synced {N} FanGraphs projections to database"
     """
@@ -161,9 +196,11 @@ def sync_fantrax_rosters_to_db(
     """
     Sync Fantrax roster ownership to players table.
     
+    Note: Ages come from MLB Stats API, not Fantrax.
+    
     Args:
         roster_sets: Dict mapping team_name to set of player names (with suffix)
-        roster_details: Dict mapping team_name to list of player dicts with age, position, etc.
+        roster_details: Dict mapping team_name to list of player dicts with roster_status, etc.
         db_path: Path to SQLite database
     
     Returns:
@@ -172,9 +209,9 @@ def sync_fantrax_rosters_to_db(
     Implementation:
         1. Clear all ownership: UPDATE players SET owner = NULL
         2. For each team's roster:
-           - UPDATE players SET owner = team_name, age = ..., roster_status = ...
+           - UPDATE players SET owner = team_name, roster_status = ...
              WHERE name = player_name
-        3. Report players in rosters but not in database (will be logged as warnings)
+        3. Report players in rosters but not in database (logged as warnings)
     
     Print: 
         "Cleared ownership for all players"
@@ -183,31 +220,64 @@ def sync_fantrax_rosters_to_db(
     """
 ```
 
-### Sync Player Pool (Ages)
+### Sync Player Pool (Positions)
 
 ```python
-def sync_player_ages_to_db(
+def sync_player_pool_to_db(
     player_pool: pd.DataFrame,
     db_path: str = "data/optimizer.db",
-) -> int:
+) -> dict[str, int]:
     """
-    Sync ages from Fantrax player pool to existing players.
+    Sync positions from Fantrax player pool to all players in database.
+    
+    Why this is needed:
+        - FanGraphs hitter CSV has no position column → defaults to "UTIL"
+        - sync_fantrax_rosters_to_db() only updates ROSTERED players
+        - Free agents (owner IS NULL) never get position updates otherwise
+    
+    Note: Ages come from MLB Stats API (sync_ages_to_db), not Fantrax.
     
     Args:
-        player_pool: DataFrame from fetch_player_pool() with name, age columns
+        player_pool: DataFrame from fetch_player_pool() with name, position columns
         db_path: Path to SQLite database
     
     Returns:
-        Number of players with age updated
+        Dict with counts: {"position_updated": N, "not_found": K}
     
     Implementation:
-        For each player in player_pool:
-            - Add -H or -P suffix based on position
-            - UPDATE players SET age = ... WHERE name = suffixed_name
-        
+        1. Build normalized name lookup from database (handles accents, etc.)
+        2. Single pass through player_pool:
+           - Apply name corrections
+           - Add -H or -P suffix based on player_type
+           - Match to database via normalized name
+           - UPDATE players SET position = ? WHERE name = db_name
+           
         Only updates existing rows (doesn't create new players).
     
-    Print: "Updated age for {N} players"
+    Print: 
+        "Synced player pool: {N} positions updated"
+        "  ({K} players not found in database)" (if any)
+    """
+```
+
+### Sync Ages from MLB API
+
+```python
+def sync_ages_to_db(ages_df: pd.DataFrame, db_path: str = "data/optimizer.db") -> int:
+    """
+    Sync ages from MLB Stats API to database.
+    
+    Args:
+        ages_df: DataFrame from fetch_player_ages() with mlbam_id, age columns
+        db_path: Path to database
+    
+    Returns:
+        Number of players updated
+    
+    Implementation:
+        UPDATE players SET age = ? WHERE mlbamid = ?
+        
+        Only updates players that exist (matched by mlbamid).
     """
 ```
 
@@ -316,51 +386,43 @@ def get_standings(db_path: str = "data/optimizer.db") -> pd.DataFrame:
 
 ```python
 def refresh_all_data(
-    hitter_proj_path: str = "data/fangraphs-steamer-projections-hitters.csv",
-    pitcher_proj_path: str = "data/fangraphs-steamer-projections-pitchers.csv",
+    hitter_proj_path: str = "data/fangraphs-atc-projections-hitters.csv",
+    pitcher_proj_path: str = "data/fangraphs-atc-projections-pitchers.csv",
     db_path: str = "data/optimizer.db",
     skip_fantrax: bool = False,
+    skip_mlb_api: bool = False,
 ) -> dict:
     """
-    Complete data refresh: FanGraphs + Fantrax → database.
+    Complete data refresh: FanGraphs + MLB API + Fantrax → database.
     
     This is the MAIN ENTRY POINT for loading data.
     
     Pipeline:
         1. Initialize database (create tables if needed)
-        2. Load FanGraphs projections (computes SGP, quality_score)
-        3. Sync projections to database
+        2. Load FanGraphs projections → sync to database
+        3. Fetch ages from MLB Stats API → sync to database
         4. If not skip_fantrax:
-           a. Create Fantrax session
-           b. Fetch all Fantrax data (rosters, standings, player pool)
-           c. Sync rosters to database (updates ownership)
-           d. Sync ages from player pool
-           e. Compute dynasty_sgp for all players
-           f. Sync standings to database
-        5. Return data from database queries
+           a. Fetch Fantrax data (rosters, standings, player pool)
+           b. Sync rosters (ownership)
+           c. Sync player pool (positions)
+           d. Sync standings
+        5. Compute dynasty_sgp for all players
+        6. Return data from database queries
     
     Args:
         hitter_proj_path: Path to FanGraphs hitter projections CSV
         pitcher_proj_path: Path to FanGraphs pitcher projections CSV
         db_path: Path to SQLite database
         skip_fantrax: If True, skip Fantrax API calls (use existing DB data)
+        skip_mlb_api: If True, skip MLB Stats API call for ages
     
     Returns:
         {
-            "projections": pd.DataFrame,           # From get_projections()
-            "my_roster": set[str],                 # From get_roster_names(MY_TEAM_NAME)
-            "opponent_rosters": dict[str, set[str]], # From get_all_roster_names() minus my team
-            "standings": pd.DataFrame,             # From get_standings()
+            "projections": pd.DataFrame,
+            "my_roster": set[str],
+            "opponent_rosters": dict[str, set[str]],
+            "standings": pd.DataFrame,
         }
-    
-    Print:
-        "=== Data Refresh Pipeline ==="
-        "Step 1: Loading FanGraphs projections..."
-        "Step 2: Syncing to database..."
-        "Step 3: Fetching Fantrax data..."
-        "Step 4: Syncing rosters..."
-        "Step 5: Computing dynasty values..."
-        "=== Refresh Complete ==="
     """
 ```
 
@@ -404,6 +466,18 @@ assert with_sgp == player_count, "All players should have SGP"
 
 with_age = pd.read_sql("SELECT COUNT(*) as n FROM players WHERE age IS NOT NULL", conn).iloc[0, 0]
 print(f"Players with age data: {with_age}/{player_count}")
+
+# Position validation: most hitters should have real positions, not UTIL
+hitter_count = pd.read_sql(
+    "SELECT COUNT(*) as n FROM players WHERE player_type = 'hitter'", conn
+).iloc[0, 0]
+util_count = pd.read_sql(
+    "SELECT COUNT(*) as n FROM players WHERE player_type = 'hitter' AND position = 'UTIL'", conn
+).iloc[0, 0]
+util_pct = util_count / hitter_count * 100
+print(f"Hitters with UTIL position: {util_count}/{hitter_count} ({util_pct:.1f}%)")
+# After position sync, UTIL should be <60% (only minor leaguers not in Fantrax top 5000)
+assert util_pct < 60, f"Too many UTIL hitters ({util_pct:.1f}%) - position sync may have failed"
 
 conn.close()
 ```

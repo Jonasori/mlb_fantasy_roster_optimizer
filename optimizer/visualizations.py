@@ -1,11 +1,10 @@
 """
-Visualizations for MLB Fantasy Roster Optimizer.
+Visualization functions for the roster optimizer.
 
-All functions return matplotlib.Figure objects.
-NEVER call plt.show() — the marimo notebook handles display.
+All functions return matplotlib.Figure objects. NEVER call plt.show() -
+the marimo notebook handles display.
 """
 
-import matplotlib.patches as mpatches
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -14,19 +13,17 @@ import seaborn as sns
 from .data_loader import (
     ALL_CATEGORIES,
     HITTING_CATEGORIES,
-    HITTING_SLOTS,
-    MAX_HITTERS,
-    MAX_PITCHERS,
-    MIN_HITTERS,
-    MIN_PITCHERS,
     NEGATIVE_CATEGORIES,
     PITCHING_CATEGORIES,
-    PITCHING_SLOTS,
     strip_name_suffix,
 )
 
-# Consistent styling
+# =============================================================================
+# STYLING
+# =============================================================================
+
 plt.style.use("seaborn-v0_8-whitegrid")
+
 TEAM_COLORS = {
     "me": "#2E86AB",
     "opponent": "#A23B72",
@@ -36,7 +33,9 @@ LOSS_COLOR = "#E74C3C"
 NEUTRAL_COLOR = "#95A5A6"
 
 
-# === UTILITY FUNCTIONS ===
+# =============================================================================
+# UTILITY FUNCTIONS
+# =============================================================================
 
 
 def _format_stat(value: float, category: str) -> str:
@@ -58,96 +57,197 @@ def _get_category_color(category: str, value: float, opponent_value: float) -> s
     return WIN_COLOR if value > opponent_value else LOSS_COLOR
 
 
-def _compute_percentile_rank(
-    values: list[float], target_idx: int = 0, higher_is_better: bool = True
-) -> float:
-    """Compute percentile rank for target value among all values."""
-    target = values[target_idx]
-    if higher_is_better:
-        rank = sum(1 for v in values if v <= target) / len(values)
-    else:
-        rank = sum(1 for v in values if v >= target) / len(values)
-    return rank
+def sort_categories_for_radar(
+    my_totals: dict[str, float],
+    opponent_totals: dict[int, dict[str, float]],
+    categories: list[str] | None = None,
+) -> list[str]:
+    """
+    Sort categories for radar chart display.
+
+    Hitting categories are sorted descending (best first, going clockwise).
+    Pitching categories are sorted ascending (worst first, going clockwise).
+    This makes the maxima of hitting and pitching meet in the middle of the chart.
+
+    Args:
+        my_totals: My team's category totals
+        opponent_totals: Dict mapping opponent ID to their totals
+        categories: Optional list of categories to sort (defaults to ALL_CATEGORIES)
+
+    Returns:
+        Sorted list of category names
+    """
+    if categories is None:
+        categories = ALL_CATEGORIES
+
+    # Compute normalized score (higher = better for my team)
+    def sort_key(cat):
+        all_vals = [my_totals[cat]] + [opp[cat] for opp in opponent_totals.values()]
+        min_val, max_val = min(all_vals), max(all_vals)
+        if max_val > min_val:
+            norm = (my_totals[cat] - min_val) / (max_val - min_val)
+            return 1 - norm if cat in NEGATIVE_CATEGORIES else norm
+        return 0.5
+
+    # Hitting: sort descending (best first, clockwise from top)
+    sorted_hitting = sorted(
+        [c for c in categories if c in HITTING_CATEGORIES], key=sort_key, reverse=True
+    )
+
+    # Pitching: sort ASCENDING (worst first, so best ends up adjacent to hitting's best)
+    sorted_pitching = sorted(
+        [c for c in categories if c in PITCHING_CATEGORIES], key=sort_key, reverse=False
+    )
+
+    return sorted_hitting + sorted_pitching
 
 
-# === TEAM COMPARISON VISUALIZATIONS ===
+# =============================================================================
+# TEAM COMPARISON VISUALIZATIONS
+# =============================================================================
 
 
 def plot_team_radar(
     my_totals: dict[str, float],
     opponent_totals: dict[int, dict[str, float]],
     title: str = "Team Comparison Across Categories",
+    team_names: dict[int, str] | None = None,
 ) -> plt.Figure:
     """
-    Radar chart comparing all 7 teams across all 10 categories.
+    Radar chart comparing all teams across all 10 categories.
 
-    One polygon per team. My team uses thick solid line.
-    Values normalized to percentile rank among all teams.
+    Categories are sorted so hitting and pitching maxima meet:
+    - Hitting: sorted descending (best first, clockwise from top)
+    - Pitching: sorted ascending (worst first, so best ends adjacent to hitting's best)
+
+    Args:
+        my_totals: My team's category totals
+        opponent_totals: Dict mapping opponent ID to their totals
+        title: Chart title
+        team_names: Optional dict mapping opponent ID to team name for legend
     """
-    categories = ALL_CATEGORIES
-    n_cats = len(categories)
+    # Use shared sorting logic
+    categories = sort_categories_for_radar(my_totals, opponent_totals)
+    n_categories = len(categories)
 
-    # Compute angles for radar
-    angles = np.linspace(0, 2 * np.pi, n_cats, endpoint=False).tolist()
+    # Compute angles for radar chart
+    angles = np.linspace(0, 2 * np.pi, n_categories, endpoint=False).tolist()
     angles += angles[:1]  # Close the polygon
 
-    # Collect all team values
-    all_teams = {"Me": my_totals}
-    for opp_id, opp_totals in opponent_totals.items():
-        all_teams[f"Opp {opp_id}"] = opp_totals
-
-    # Compute percentile ranks for each category
-    team_ranks = {}
-    for team_name, totals in all_teams.items():
-        ranks = []
-        for cat in categories:
-            all_vals = [all_teams[t][cat] for t in all_teams]
-            target_idx = list(all_teams.keys()).index(team_name)
-            higher_is_better = cat not in NEGATIVE_CATEGORIES
-            rank = _compute_percentile_rank(all_vals, target_idx, higher_is_better)
-            ranks.append(rank)
-        ranks += ranks[:1]  # Close polygon
-        team_ranks[team_name] = ranks
-
-    # Create figure
-    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection="polar"))
-
-    # Plot each team
-    colors = plt.cm.tab10(np.linspace(0, 1, len(all_teams)))
-
-    for i, (team_name, ranks) in enumerate(team_ranks.items()):
-        if team_name == "Me":
-            ax.plot(
-                angles,
-                ranks,
-                "o-",
-                linewidth=3,
-                color=TEAM_COLORS["me"],
-                label=team_name,
-            )
-            ax.fill(angles, ranks, alpha=0.25, color=TEAM_COLORS["me"])
+    # Collect opponent teams first (so My Team is drawn last, on top)
+    opponent_teams = []
+    for opp_id, totals in opponent_totals.items():
+        if team_names and opp_id in team_names:
+            name = team_names[opp_id]
         else:
-            ax.plot(
-                angles,
-                ranks,
-                "--",
-                linewidth=1,
-                color=colors[i],
-                alpha=0.6,
-                label=team_name,
-            )
+            name = f"Opponent {opp_id}"
+        opponent_teams.append((name, totals))
+
+    # Color palette - muted colors for opponents
+    opponent_colors = [
+        "#E57373",  # Light red
+        "#81C784",  # Light green
+        "#BA68C8",  # Light purple
+        "#FFB74D",  # Light orange
+        "#4DB6AC",  # Light teal
+        "#F06292",  # Light pink
+        "#A1887F",  # Light brown
+        "#90A4AE",  # Light blue-gray
+        "#FF8A65",  # Light deep orange
+    ]
+
+    # High-resolution figure (display size controlled by Streamlit)
+    fig, ax = plt.subplots(figsize=(8, 8), subplot_kw=dict(polar=True))
+
+    # Helper to compute percentile for a team
+    def get_percentile_values(totals):
+        values = []
+        for cat in categories:
+            # Get all values for this category (league-wide)
+            all_values = [my_totals[cat]] + [
+                opponent_totals[o][cat] for o in opponent_totals
+            ]
+
+            # Compute percentile rank
+            if cat in NEGATIVE_CATEGORIES:
+                # Lower is better - flip
+                rank = sum(1 for v in all_values if v < totals[cat]) / (
+                    len(all_values) - 1
+                )
+                pct = 1 - rank
+            else:
+                rank = sum(1 for v in all_values if v < totals[cat]) / (
+                    len(all_values) - 1
+                )
+                pct = rank
+
+            values.append(pct)
+        return values + values[:1]  # Close polygon
+
+    # Draw opponents FIRST (so they're behind My Team)
+    for idx, (team_name, totals) in enumerate(opponent_teams):
+        values = get_percentile_values(totals)
+        color = opponent_colors[idx % len(opponent_colors)]
+
+        ax.plot(
+            angles,
+            values,
+            "-",
+            linewidth=0.8,
+            label=team_name,
+            alpha=0.5,
+            color=color,
+        )
+
+    # Draw My Team LAST (on top)
+    my_values = get_percentile_values(my_totals)
+    ax.plot(
+        angles,
+        my_values,
+        "o-",
+        linewidth=2.5,
+        label="My Team",
+        color="#2E86AB",
+        zorder=10,  # Ensure on top
+    )
+    ax.fill(angles, my_values, alpha=0.25, color="#2E86AB", zorder=9)
 
     # Set category labels
     ax.set_xticks(angles[:-1])
-    ax.set_xticklabels(categories, size=10)
+    ax.set_xticklabels(categories, fontsize=11)
+    ax.set_ylim(-0.5, 1.1)  # Buffer for cleaner center and edge
 
-    # Set radial limits
-    ax.set_ylim(0, 1)
-    ax.set_yticks([0.25, 0.5, 0.75, 1.0])
-    ax.set_yticklabels(["25%", "50%", "75%", "100%"], size=8)
+    # Draw reference circles at r=0 and r=1
+    theta_circle = np.linspace(0, 2 * np.pi, 100)
+    ax.plot(theta_circle, [0] * 100, "k-", linewidth=1.0, alpha=0.5)
+    ax.plot(theta_circle, [1] * 100, "k-", linewidth=1.0, alpha=0.5)
 
-    ax.set_title(title, size=14, fontweight="bold", pad=20)
-    ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.0))
+    # Set tick labels only within [0, 1] range
+    ax.set_yticks([0, 0.5, 1])
+    ax.set_yticklabels(["0", "0.5", "1"], fontsize=8)
+
+    # Add radial axis label
+    ax.set_ylabel("League Percentile", labelpad=35, fontsize=9)
+
+    ax.set_title(title, size=14, fontweight="bold", pad=15)
+
+    # Legend outside plot - reorder to put My Team first
+    handles, labels = ax.get_legend_handles_labels()
+    # Move My Team to front
+    my_team_idx = labels.index("My Team")
+    handles = (
+        [handles[my_team_idx]] + handles[:my_team_idx] + handles[my_team_idx + 1 :]
+    )
+    labels = [labels[my_team_idx]] + labels[:my_team_idx] + labels[my_team_idx + 1 :]
+
+    ax.legend(
+        handles,
+        labels,
+        loc="upper left",
+        bbox_to_anchor=(1.02, 1.0),
+        fontsize=10,
+        framealpha=0.9,
+    )
 
     plt.tight_layout()
     return fig
@@ -159,52 +259,42 @@ def plot_category_margins(
 ) -> plt.Figure:
     """
     Grouped bar chart showing my margin over each opponent in each category.
-
-    Green if positive (I win), red if negative (I lose).
     """
     categories = ALL_CATEGORIES
-    n_cats = len(categories)
-    n_opps = len(opponent_totals)
+    n_categories = len(categories)
+    n_opponents = len(opponent_totals)
 
-    # Compute margins
-    margins = {}
-    for cat in categories:
-        margins[cat] = []
-        for opp_id in sorted(opponent_totals.keys()):
-            if cat in NEGATIVE_CATEGORIES:
-                # Lower is better, so positive margin = opponent higher (I win)
-                margin = opponent_totals[opp_id][cat] - my_totals[cat]
-            else:
-                margin = my_totals[cat] - opponent_totals[opp_id][cat]
-            margins[cat].append(margin)
-
-    # Create figure
     fig, ax = plt.subplots(figsize=(14, 6))
 
-    x = np.arange(n_cats)
+    x = np.arange(n_categories)
     width = 0.12
 
-    for i, opp_id in enumerate(sorted(opponent_totals.keys())):
-        opp_margins = [margins[cat][i] for cat in categories]
-        colors = [WIN_COLOR if m > 0 else LOSS_COLOR for m in opp_margins]
+    for i, (opp_id, opp_totals) in enumerate(sorted(opponent_totals.items())):
+        margins = []
+        colors = []
 
-        offset = (i - n_opps / 2 + 0.5) * width
-        bars = ax.bar(
-            x + offset,
-            opp_margins,
-            width,
-            label=f"vs Opp {opp_id}",
-            color=colors,
-            alpha=0.7,
-        )
+        for cat in categories:
+            if cat in NEGATIVE_CATEGORIES:
+                margin = opp_totals[cat] - my_totals[cat]  # Positive = I win
+            else:
+                margin = my_totals[cat] - opp_totals[cat]
 
-    ax.axhline(y=0, color="black", linestyle="-", linewidth=0.5)
-    ax.set_xlabel("Category")
-    ax.set_ylabel("Margin (positive = winning)")
-    ax.set_title("My Margin vs Each Opponent by Category")
+            margins.append(margin)
+            colors.append(WIN_COLOR if margin > 0 else LOSS_COLOR)
+
+        offset = (i - n_opponents / 2 + 0.5) * width
+        bars = ax.bar(x + offset, margins, width, label=f"vs Opp {opp_id}", alpha=0.7)
+
+        for bar, color in zip(bars, colors):
+            bar.set_color(color)
+
     ax.set_xticks(x)
     ax.set_xticklabels(categories)
-    ax.legend(loc="upper right")
+    ax.axhline(y=0, color="black", linewidth=0.5)
+    ax.set_xlabel("Category")
+    ax.set_ylabel("Margin (positive = winning)")
+    ax.set_title("Category Margins vs Each Opponent", fontweight="bold")
+    ax.legend(loc="upper right", fontsize=8)
 
     plt.tight_layout()
     return fig
@@ -216,74 +306,473 @@ def plot_win_matrix(
 ) -> plt.Figure:
     """
     Heatmap showing win/loss for each opponent-category pair.
-
-    Rows: opponents, Columns: categories
-    Color: Green if I win, red if I lose
     """
     categories = ALL_CATEGORIES
-    opp_ids = sorted(opponent_totals.keys())
+    opponents = sorted(opponent_totals.keys())
 
     # Build matrix
-    matrix = np.zeros((len(opp_ids), len(categories)))
-    annotations = []
-
-    for i, opp_id in enumerate(opp_ids):
-        row_annot = []
-        for j, cat in enumerate(categories):
-            my_val = my_totals[cat]
-            opp_val = opponent_totals[opp_id][cat]
-
+    data = []
+    for opp_id in opponents:
+        row = []
+        for cat in categories:
             if cat in NEGATIVE_CATEGORIES:
-                margin = opp_val - my_val  # Positive = I win
+                margin = opponent_totals[opp_id][cat] - my_totals[cat]
             else:
-                margin = my_val - opp_val
+                margin = my_totals[cat] - opponent_totals[opp_id][cat]
+            row.append(margin)
+        data.append(row)
 
-            matrix[i, j] = margin
-            row_annot.append(
-                _format_stat(margin, cat) if abs(margin) < 100 else f"{margin:.0f}"
-            )
-        annotations.append(row_annot)
+    df = pd.DataFrame(data, index=[f"Opp {o}" for o in opponents], columns=categories)
 
-    # Create figure
-    fig, ax = plt.subplots(figsize=(14, 6))
+    fig, ax = plt.subplots(figsize=(10, 5))
 
-    # Create custom colormap
-    cmap = sns.diverging_palette(10, 130, as_cmap=True)
+    # Use diverging colormap
+    vmax = max(abs(df.min().min()), abs(df.max().max()))
 
-    # Normalize matrix for coloring
-    max_abs = max(abs(matrix.min()), abs(matrix.max()))
+    sns.heatmap(
+        df,
+        ax=ax,
+        cmap="RdYlGn",
+        center=0,
+        vmin=-vmax,
+        vmax=vmax,
+        annot=True,
+        fmt=".1f",
+        cbar_kws={"label": "Margin"},
+    )
 
-    im = ax.imshow(matrix, cmap=cmap, aspect="auto", vmin=-max_abs, vmax=max_abs)
+    ax.set_title("Win/Loss Matrix (positive margin = winning)", fontweight="bold")
 
-    # Add annotations
-    for i in range(len(opp_ids)):
-        for j in range(len(categories)):
-            color = "white" if abs(matrix[i, j]) > max_abs * 0.5 else "black"
-            ax.text(
-                j,
-                i,
-                annotations[i][j],
-                ha="center",
-                va="center",
-                color=color,
-                fontsize=9,
-            )
-
-    ax.set_xticks(np.arange(len(categories)))
-    ax.set_xticklabels(categories)
-    ax.set_yticks(np.arange(len(opp_ids)))
-    ax.set_yticklabels([f"Opp {oid}" for oid in opp_ids])
-
-    ax.set_xlabel("Category")
-    ax.set_ylabel("Opponent")
-    ax.set_title("Win/Loss Matrix (positive margin = I win)")
-
-    plt.colorbar(im, ax=ax, label="Margin")
     plt.tight_layout()
     return fig
 
 
-# === PLAYER CONTRIBUTION VISUALIZATIONS ===
+# =============================================================================
+# COMBINED TEAM DASHBOARD VISUALIZATION
+# =============================================================================
+
+
+def plot_team_dashboard(
+    my_totals: dict[str, float],
+    opponent_totals: dict[int, dict[str, float]],
+    optimal_roster_names: list[str],
+    projections: pd.DataFrame,
+    team_names: dict[int, str] | None = None,
+) -> plt.Figure:
+    """
+    Combined 3-panel visualization for team performance dashboard.
+
+    Panel 1: Radar chart showing league percentile across categories
+    Panel 2: Win/Loss heatmap vs each opponent
+    Panel 3: Roster composition (horizontal bar chart)
+
+    Args:
+        my_totals: Dict of category -> total for my team
+        opponent_totals: Dict of opponent_id -> {category -> total}
+        optimal_roster_names: List of player names on roster
+        projections: Full projections DataFrame
+        team_names: Optional dict mapping opponent_id -> team name
+
+    Returns:
+        matplotlib Figure with 3 panels
+    """
+    from .data_loader import (
+        HITTING_SLOTS,
+        MAX_HITTERS,
+        MAX_PITCHERS,
+        MIN_HITTERS,
+        MIN_PITCHERS,
+        PITCHING_SLOTS,
+    )
+
+    # Create wide figure with constrained layout for automatic spacing
+    fig = plt.figure(figsize=(28, 8), constrained_layout=True)
+
+    # Use GridSpec with explicit spacing
+    gs = fig.add_gridspec(1, 3, width_ratios=[4, 5, 2.5])
+
+    ax1 = fig.add_subplot(gs[0], polar=True)  # Radar chart
+    ax2 = fig.add_subplot(gs[1])  # Heatmap
+    ax3 = fig.add_subplot(gs[2])  # Bar chart
+
+    # =========================================================================
+    # PANEL 1: Radar Chart (Category Comparison)
+    # =========================================================================
+    categories = sort_categories_for_radar(my_totals, opponent_totals, ALL_CATEGORIES)
+    n_categories = len(categories)
+    angles = np.linspace(0, 2 * np.pi, n_categories, endpoint=False).tolist()
+    angles += angles[:1]
+
+    # Collect all values for percentile calculation
+    all_team_totals = [my_totals] + list(opponent_totals.values())
+
+    def get_percentile_values(totals):
+        values = []
+        for cat in categories:
+            all_values = [t[cat] for t in all_team_totals]
+            if cat in NEGATIVE_CATEGORIES:
+                rank = sum(1 for v in all_values if v < totals[cat]) / (
+                    len(all_values) - 1
+                )
+                pct = 1 - rank
+            else:
+                rank = sum(1 for v in all_values if v < totals[cat]) / (
+                    len(all_values) - 1
+                )
+                pct = rank
+            values.append(pct)
+        return values + values[:1]
+
+    # Colors for opponents
+    opponent_colors = ["#E8A87C", "#C38D9E", "#41B3A3", "#E27D60", "#85DCB8", "#659DBD"]
+
+    # Prepare opponent teams with names (truncated for legend)
+    opponent_teams = []
+    for opp_id, opp_totals in opponent_totals.items():
+        if team_names:
+            full_name = team_names.get(opp_id, f"Opp {opp_id}")
+            # Truncate for legend readability
+            name = full_name[:12] + "..." if len(full_name) > 15 else full_name
+        else:
+            name = f"Opp {opp_id}"
+        opponent_teams.append((name, opp_totals))
+
+    # Draw opponents first (behind My Team)
+    for idx, (team_name, totals) in enumerate(opponent_teams):
+        values = get_percentile_values(totals)
+        color = opponent_colors[idx % len(opponent_colors)]
+        ax1.plot(angles, values, "-", linewidth=1.0, alpha=0.5, color=color)
+
+    # Draw My Team last (on top)
+    my_values = get_percentile_values(my_totals)
+    ax1.plot(
+        angles,
+        my_values,
+        "o-",
+        linewidth=2.5,
+        label="My Team",
+        color="#2E86AB",
+        zorder=10,
+    )
+    ax1.fill(angles, my_values, alpha=0.25, color="#2E86AB", zorder=9)
+
+    ax1.set_xticks(angles[:-1])
+    ax1.set_xticklabels(categories, fontsize=11)
+    ax1.set_ylim(-0.5, 1.1)
+
+    # Reference circles and ticks
+    theta_circle = np.linspace(0, 2 * np.pi, 100)
+    ax1.plot(theta_circle, [0] * 100, "k-", linewidth=1.0, alpha=0.5)
+    ax1.plot(theta_circle, [1] * 100, "k-", linewidth=1.0, alpha=0.5)
+    ax1.set_yticks([0, 0.5, 1])
+    ax1.set_yticklabels(["0", "0.5", "1"], fontsize=9)
+    ax1.set_ylabel("League Percentile", labelpad=30, fontsize=10)
+    ax1.set_title(
+        "Category Comparison\n(vs League)", fontweight="bold", fontsize=12, pad=10
+    )
+
+    # =========================================================================
+    # PANEL 2: Win/Loss Heatmap
+    # =========================================================================
+    opponents = sorted(opponent_totals.keys())
+    heatmap_data = []
+    for opp_id in opponents:
+        row = []
+        for cat in ALL_CATEGORIES:
+            if cat in NEGATIVE_CATEGORIES:
+                margin = opponent_totals[opp_id][cat] - my_totals[cat]
+            else:
+                margin = my_totals[cat] - opponent_totals[opp_id][cat]
+            row.append(margin)
+        heatmap_data.append(row)
+
+    # Use team names if available (truncated for display)
+    row_labels = []
+    for opp_id in opponents:
+        if team_names and opp_id in team_names:
+            full_name = team_names[opp_id]
+            name = full_name[:18] + "..." if len(full_name) > 20 else full_name
+            row_labels.append(name)
+        else:
+            row_labels.append(f"Opp {opp_id}")
+
+    df_heatmap = pd.DataFrame(heatmap_data, index=row_labels, columns=ALL_CATEGORIES)
+    vmax = max(abs(df_heatmap.min().min()), abs(df_heatmap.max().max()))
+
+    sns.heatmap(
+        df_heatmap,
+        ax=ax2,
+        cmap="RdYlGn",
+        center=0,
+        vmin=-vmax,
+        vmax=vmax,
+        annot=True,
+        fmt=".0f",
+        annot_kws={"fontsize": 9},
+        cbar_kws={"label": "Margin", "shrink": 0.7},
+    )
+    ax2.set_title(
+        "Win/Loss Matrix\n(positive = winning)", fontweight="bold", fontsize=12
+    )
+    ax2.set_xlabel("")
+    ax2.set_ylabel("")
+    ax2.tick_params(axis="x", labelsize=10)
+    ax2.tick_params(axis="y", labelsize=9)
+
+    # =========================================================================
+    # PANEL 3: Roster Composition (Horizontal Bar Chart)
+    # =========================================================================
+    roster_df = projections[projections["Name"].isin(optimal_roster_names)]
+    position_counts = roster_df["Position"].value_counts()
+    all_slots = {**HITTING_SLOTS, **PITCHING_SLOTS}
+
+    positions = list(all_slots.keys())
+    required = [all_slots[p] for p in positions]
+    actual = [position_counts.get(p, 0) for p in positions]
+
+    y = np.arange(len(positions))
+    height = 0.35
+
+    ax3.barh(
+        y - height / 2,
+        required,
+        height,
+        label="Required",
+        color=NEUTRAL_COLOR,
+        alpha=0.7,
+    )
+    ax3.barh(y + height / 2, actual, height, label="Actual", color=WIN_COLOR, alpha=0.7)
+
+    ax3.set_yticks(y)
+    ax3.set_yticklabels(positions, fontsize=10)
+    ax3.set_xlabel("Count", fontsize=10)
+    ax3.set_title("Roster Composition", fontweight="bold", fontsize=12)
+    ax3.legend(loc="lower right", fontsize=9)
+    ax3.invert_yaxis()  # Top position at top
+
+    # Add composition summary
+    n_hitters = (roster_df["player_type"] == "hitter").sum()
+    n_pitchers = (roster_df["player_type"] == "pitcher").sum()
+    ax3.text(
+        0.95,
+        0.05,
+        f"Hitters: {n_hitters} ({MIN_HITTERS}-{MAX_HITTERS})\nPitchers: {n_pitchers} ({MIN_PITCHERS}-{MAX_PITCHERS})",
+        transform=ax3.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=9,
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.7),
+    )
+
+    return fig
+
+
+# =============================================================================
+# PLAYER CONTRIBUTION VISUALIZATIONS
+# =============================================================================
+
+
+def plot_comparison_dashboard(
+    before_totals: dict[str, float],
+    after_totals: dict[str, float],
+    opponent_totals: dict[int, dict[str, float]],
+    team_names: dict[int, str] | None = None,
+    title: str = "Trade/Roster Change Analysis",
+) -> plt.Figure:
+    """
+    Combined 3-panel visualization comparing before/after a roster change.
+
+    Panel 1: Radar chart showing Before vs After (league percentile)
+    Panel 2: Win/Loss heatmap for AFTER state
+    Panel 3: Category-by-category delta bars
+
+    Args:
+        before_totals: Dict of category -> total before change
+        after_totals: Dict of category -> total after change
+        opponent_totals: Dict of opponent_id -> {category -> total}
+        team_names: Optional dict mapping opponent_id -> team name
+        title: Title for the figure
+
+    Returns:
+        matplotlib Figure with 3 panels
+    """
+    # Create wide figure with constrained layout
+    fig = plt.figure(figsize=(28, 8), constrained_layout=True)
+    gs = fig.add_gridspec(1, 3, width_ratios=[4, 5, 2.5])
+
+    ax1 = fig.add_subplot(gs[0], polar=True)  # Radar chart
+    ax2 = fig.add_subplot(gs[1])  # Heatmap
+    ax3 = fig.add_subplot(gs[2])  # Delta bars
+
+    # =========================================================================
+    # PANEL 1: Before/After Radar Chart
+    # =========================================================================
+    categories = sort_categories_for_radar(
+        before_totals, opponent_totals, ALL_CATEGORIES
+    )
+    n_categories = len(categories)
+    angles = np.linspace(0, 2 * np.pi, n_categories, endpoint=False).tolist()
+    angles += angles[:1]
+
+    # Collect all values for percentile calculation (league baseline)
+    all_team_totals = [before_totals] + list(opponent_totals.values())
+
+    def get_percentile_values(totals):
+        values = []
+        for cat in categories:
+            all_values = [t[cat] for t in all_team_totals]
+            if cat in NEGATIVE_CATEGORIES:
+                rank = sum(1 for v in all_values if v < totals[cat]) / (
+                    len(all_values) - 1
+                )
+                pct = 1 - rank
+            else:
+                rank = sum(1 for v in all_values if v < totals[cat]) / (
+                    len(all_values) - 1
+                )
+                pct = rank
+            # Clamp in case after is outside league range
+            pct = max(0, min(1, pct))
+            values.append(pct)
+        return values + values[:1]
+
+    # Draw opponents faintly in background
+    for opp_totals in opponent_totals.values():
+        values = get_percentile_values(opp_totals)
+        ax1.plot(angles, values, "-", linewidth=0.5, alpha=0.2, color="gray")
+
+    # Draw Before (blue solid)
+    before_values = get_percentile_values(before_totals)
+    ax1.plot(
+        angles,
+        before_values,
+        "o-",
+        linewidth=2.5,
+        label="Before",
+        color="#2E86AB",
+        zorder=10,
+    )
+    ax1.fill(angles, before_values, alpha=0.15, color="#2E86AB", zorder=9)
+
+    # Draw After (green dashed)
+    after_values = get_percentile_values(after_totals)
+    ax1.plot(
+        angles,
+        after_values,
+        "o--",
+        linewidth=2.5,
+        label="After",
+        color="#2ECC71",
+        zorder=11,
+    )
+    ax1.fill(angles, after_values, alpha=0.15, color="#2ECC71", zorder=8)
+
+    ax1.set_xticks(angles[:-1])
+    ax1.set_xticklabels(categories, fontsize=11)
+    ax1.set_ylim(-0.5, 1.1)
+
+    # Reference circles and ticks
+    theta_circle = np.linspace(0, 2 * np.pi, 100)
+    ax1.plot(theta_circle, [0] * 100, "k-", linewidth=1.0, alpha=0.5)
+    ax1.plot(theta_circle, [1] * 100, "k-", linewidth=1.0, alpha=0.5)
+    ax1.set_yticks([0, 0.5, 1])
+    ax1.set_yticklabels(["0", "0.5", "1"], fontsize=9)
+    ax1.set_ylabel("League Percentile", labelpad=30, fontsize=10)
+    ax1.set_title(
+        "Before vs After\n(League Percentile)", fontweight="bold", fontsize=12, pad=10
+    )
+    ax1.legend(loc="upper right", fontsize=10)
+
+    # =========================================================================
+    # PANEL 2: Win/Loss Heatmap (After state)
+    # =========================================================================
+    opponents = sorted(opponent_totals.keys())
+    heatmap_data = []
+    for opp_id in opponents:
+        row = []
+        for cat in ALL_CATEGORIES:
+            if cat in NEGATIVE_CATEGORIES:
+                margin = opponent_totals[opp_id][cat] - after_totals[cat]
+            else:
+                margin = after_totals[cat] - opponent_totals[opp_id][cat]
+            row.append(margin)
+        heatmap_data.append(row)
+
+    # Use team names if available
+    row_labels = []
+    for opp_id in opponents:
+        if team_names and opp_id in team_names:
+            full_name = team_names[opp_id]
+            name = full_name[:18] + "..." if len(full_name) > 20 else full_name
+            row_labels.append(name)
+        else:
+            row_labels.append(f"Opp {opp_id}")
+
+    df_heatmap = pd.DataFrame(heatmap_data, index=row_labels, columns=ALL_CATEGORIES)
+    vmax = max(abs(df_heatmap.min().min()), abs(df_heatmap.max().max()))
+
+    sns.heatmap(
+        df_heatmap,
+        ax=ax2,
+        cmap="RdYlGn",
+        center=0,
+        vmin=-vmax,
+        vmax=vmax,
+        annot=True,
+        fmt=".0f",
+        annot_kws={"fontsize": 9},
+        cbar_kws={"label": "Margin", "shrink": 0.7},
+    )
+    ax2.set_title(
+        "Win/Loss Matrix (After)\n(positive = winning)", fontweight="bold", fontsize=12
+    )
+    ax2.set_xlabel("")
+    ax2.set_ylabel("")
+    ax2.tick_params(axis="x", labelsize=10)
+    ax2.tick_params(axis="y", labelsize=9)
+
+    # =========================================================================
+    # PANEL 3: Category Deltas (horizontal bar)
+    # =========================================================================
+    deltas = []
+    colors = []
+    for cat in ALL_CATEGORIES:
+        if cat in NEGATIVE_CATEGORIES:
+            # For ERA/WHIP, lower is better so negative delta is good
+            delta = before_totals[cat] - after_totals[cat]
+        else:
+            delta = after_totals[cat] - before_totals[cat]
+        deltas.append(delta)
+        colors.append(
+            WIN_COLOR if delta > 0 else LOSS_COLOR if delta < 0 else NEUTRAL_COLOR
+        )
+
+    y = np.arange(len(ALL_CATEGORIES))
+    ax3.barh(y, deltas, color=colors, alpha=0.8)
+    ax3.set_yticks(y)
+    ax3.set_yticklabels(ALL_CATEGORIES, fontsize=10)
+    ax3.axvline(x=0, color="black", linewidth=0.8)
+    ax3.set_xlabel("Change (+ is better)", fontsize=10)
+    ax3.set_title("Category Impact", fontweight="bold", fontsize=12)
+    ax3.invert_yaxis()
+
+    # Add summary annotation
+    gains = sum(1 for d in deltas if d > 0)
+    losses = sum(1 for d in deltas if d < 0)
+    ax3.text(
+        0.95,
+        0.05,
+        f"Gains: {gains}\nLosses: {losses}",
+        transform=ax3.transAxes,
+        ha="right",
+        va="bottom",
+        fontsize=10,
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.7),
+    )
+
+    fig.suptitle(title, fontsize=14, fontweight="bold", y=1.02)
+
+    return fig
 
 
 def plot_category_contributions(
@@ -293,36 +782,40 @@ def plot_category_contributions(
 ) -> plt.Figure:
     """
     Horizontal bar chart showing each player's contribution to one category.
-
-    For counting stats: contribution = player's raw value
-    For ratio stats: contribution = impact on team ratio
     """
     roster_df = projections[projections["Name"].isin(roster_names)].copy()
 
-    # Filter by player type
+    # Filter to appropriate player type
     if category in HITTING_CATEGORIES:
         roster_df = roster_df[roster_df["player_type"] == "hitter"]
     else:
         roster_df = roster_df[roster_df["player_type"] == "pitcher"]
 
+    # For ratio stats, compute impact relative to team average
     if category in ["OPS", "ERA", "WHIP"]:
-        # Ratio stat: compute impact on team average
         if category == "OPS":
             weight_col = "PA"
         else:
             weight_col = "IP"
 
         total_weight = roster_df[weight_col].sum()
-        team_avg = (roster_df[weight_col] * roster_df[category]).sum() / total_weight
+        if total_weight > 0:
+            team_avg = (
+                roster_df[weight_col] * roster_df[category]
+            ).sum() / total_weight
+        else:
+            team_avg = roster_df[category].mean()
 
-        roster_df["contribution"] = roster_df[weight_col] * (
-            roster_df[category] - team_avg
-        )
+        roster_df = roster_df.copy()
 
         if category in NEGATIVE_CATEGORIES:
-            roster_df["contribution"] = -roster_df[
-                "contribution"
-            ]  # Flip so positive = helps
+            roster_df["contribution"] = roster_df[weight_col] * (
+                team_avg - roster_df[category]
+            )
+        else:
+            roster_df["contribution"] = roster_df[weight_col] * (
+                roster_df[category] - team_avg
+            )
     else:
         roster_df["contribution"] = roster_df[category]
 
@@ -332,19 +825,18 @@ def plot_category_contributions(
     # Create figure
     fig, ax = plt.subplots(figsize=(10, max(6, len(roster_df) * 0.4)))
 
-    colors = [WIN_COLOR if c > 0 else LOSS_COLOR for c in roster_df["contribution"]]
+    colors = [WIN_COLOR if v >= 0 else LOSS_COLOR for v in roster_df["contribution"]]
 
-    y_pos = np.arange(len(roster_df))
-    ax.barh(y_pos, roster_df["contribution"], color=colors, alpha=0.8)
+    ax.barh(
+        [strip_name_suffix(n) for n in roster_df["Name"]],
+        roster_df["contribution"],
+        color=colors,
+        alpha=0.7,
+    )
 
-    # Labels
-    names = [strip_name_suffix(n) for n in roster_df["Name"]]
-    ax.set_yticks(y_pos)
-    ax.set_yticklabels(names)
-    ax.axvline(x=0, color="black", linestyle="-", linewidth=0.5)
-
-    ax.set_xlabel(f"{category} Contribution")
-    ax.set_title(f"Player Contributions to {category}")
+    ax.axvline(x=0, color="black", linewidth=0.5)
+    ax.set_xlabel(f"Contribution to {category}")
+    ax.set_title(f"Player Contributions to {category}", fontweight="bold")
 
     plt.tight_layout()
     return fig
@@ -357,7 +849,7 @@ def plot_player_contribution_radar(
     top_n: int = 12,
 ) -> plt.Figure:
     """
-    Radar chart showing each player's contributions across relevant categories.
+    Radar chart showing each player's contributions across all relevant categories.
     """
     roster_df = projections[projections["Name"].isin(roster_names)].copy()
     roster_df = roster_df[roster_df["player_type"] == player_type]
@@ -367,57 +859,52 @@ def plot_player_contribution_radar(
     else:
         categories = ["W", "SV", "K", "ERA", "WHIP"]
 
-    n_cats = len(categories)
-
     # Normalize values to [0, 1]
-    normalized = pd.DataFrame()
     for cat in categories:
+        min_val = roster_df[cat].min()
+        max_val = roster_df[cat].max()
+
         if cat in NEGATIVE_CATEGORIES:
-            # Lower is better, flip
-            normalized[cat] = 1 - (roster_df[cat] - roster_df[cat].min()) / (
-                roster_df[cat].max() - roster_df[cat].min() + 1e-10
+            roster_df[f"{cat}_norm"] = 1 - (roster_df[cat] - min_val) / (
+                max_val - min_val + 0.001
             )
         else:
-            normalized[cat] = (roster_df[cat] - roster_df[cat].min()) / (
-                roster_df[cat].max() - roster_df[cat].min() + 1e-10
+            roster_df[f"{cat}_norm"] = (roster_df[cat] - min_val) / (
+                max_val - min_val + 0.001
             )
 
-    normalized["Name"] = roster_df["Name"].values
+    # Sort by total normalized value
+    roster_df["total_norm"] = roster_df[[f"{c}_norm" for c in categories]].sum(axis=1)
+    roster_df = roster_df.nlargest(top_n, "total_norm")
 
-    # Select top N by total contribution
-    normalized["total"] = normalized[categories].sum(axis=1)
-    normalized = normalized.nlargest(top_n, "total")
-
-    # Create radar
-    angles = np.linspace(0, 2 * np.pi, n_cats, endpoint=False).tolist()
+    # Create radar chart
+    n_categories = len(categories)
+    angles = np.linspace(0, 2 * np.pi, n_categories, endpoint=False).tolist()
     angles += angles[:1]
 
-    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(projection="polar"))
+    fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
 
-    colors = plt.cm.tab20(np.linspace(0, 1, len(normalized)))
+    colors = plt.cm.tab20(np.linspace(0, 1, len(roster_df)))
 
-    for i, (_, row) in enumerate(normalized.iterrows()):
-        values = [row[cat] for cat in categories]
+    for i, (_, row) in enumerate(roster_df.iterrows()):
+        values = [row[f"{c}_norm"] for c in categories]
         values += values[:1]
 
         ax.plot(
             angles,
             values,
             "o-",
-            linewidth=2,
-            color=colors[i],
+            linewidth=1.5,
             label=strip_name_suffix(row["Name"]),
-            alpha=0.7,
+            color=colors[i],
         )
         ax.fill(angles, values, alpha=0.1, color=colors[i])
 
     ax.set_xticks(angles[:-1])
     ax.set_xticklabels(categories)
     ax.set_ylim(0, 1)
-
-    title = "Hitter" if player_type == "hitter" else "Pitcher"
     ax.set_title(
-        f"{title} Contributions by Category", size=14, fontweight="bold", pad=20
+        f"{player_type.title()} Contributions (normalized)", fontweight="bold", pad=20
     )
     ax.legend(loc="upper right", bbox_to_anchor=(1.3, 1.0), fontsize=8)
 
@@ -425,7 +912,9 @@ def plot_player_contribution_radar(
     return fig
 
 
-# === ROSTER CHANGE VISUALIZATIONS ===
+# =============================================================================
+# ROSTER CHANGE VISUALIZATIONS
+# =============================================================================
 
 
 def plot_roster_changes(
@@ -433,101 +922,75 @@ def plot_roster_changes(
     dropped_df: pd.DataFrame,
 ) -> plt.Figure:
     """
-    Diverging bar chart showing roster changes sorted by WPA.
-
-    Players are sorted by priority (highest WPA magnitude at top).
-    Bar length is proportional to WPA. Names include WAR and WPA values.
-
-    Parameters
-    ----------
-    added_df : pd.DataFrame
-        DataFrame with columns: Name, Position, WPA, WAR (sorted by WPA descending)
-    dropped_df : pd.DataFrame
-        DataFrame with columns: Name, Position, WPA, WAR (sorted by WPA descending,
-        i.e., least harmful to drop at top)
+    Diverging bar chart showing roster changes sorted by EWA (Expected Wins Added).
     """
-    n_added = len(added_df)
-    n_dropped = len(dropped_df)
-    n_rows = max(n_added, n_dropped, 1)
+    n_adds = len(added_df)
+    n_drops = len(dropped_df)
+    n_rows = max(n_adds, n_drops)
 
-    fig, ax = plt.subplots(figsize=(14, max(6, n_rows * 0.45)))
+    if n_rows == 0:
+        fig, ax = plt.subplots(figsize=(12, 4))
+        ax.text(0.5, 0.5, "No roster changes", ha="center", va="center", fontsize=14)
+        ax.axis("off")
+        return fig
 
-    # Determine scale for bar lengths (use max absolute WPA across both)
-    max_wpa = 0.0
-    if n_added > 0:
-        max_wpa = max(max_wpa, added_df["WPA"].abs().max())
-    if n_dropped > 0:
-        max_wpa = max(max_wpa, dropped_df["WPA"].abs().max())
+    fig, (ax_drop, ax_add) = plt.subplots(1, 2, figsize=(14, max(6, n_rows * 0.5)))
 
-    # Avoid division by zero
-    if max_wpa < 0.001:
-        max_wpa = 0.001
+    # DROPS (left side) - sorted by EWA descending, so least harmful first
+    # Reverse for display so TOP of chart = first priority (least harmful to drop)
+    if not dropped_df.empty:
+        dropped_display = dropped_df.iloc[::-1]  # Reverse for top-to-bottom display
+        y_pos = range(len(dropped_display))
+        bars = ax_drop.barh(
+            y_pos,
+            dropped_display["EWA"],  # Expected wins added (raw number)
+            color=LOSS_COLOR,
+            alpha=0.7,
+        )
 
-    # Y positions (0 at bottom, n_rows-1 at top for highest priority)
-    y_positions = np.arange(n_rows)
+        labels = [
+            f"{row['Position']} {strip_name_suffix(row['Name'])} (SGP: {row['SGP']:.1f})"
+            for _, row in dropped_display.iterrows()
+        ]
+        ax_drop.set_yticks(y_pos)
+        ax_drop.set_yticklabels(labels)
+        ax_drop.set_xlabel("EWA (Expected Wins)")
+        ax_drop.set_title(f"DROP ({n_drops})", fontweight="bold", color=LOSS_COLOR)
+        ax_drop.axvline(x=0, color="black", linewidth=0.5)
+        ax_drop.invert_xaxis()  # Negative values go left
+    else:
+        ax_drop.text(0.5, 0.5, "No drops", ha="center", va="center")
+        ax_drop.axis("off")
 
-    # Plot dropped players (left side, negative x)
-    for i, (_, row) in enumerate(dropped_df.iterrows()):
-        y = n_rows - 1 - i  # Top row = highest priority
-        # WPA for drops is negative (loss of value), so abs() for bar length
-        bar_length = abs(row["WPA"]) / max_wpa
-        ax.barh(y, -bar_length, color=LOSS_COLOR, alpha=0.7, height=0.8)
+    # ADDS (right side) - sorted by EWA descending, so most valuable first
+    # Reverse for display so TOP of chart = first priority (most valuable to add)
+    if not added_df.empty:
+        added_display = added_df.iloc[::-1]  # Reverse for top-to-bottom display
+        y_pos = range(len(added_display))
+        bars = ax_add.barh(
+            y_pos,
+            added_display["EWA"],
+            color=WIN_COLOR,
+            alpha=0.7,
+        )
 
-        # Label on the left of center
-        name = strip_name_suffix(row["Name"])
-        pos = row["Position"]
-        wpa = row["WPA"]
-        sgp = row["SGP"]
-        label = f"{pos} {name}  (SGP: {sgp:.1f}, WPA: {wpa:+.1%})"
-        ax.text(-0.02, y, label, va="center", ha="right", fontsize=9)
+        labels = [
+            f"{row['Position']} {strip_name_suffix(row['Name'])} (SGP: {row['SGP']:.1f})"
+            for _, row in added_display.iterrows()
+        ]
+        ax_add.set_yticks(y_pos)
+        ax_add.set_yticklabels(labels)
+        ax_add.set_xlabel("EWA (Expected Wins)")
+        ax_add.set_title(f"ADD ({n_adds})", fontweight="bold", color=WIN_COLOR)
+        ax_add.axvline(x=0, color="black", linewidth=0.5)
+    else:
+        ax_add.text(0.5, 0.5, "No adds", ha="center", va="center")
+        ax_add.axis("off")
 
-    # Plot added players (right side, positive x)
-    for i, (_, row) in enumerate(added_df.iterrows()):
-        y = n_rows - 1 - i  # Top row = highest priority
-        bar_length = row["WPA"] / max_wpa
-        ax.barh(y, bar_length, color=WIN_COLOR, alpha=0.7, height=0.8)
-
-        # Label on the right of center
-        name = strip_name_suffix(row["Name"])
-        pos = row["Position"]
-        wpa = row["WPA"]
-        sgp = row["SGP"]
-        label = f"{pos} {name}  (SGP: {sgp:.1f}, WPA: {wpa:+.1%})"
-        ax.text(0.02, y, label, va="center", ha="left", fontsize=9)
-
-    # Styling
-    ax.axvline(x=0, color="black", linewidth=1)
-    ax.set_xlim(-1.15, 1.15)
-    ax.set_ylim(-0.5, n_rows - 0.5)
-    ax.set_yticks([])
-    ax.set_xticks([])
-    ax.set_frame_on(False)
-
-    # Column headers
-    ax.text(
-        -0.5,
-        n_rows + 0.3,
-        f"DROP ({n_dropped})",
-        fontsize=12,
+    fig.suptitle(
+        "Waiver Priority List (sorted by Expected Wins Added)",
         fontweight="bold",
-        color=LOSS_COLOR,
-        ha="center",
-    )
-    ax.text(
-        0.5,
-        n_rows + 0.3,
-        f"ADD ({n_added})",
-        fontsize=12,
-        fontweight="bold",
-        color=WIN_COLOR,
-        ha="center",
-    )
-
-    plt.suptitle(
-        "Waiver Priority List (sorted by Win Probability Added)",
-        fontsize=14,
-        fontweight="bold",
-        y=0.98,
+        y=1.02,
     )
     plt.tight_layout()
     return fig
@@ -543,124 +1006,81 @@ def plot_trade_impact(
     Visualize the impact of a proposed trade.
     """
     fig = plt.figure(figsize=(14, 10))
-    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+
+    # 2x2 grid
+    ax1 = fig.add_subplot(2, 2, 1)
+    ax2 = fig.add_subplot(2, 2, 2)
+    ax3 = fig.add_subplot(2, 2, 3)
+    ax4 = fig.add_subplot(2, 2, 4)
 
     # Top-left: Trade summary
-    ax1 = fig.add_subplot(gs[0, 0])
     ax1.axis("off")
-
     summary_text = f"""
-Trade Summary
-─────────────
-Send:    {[strip_name_suffix(p) for p in trade_eval["send_players"]]}
-Receive: {[strip_name_suffix(p) for p in trade_eval["receive_players"]]}
+TRADE SUMMARY
 
-Win Probability: {trade_eval["V_before"] * 100:.1f}% → {trade_eval["V_after"] * 100:.1f}%
-Change: {trade_eval["delta_V"] * 100:+.1f}%
+Send: {", ".join(strip_name_suffix(p) for p in trade_eval["send_players"])}
+Receive: {", ".join(strip_name_suffix(p) for p in trade_eval["receive_players"])}
 
-SGP Change: {trade_eval["delta_generic"]:+.1f}
-Fair: {"Yes" if trade_eval["is_fair"] else "No"}
+Expected Wins: {trade_eval["ew_before"]:.1f} → {trade_eval["ew_after"]:.1f}
+Change: {trade_eval["ewa"]:+.2f} EWA
 
-Recommendation: {trade_eval["recommendation"]}
+SGP: {trade_eval["delta_generic"]:+.1f}
+Fairness: {"Fair" if trade_eval["is_fair"] else "Unfair"}
+
+RECOMMENDATION: {trade_eval["recommendation"]}
 """
-    ax1.text(
-        0.1,
-        0.9,
-        summary_text,
-        transform=ax1.transAxes,
-        fontsize=11,
-        verticalalignment="top",
-        fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-    )
+    ax1.text(0.1, 0.5, summary_text, fontsize=11, family="monospace", va="center")
+    ax1.set_title("Trade Summary", fontweight="bold")
 
     # Top-right: Category changes
-    ax2 = fig.add_subplot(gs[0, 1])
-
     categories = ALL_CATEGORIES
-    changes = [my_totals_after[c] - my_totals_before[c] for c in categories]
+    changes = [trade_eval["category_impact"].get(c, 0) for c in categories]
+    colors = [WIN_COLOR if c > 0 else LOSS_COLOR for c in changes]
 
-    # Flip sign for negative categories for display
-    display_changes = []
-    for cat, change in zip(categories, changes):
-        if cat in NEGATIVE_CATEGORIES:
-            display_changes.append(-change)  # Negative change is good
-        else:
-            display_changes.append(change)
+    ax2.barh(categories, changes, color=colors, alpha=0.7)
+    ax2.axvline(x=0, color="black", linewidth=0.5)
+    ax2.set_xlabel("Change")
+    ax2.set_title("Category Impact", fontweight="bold")
 
-    colors = [WIN_COLOR if c > 0 else LOSS_COLOR for c in display_changes]
+    # Bottom-left: Win probability gauges
+    ax3.axis("off")
 
-    y_pos = np.arange(len(categories))
-    ax2.barh(y_pos, display_changes, color=colors, alpha=0.8)
-    ax2.set_yticks(y_pos)
-    ax2.set_yticklabels(categories)
-    ax2.axvline(x=0, color="black", linestyle="-", linewidth=0.5)
-    ax2.set_xlabel("Change (positive = improvement)")
-    ax2.set_title("Category Impact")
+    # Simple text representation of before/after
+    gauge_text = f"""
+EXPECTED WINS (out of 60)
 
-    # Bottom-left: Win probability gauge
-    ax3 = fig.add_subplot(gs[1, 0])
+Before: {trade_eval["ew_before"]:.1f}
+After:  {trade_eval["ew_after"]:.1f}
 
-    before = trade_eval["V_before"]
-    after = trade_eval["V_after"]
+Change: {trade_eval["ewa"]:+.2f}
+"""
+    ax3.text(0.3, 0.5, gauge_text, fontsize=14, family="monospace", va="center")
+    ax3.set_title("Expected Wins", fontweight="bold")
 
-    ax3.barh(
-        [0, 1],
-        [before, after],
-        color=[NEUTRAL_COLOR, WIN_COLOR if after > before else LOSS_COLOR],
-        alpha=0.8,
-    )
-    ax3.set_yticks([0, 1])
-    ax3.set_yticklabels(["Before", "After"])
-    ax3.set_xlim(0, 1)
-    ax3.set_xlabel("Win Probability")
-    ax3.set_title("Win Probability Comparison")
+    # Bottom-right: Value comparison
+    ax4.axis("off")
 
-    for i, val in enumerate([before, after]):
-        ax3.text(val + 0.02, i, f"{val * 100:.1f}%", va="center")
+    send_sgp = sum(g[1] for g in trade_eval["send_generics"])
+    receive_sgp = sum(g[1] for g in trade_eval["receive_generics"])
 
-    # Bottom-right: Category value comparison
-    ax4 = fig.add_subplot(gs[1, 1])
+    value_text = f"""
+VALUE COMPARISON
 
-    x = np.arange(len(categories))
-    width = 0.35
+Sending: {send_sgp:.1f} dynasty SGP
+Receiving: {receive_sgp:.1f} dynasty SGP
 
-    before_vals = [my_totals_before[c] for c in categories]
-    after_vals = [my_totals_after[c] for c in categories]
+Net: {trade_eval["delta_generic"]:+.1f} dynasty SGP
+"""
+    ax4.text(0.3, 0.5, value_text, fontsize=14, family="monospace", va="center")
+    ax4.set_title("Dynasty Value", fontweight="bold")
 
-    # Normalize for display
-    max_vals = [max(abs(b), abs(a)) for b, a in zip(before_vals, after_vals)]
-    before_norm = [b / m if m > 0 else 0 for b, m in zip(before_vals, max_vals)]
-    after_norm = [a / m if m > 0 else 0 for a, m in zip(after_vals, max_vals)]
-
-    ax4.bar(
-        x - width / 2,
-        before_norm,
-        width,
-        label="Before",
-        color=NEUTRAL_COLOR,
-        alpha=0.7,
-    )
-    ax4.bar(
-        x + width / 2,
-        after_norm,
-        width,
-        label="After",
-        color=TEAM_COLORS["me"],
-        alpha=0.7,
-    )
-
-    ax4.set_xticks(x)
-    ax4.set_xticklabels(categories, rotation=45, ha="right")
-    ax4.set_ylabel("Normalized Value")
-    ax4.set_title("Category Values (normalized)")
-    ax4.legend()
-
-    plt.suptitle("Trade Impact Analysis", fontsize=14, fontweight="bold")
+    plt.tight_layout()
     return fig
 
 
-# === SENSITIVITY ANALYSIS VISUALIZATIONS ===
+# =============================================================================
+# SENSITIVITY ANALYSIS VISUALIZATIONS
+# =============================================================================
 
 
 def plot_player_sensitivity(
@@ -670,52 +1090,44 @@ def plot_player_sensitivity(
     """
     Horizontal bar chart showing most impactful players.
     """
-    fig, axes = plt.subplots(2, 1, figsize=(12, 10))
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 12))
 
     # Top panel: Most valuable rostered players
-    ax1 = axes[0]
-    rostered = sensitivity_df[sensitivity_df["on_optimal_roster"]].copy()
-    rostered = rostered.nsmallest(
+    on_roster = sensitivity_df[sensitivity_df["on_optimal_roster"]]
+    on_roster = on_roster.nsmallest(
         top_n, "objective_delta"
     )  # Most negative = most valuable
 
-    if len(rostered) > 0:
-        y_pos = np.arange(len(rostered))
-        ax1.barh(y_pos, rostered["objective_delta"], color=LOSS_COLOR, alpha=0.8)
-
-        names = [
-            f"{row['Position']} {strip_name_suffix(row['Name'])}"
-            for _, row in rostered.iterrows()
-        ]
-        ax1.set_yticks(y_pos)
-        ax1.set_yticklabels(names)
-        ax1.axvline(x=0, color="black", linestyle="-", linewidth=0.5)
-
-    ax1.set_xlabel("Objective Change if Removed")
-    ax1.set_title("Most Valuable Rostered Players")
+    if not on_roster.empty:
+        ax1.barh(
+            [strip_name_suffix(n) for n in on_roster["Name"]],
+            on_roster["objective_delta"],
+            color=WIN_COLOR,
+            alpha=0.7,
+        )
+        ax1.axvline(x=0, color="black", linewidth=0.5)
+        ax1.set_xlabel("Objective Delta (if removed)")
+        ax1.set_title("Most Valuable Rostered Players", fontweight="bold")
+    else:
+        ax1.text(0.5, 0.5, "No data", ha="center", va="center")
 
     # Bottom panel: Best available non-rostered
-    ax2 = axes[1]
-    non_rostered = sensitivity_df[~sensitivity_df["on_optimal_roster"]].copy()
-    non_rostered["abs_delta"] = non_rostered["objective_delta"].abs()
-    non_rostered = non_rostered.nlargest(top_n, "abs_delta")
+    off_roster = sensitivity_df[~sensitivity_df["on_optimal_roster"]]
+    off_roster = off_roster.nlargest(top_n, "objective_delta")
 
-    if len(non_rostered) > 0:
-        y_pos = np.arange(len(non_rostered))
-        ax2.barh(y_pos, non_rostered["objective_delta"], color=WIN_COLOR, alpha=0.8)
+    if not off_roster.empty:
+        ax2.barh(
+            [strip_name_suffix(n) for n in off_roster["Name"]],
+            off_roster["objective_delta"],
+            color=NEUTRAL_COLOR,
+            alpha=0.7,
+        )
+        ax2.axvline(x=0, color="black", linewidth=0.5)
+        ax2.set_xlabel("Objective Delta (if added)")
+        ax2.set_title("Best Available Non-Rostered", fontweight="bold")
+    else:
+        ax2.text(0.5, 0.5, "No data", ha="center", va="center")
 
-        names = [
-            f"{row['Position']} {strip_name_suffix(row['Name'])}"
-            for _, row in non_rostered.iterrows()
-        ]
-        ax2.set_yticks(y_pos)
-        ax2.set_yticklabels(names)
-        ax2.axvline(x=0, color="black", linestyle="-", linewidth=0.5)
-
-    ax2.set_xlabel("Objective Change if Added")
-    ax2.set_title("Best Available Non-Rostered")
-
-    plt.suptitle("Player Sensitivity Analysis", fontsize=14, fontweight="bold")
     plt.tight_layout()
     return fig
 
@@ -727,113 +1139,66 @@ def plot_constraint_analysis(
     """
     Visualize which roster constraints are binding.
     """
+    from .data_loader import (
+        HITTING_SLOTS,
+        MAX_HITTERS,
+        MAX_PITCHERS,
+        MIN_HITTERS,
+        MIN_PITCHERS,
+        PITCHING_SLOTS,
+    )
+
     roster_df = projections[projections["Name"].isin(optimal_roster_names)]
 
     # Count by position
-    position_counts = roster_df["Position"].value_counts().to_dict()
+    position_counts = roster_df["Position"].value_counts()
 
-    # Count by type
+    # Slot requirements
+    all_slots = {**HITTING_SLOTS, **PITCHING_SLOTS}
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+
+    positions = list(all_slots.keys())
+    required = [all_slots[p] for p in positions]
+    actual = [position_counts.get(p, 0) for p in positions]
+
+    x = np.arange(len(positions))
+    width = 0.35
+
+    ax.bar(
+        x - width / 2, required, width, label="Required", color=NEUTRAL_COLOR, alpha=0.7
+    )
+    ax.bar(x + width / 2, actual, width, label="Actual", color=WIN_COLOR, alpha=0.7)
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(positions)
+    ax.set_ylabel("Count")
+    ax.set_title("Position Slot Analysis", fontweight="bold")
+    ax.legend()
+
+    # Add composition info
     n_hitters = (roster_df["player_type"] == "hitter").sum()
     n_pitchers = (roster_df["player_type"] == "pitcher").sum()
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
-
-    # Position slots
-    ax1 = axes[0]
-    all_slots = {**HITTING_SLOTS, **PITCHING_SLOTS}
-    slot_names = list(all_slots.keys())
-    required = [all_slots[s] for s in slot_names]
-
-    # Get actual counts (approximate - positions don't map 1:1 to slots)
-    position_to_slot = {
-        "C": "C",
-        "1B": "1B",
-        "2B": "2B",
-        "SS": "SS",
-        "3B": "3B",
-        "OF": "OF",
-        "DH": "UTIL",
-        "SP": "SP",
-        "RP": "RP",
-    }
-
-    actual = []
-    for slot in slot_names:
-        if slot == "UTIL":
-            actual.append(position_counts.get("DH", 0))
-        elif slot == "OF":
-            actual.append(position_counts.get("OF", 0))
-        else:
-            actual.append(position_counts.get(slot, 0))
-
-    x = np.arange(len(slot_names))
-    width = 0.35
-
-    ax1.bar(
-        x - width / 2, required, width, label="Required", color=NEUTRAL_COLOR, alpha=0.7
-    )
-    ax1.bar(
-        x + width / 2,
-        actual,
-        width,
-        label="Rostered",
-        color=TEAM_COLORS["me"],
-        alpha=0.7,
+    ax.text(
+        0.98,
+        0.98,
+        f"Hitters: {n_hitters} (bounds: {MIN_HITTERS}-{MAX_HITTERS})\n"
+        f"Pitchers: {n_pitchers} (bounds: {MIN_PITCHERS}-{MAX_PITCHERS})",
+        transform=ax.transAxes,
+        ha="right",
+        va="top",
+        fontsize=10,
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
     )
 
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(slot_names, rotation=45, ha="right")
-    ax1.set_ylabel("Count")
-    ax1.set_title("Position Slot Analysis")
-    ax1.legend()
-
-    # Composition bounds
-    ax2 = axes[1]
-
-    bounds_data = {
-        "Hitters": (n_hitters, MIN_HITTERS, MAX_HITTERS),
-        "Pitchers": (n_pitchers, MIN_PITCHERS, MAX_PITCHERS),
-    }
-
-    x = np.arange(2)
-
-    for i, (label, (actual, min_val, max_val)) in enumerate(bounds_data.items()):
-        if actual == min_val:
-            color = LOSS_COLOR  # At minimum
-        elif actual == max_val:
-            color = "#F39C12"  # At maximum (yellow/orange)
-        else:
-            color = WIN_COLOR  # Has slack
-
-        ax2.bar(i, actual, color=color, alpha=0.8, label=label)
-        ax2.hlines(
-            min_val, i - 0.3, i + 0.3, colors="black", linestyles="--", linewidth=2
-        )
-        ax2.hlines(
-            max_val, i - 0.3, i + 0.3, colors="black", linestyles="--", linewidth=2
-        )
-        ax2.text(i, min_val - 0.5, f"min={min_val}", ha="center", fontsize=9)
-        ax2.text(i, max_val + 0.5, f"max={max_val}", ha="center", fontsize=9)
-
-    ax2.set_xticks(x)
-    ax2.set_xticklabels(["Hitters", "Pitchers"])
-    ax2.set_ylabel("Count")
-    ax2.set_title("Roster Composition")
-
-    # Legend for colors
-    legend_patches = [
-        mpatches.Patch(color=LOSS_COLOR, alpha=0.8, label="At minimum"),
-        mpatches.Patch(color="#F39C12", alpha=0.8, label="At maximum"),
-        mpatches.Patch(color=WIN_COLOR, alpha=0.8, label="Slack available"),
-    ]
-    ax2.legend(handles=legend_patches, loc="upper right")
-
-    plt.suptitle("Constraint Analysis", fontsize=14, fontweight="bold")
     plt.tight_layout()
     return fig
 
 
-# === TRADE ENGINE SPECIFIC VISUALIZATIONS ===
+# =============================================================================
+# TRADE ENGINE VISUALIZATIONS
+# =============================================================================
 
 
 def plot_win_probability_breakdown(
@@ -843,115 +1208,93 @@ def plot_win_probability_breakdown(
     Visualize the components of win probability calculation.
     """
     fig = plt.figure(figsize=(14, 10))
-    gs = fig.add_gridspec(2, 2, hspace=0.3, wspace=0.3)
+
+    # 2x2 grid
+    ax1 = fig.add_subplot(2, 2, 1)
+    ax2 = fig.add_subplot(2, 2, 2)
+    ax3 = fig.add_subplot(2, 2, 3)
+    ax4 = fig.add_subplot(2, 2, 4)
+
+    matchup_probs = diagnostics.get("matchup_probs", {})
 
     # Top-left: Matchup probability heatmap
-    ax1 = fig.add_subplot(gs[0, 0])
+    if matchup_probs:
+        categories = ALL_CATEGORIES
+        opponents = sorted(list(matchup_probs.get(categories[0], {}).keys()))
 
-    matchup_probs = diagnostics["matchup_probs"]
-    categories = ALL_CATEGORIES
-    opp_ids = sorted(list(matchup_probs[categories[0]].keys()))
+        data = []
+        for opp in opponents:
+            row = [matchup_probs.get(cat, {}).get(opp, 0.5) for cat in categories]
+            data.append(row)
 
-    matrix = np.array(
-        [[matchup_probs[cat][opp] for cat in categories] for opp in opp_ids]
-    )
+        df = pd.DataFrame(
+            data, index=[f"Opp {o}" for o in opponents], columns=categories
+        )
 
-    im = ax1.imshow(matrix, cmap="RdYlGn", aspect="auto", vmin=0, vmax=1)
-
-    for i in range(len(opp_ids)):
-        for j in range(len(categories)):
-            ax1.text(j, i, f"{matrix[i, j]:.0%}", ha="center", va="center", fontsize=8)
-
-    ax1.set_xticks(np.arange(len(categories)))
-    ax1.set_xticklabels(categories, rotation=45, ha="right")
-    ax1.set_yticks(np.arange(len(opp_ids)))
-    ax1.set_yticklabels([f"Opp {o}" for o in opp_ids])
-    ax1.set_title("Matchup Win Probabilities")
-    plt.colorbar(im, ax=ax1)
+        sns.heatmap(
+            df, ax=ax1, cmap="RdYlGn", vmin=0, vmax=1, annot=True, fmt=".2f", center=0.5
+        )
+        ax1.set_title("Matchup Win Probabilities", fontweight="bold")
+    else:
+        ax1.text(0.5, 0.5, "No matchup data", ha="center", va="center")
+        ax1.axis("off")
 
     # Top-right: Expected wins by category
-    ax2 = fig.add_subplot(gs[0, 1])
+    if matchup_probs:
+        cat_wins = []
+        for cat in categories:
+            wins = sum(matchup_probs.get(cat, {}).values())
+            cat_wins.append(wins)
 
-    expected_per_cat = [sum(matchup_probs[cat].values()) for cat in categories]
-
-    colors = [
-        WIN_COLOR if e > len(opp_ids) / 2 else LOSS_COLOR for e in expected_per_cat
-    ]
-    ax2.bar(range(len(categories)), expected_per_cat, color=colors, alpha=0.8)
-    ax2.axhline(
-        y=len(opp_ids) / 2,
-        color="black",
-        linestyle="--",
-        linewidth=1,
-        label="Break-even",
-    )
-    ax2.set_xticks(range(len(categories)))
-    ax2.set_xticklabels(categories, rotation=45, ha="right")
-    ax2.set_ylabel("Expected Wins")
-    ax2.set_title("Expected Wins by Category")
-    ax2.legend()
+        ax2.barh(categories, cat_wins, color=WIN_COLOR, alpha=0.7)
+        ax2.set_xlabel("Expected Wins (out of 6)")
+        ax2.set_title("Expected Wins by Category", fontweight="bold")
+        ax2.set_xlim(0, 6)
+    else:
+        ax2.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax2.axis("off")
 
     # Bottom-left: Distribution visualization
-    ax3 = fig.add_subplot(gs[1, 0])
+    mu_D = diagnostics.get("mu_D", 0)
+    sigma_D = diagnostics.get("sigma_D", 1)
 
-    mu_T = diagnostics["mu_T"]
-    sigma_T = np.sqrt(diagnostics["sigma_T_sq"])
-    mu_D = diagnostics["mu_D"]
-    sigma_D = diagnostics["sigma_D"]
-
-    # Plot my distribution vs target
     x = np.linspace(mu_D - 4 * sigma_D, mu_D + 4 * sigma_D, 100)
-    y_me = (
-        1 / (sigma_D * np.sqrt(2 * np.pi)) * np.exp(-0.5 * ((x - mu_D) / sigma_D) ** 2)
+    y = (1 / (sigma_D * np.sqrt(2 * np.pi))) * np.exp(
+        -0.5 * ((x - mu_D) / sigma_D) ** 2
     )
 
+    ax3.plot(x, y, color=TEAM_COLORS["me"], linewidth=2)
+    ax3.fill_between(x[x > 0], y[x > 0], alpha=0.3, color=WIN_COLOR, label="Win Region")
     ax3.fill_between(
-        x[x > 0], y_me[x > 0], alpha=0.3, color=WIN_COLOR, label="Win region"
+        x[x <= 0], y[x <= 0], alpha=0.3, color=LOSS_COLOR, label="Lose Region"
     )
-    ax3.fill_between(
-        x[x <= 0], y_me[x <= 0], alpha=0.3, color=LOSS_COLOR, label="Loss region"
-    )
-    ax3.plot(x, y_me, color="black", linewidth=2)
     ax3.axvline(x=0, color="black", linestyle="--", linewidth=1)
-    ax3.set_xlabel("Differential (vs best opponent)")
-    ax3.set_ylabel("Density")
-    ax3.set_title("Win Probability Distribution")
+    ax3.set_xlabel("Differential (my points - best opponent)")
+    ax3.set_ylabel("Probability Density")
+    ax3.set_title("Win Probability Distribution", fontweight="bold")
     ax3.legend()
 
     # Bottom-right: Summary statistics
-    ax4 = fig.add_subplot(gs[1, 1])
     ax4.axis("off")
 
-    from scipy import stats as scipy_stats
+    stats_text = f"""
+SUMMARY STATISTICS
 
-    V = scipy_stats.norm.cdf(mu_D / sigma_D) if sigma_D > 0.001 else 0.5
+Expected Wins (μ_T): {diagnostics.get("mu_T", 0):.1f}
+Variance (σ_T²): {diagnostics.get("sigma_T_sq", 0):.2f}
 
-    summary_text = f"""
-Summary Statistics
-──────────────────
-Expected Wins (μ_T):    {mu_T:.1f} / 60
-Std Dev (σ_T):          {sigma_T:.2f}
+Target Lead (μ_L): {diagnostics.get("mu_L", 0):.2f}
+Target Var (σ_L²): {diagnostics.get("sigma_L_sq", 0):.2f}
 
-Target to Beat (μ_L):   {diagnostics["mu_L"]:.2f}
-Target Std (σ_L):       {np.sqrt(diagnostics["sigma_L_sq"]):.2f}
+Differential Mean (μ_D): {diagnostics.get("mu_D", 0):.2f}
+Differential Std (σ_D): {diagnostics.get("sigma_D", 1):.2f}
 
-Differential (μ_D):     {mu_D:.2f}
-Differential Std (σ_D): {sigma_D:.2f}
-
-Win Probability (V):    {V:.1%}
+Expected Roto Points: {diagnostics.get("expected_roto_points", 0)}/70
 """
-    ax4.text(
-        0.1,
-        0.9,
-        summary_text,
-        transform=ax4.transAxes,
-        fontsize=12,
-        verticalalignment="top",
-        fontfamily="monospace",
-        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
-    )
+    ax4.text(0.1, 0.5, stats_text, fontsize=11, family="monospace", va="center")
+    ax4.set_title("Summary", fontweight="bold")
 
-    plt.suptitle("Win Probability Breakdown", fontsize=14, fontweight="bold")
+    plt.tight_layout()
     return fig
 
 
@@ -962,28 +1305,481 @@ def plot_category_marginal_values(
     Visualize marginal value of improvement in each category.
     """
     categories = ALL_CATEGORIES
-    opp_ids = sorted(list(gradient[categories[0]].keys()))
+    opponents = sorted(list(gradient.get(categories[0], {}).keys()))
 
-    matrix = np.array([[gradient[cat][opp] for opp in opp_ids] for cat in categories])
+    data = []
+    for opp in opponents:
+        row = [gradient.get(cat, {}).get(opp, 0) for cat in categories]
+        data.append(row)
 
-    fig, ax = plt.subplots(figsize=(10, 8))
+    df = pd.DataFrame(data, index=[f"Opp {o}" for o in opponents], columns=categories)
 
-    im = ax.imshow(matrix, cmap="YlOrRd", aspect="auto")
+    fig, ax = plt.subplots(figsize=(12, 6))
 
-    for i in range(len(categories)):
-        for j in range(len(opp_ids)):
-            ax.text(j, i, f"{matrix[i, j]:.3f}", ha="center", va="center", fontsize=9)
+    sns.heatmap(df, ax=ax, cmap="YlOrRd", annot=True, fmt=".3f")
+    ax.set_title("Marginal Value of Improvement (Gradient)", fontweight="bold")
 
-    ax.set_xticks(np.arange(len(opp_ids)))
-    ax.set_xticklabels([f"Opp {o}" for o in opp_ids])
-    ax.set_yticks(np.arange(len(categories)))
-    ax.set_yticklabels(categories)
+    plt.tight_layout()
+    return fig
 
-    ax.set_xlabel("Opponent")
-    ax.set_ylabel("Category")
-    ax.set_title("Marginal Value of Improvement")
 
-    plt.colorbar(im, ax=ax, label="Gradient")
+# =============================================================================
+# POSITION SENSITIVITY VISUALIZATIONS
+# =============================================================================
+
+
+def plot_position_sensitivity_dashboard(
+    ewa_df: pd.DataFrame,
+    sensitivity_df: pd.DataFrame,
+    slot_data: dict[str, pd.DataFrame],
+) -> plt.Figure:
+    """
+    Combined 4-panel visualization for position sensitivity analysis.
+
+    Panel 1: EWA per SGP by position (which positions give most bang for buck)
+    Panel 2: EWA from upgrading to best FA at each position
+    Panel 3: SGP vs EWA scatter by position
+    Panel 4: Position scarcity curves with my players marked
+
+    Args:
+        ewa_df: DataFrame with columns: slot, sgp_delta, ewa, candidate_rank, etc.
+        sensitivity_df: DataFrame with columns: slot, ewa_per_sgp, better_fas_count, best_fa_ewa
+        slot_data: Dict mapping slot name to eligible players DataFrame
+
+    Returns:
+        matplotlib Figure with 4 panels
+    """
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+
+    # Plot 1: EWA per SGP by position
+    ax1 = axes[0, 0]
+    sens_plot = sensitivity_df.sort_values("ewa_per_sgp", ascending=True)
+    colors = [WIN_COLOR if w > 0 else LOSS_COLOR for w in sens_plot["ewa_per_sgp"]]
+    ax1.barh(sens_plot["slot"], sens_plot["ewa_per_sgp"], color=colors, alpha=0.7)
+    ax1.set_xlabel("Expected Wins Added per 1 SGP")
+    ax1.set_title(
+        "Position Sensitivity: EWA per SGP\n(Higher = upgrades more impactful)",
+        fontweight="bold",
+    )
+    ax1.axvline(x=0, color="black", linewidth=0.5)
+    ax1.grid(True, alpha=0.3, axis="x")
+
+    # Plot 2: EWA from upgrading to best FA
+    ax2 = axes[0, 1]
+    best_fa_ewa = ewa_df[ewa_df["candidate_rank"] == 1].set_index("slot")["ewa"]
+    best_fa_ewa = best_fa_ewa.sort_values()
+    colors = [WIN_COLOR if w > 0 else LOSS_COLOR for w in best_fa_ewa]
+    ax2.barh(best_fa_ewa.index, best_fa_ewa.values, color=colors, alpha=0.7)
+    ax2.set_xlabel("Expected Wins Added")
+    ax2.set_title(
+        "EWA from Upgrading to Best FA\n(Replaces your worst at each position)",
+        fontweight="bold",
+    )
+    ax2.axvline(x=0, color="black", linewidth=0.5)
+    ax2.grid(True, alpha=0.3, axis="x")
+
+    # Plot 3: SGP vs EWA scatter
+    ax3 = axes[1, 0]
+    colors_map = plt.cm.tab10(np.linspace(0, 1, 10))
+    for i, slot in enumerate(ewa_df["slot"].unique()):
+        slot_plot = ewa_df[ewa_df["slot"] == slot]
+        if not slot_plot.empty:
+            ax3.scatter(
+                slot_plot["sgp_delta"],
+                slot_plot["ewa"],
+                label=slot,
+                alpha=0.7,
+                s=80,
+                color=colors_map[i % 10],
+            )
+
+    ax3.set_xlabel("SGP Gain (candidate - my worst)")
+    ax3.set_ylabel("Expected Wins Added")
+    ax3.set_title(
+        "SGP vs EWA by Position\n(Slope = position sensitivity)", fontweight="bold"
+    )
+    ax3.axhline(y=0, color="black", linewidth=0.5)
+    ax3.axvline(x=0, color="black", linewidth=0.5)
+    ax3.legend(loc="best", fontsize=8)
+    ax3.grid(True, alpha=0.3)
+
+    # Plot 4: Position scarcity curves
+    ax4 = axes[1, 1]
+    highlight_slots = ["C", "SS", "OF", "SP", "RP"]
+    colors_line = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd"]
+
+    for i, slot in enumerate(highlight_slots):
+        if slot not in slot_data:
+            continue
+        eligible = slot_data[slot]
+        available = eligible[eligible["status"] != "opponent"].copy()
+        available = available.sort_values("SGP", ascending=False).reset_index(drop=True)
+
+        n = min(50, len(available))
+        ax4.plot(
+            range(1, n + 1),
+            available["SGP"].head(n),
+            label=slot,
+            linewidth=2,
+            color=colors_line[i % len(colors_line)],
+        )
+
+        # Mark my players with circles
+        my_at_slot = eligible[eligible["status"] == "my_roster"]
+        for _, player in my_at_slot.iterrows():
+            player_in_avail = available[available["Name"] == player["Name"]]
+            if not player_in_avail.empty:
+                idx = player_in_avail.index[0]
+                if idx < n:
+                    ax4.scatter(
+                        idx + 1,
+                        player["SGP"],
+                        marker="o",
+                        s=100,
+                        edgecolors="black",
+                        linewidth=2,
+                        zorder=5,
+                        color=colors_line[i % len(colors_line)],
+                    )
+
+    ax4.set_xlabel("Rank (1 = best)")
+    ax4.set_ylabel("SGP")
+    ax4.set_title(
+        "Position Scarcity + My Players\n(Circles = my players)", fontweight="bold"
+    )
+    ax4.legend()
+    ax4.grid(True, alpha=0.3)
+    ax4.set_xlim(1, 50)
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_percentile_ewa_curves(
+    pctl_ewa_df: pd.DataFrame,
+    slots: list[str] | None = None,
+) -> plt.Figure:
+    """
+    Plot Expected Wins Added vs EWA Percentile for each position.
+
+    Players are ranked by EWA (team-specific value), so curves are monotonic.
+    The slope tells you how valuable upgrades are at each position.
+    Includes all active players (FA + opponent rosters) for trade context.
+
+    Args:
+        pctl_ewa_df: DataFrame with columns: slot, ewa_pctl, ewa, status, my_worst_ewa_pctl
+        slots: List of slots to include (default: C, SS, OF, SP, RP, 2B)
+
+    Returns:
+        matplotlib Figure
+    """
+    if slots is None:
+        slots = ["C", "SS", "OF", "SP", "RP", "2B"]
+
+    n_slots = len(slots)
+    n_cols = min(3, n_slots)
+    n_rows = (n_slots + n_cols - 1) // n_cols
+
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+    if n_rows == 1 and n_cols == 1:
+        axes = np.array([[axes]])
+    elif n_rows == 1 or n_cols == 1:
+        axes = axes.reshape(n_rows, n_cols)
+
+    for idx, slot in enumerate(slots):
+        row = idx // n_cols
+        col = idx % n_cols
+        ax = axes[row, col]
+
+        slot_pctl = pctl_ewa_df[pctl_ewa_df["slot"] == slot]
+        if slot_pctl.empty:
+            ax.text(
+                0.5,
+                0.5,
+                f"No data for {slot}",
+                ha="center",
+                va="center",
+                transform=ax.transAxes,
+            )
+            continue
+
+        # Plot EWA vs EWA percentile (monotonic by construction)
+        slot_pctl = slot_pctl.sort_values("ewa_pctl")
+
+        # Color points by status (available vs opponent)
+        available = slot_pctl[slot_pctl["status"] == "available"]
+        opponent = slot_pctl[slot_pctl["status"] == "opponent"]
+
+        # Draw the line through all points
+        ax.plot(
+            slot_pctl["ewa_pctl"],
+            slot_pctl["ewa"],
+            "b-",
+            linewidth=2,
+            alpha=0.5,
+        )
+
+        # Plot FA and opponent points differently
+        if not available.empty:
+            ax.scatter(
+                available["ewa_pctl"],
+                available["ewa"],
+                c="green",
+                s=60,
+                marker="o",
+                label="Available (FA)",
+                zorder=3,
+            )
+        if not opponent.empty:
+            ax.scatter(
+                opponent["ewa_pctl"],
+                opponent["ewa"],
+                c="red",
+                s=60,
+                marker="^",
+                label="Opponent roster",
+                zorder=3,
+            )
+
+        # Mark my current worst percentile
+        my_pctl = slot_pctl["my_worst_ewa_pctl"].iloc[0]
+        ax.axvline(
+            x=my_pctl,
+            color="purple",
+            linestyle="--",
+            alpha=0.7,
+            linewidth=2,
+            label=f"My worst: {my_pctl:.0f}%ile",
+        )
+
+        # Zero line (no improvement)
+        ax.axhline(y=0, color="black", linewidth=0.5)
+
+        # Compute slope at key region (around 60-80th percentile)
+        mid_range = slot_pctl[
+            (slot_pctl["ewa_pctl"] >= 55) & (slot_pctl["ewa_pctl"] <= 85)
+        ]
+        if len(mid_range) >= 2:
+            # Simple linear slope
+            x_vals = mid_range["ewa_pctl"].values
+            y_vals = mid_range["ewa"].values
+            slope = (y_vals.max() - y_vals.min()) / (x_vals.max() - x_vals.min() + 0.01)
+            ax.text(
+                0.05,
+                0.95,
+                f"Slope: {slope:.3f} EWA/%ile",
+                transform=ax.transAxes,
+                fontsize=9,
+                va="top",
+                color="blue",
+            )
+
+        ax.set_xlabel("EWA Percentile (ranked by team value)")
+        ax.set_ylabel("Expected Wins Added")
+        ax.set_title(f"{slot}", fontweight="bold")
+        ax.legend(loc="lower right", fontsize=7)
+        ax.grid(True, alpha=0.3)
+        ax.set_xlim(5, 100)
+
+    # Hide any unused subplots
+    for idx in range(n_slots, n_rows * n_cols):
+        row = idx // n_cols
+        col = idx % n_cols
+        axes[row, col].axis("off")
+
+    plt.suptitle(
+        "EWA by Percentile (Ranked by Team-Specific Value)\n"
+        "Green=FA, Red=Opponent (trade targets), Purple line=My worst player",
+        fontsize=12,
+        fontweight="bold",
+    )
+    plt.tight_layout()
+    return fig
+
+
+def plot_position_distributions(
+    slot_data: dict[str, pd.DataFrame],
+    slots: list[str] | None = None,
+) -> plt.Figure:
+    """
+    Violin plots showing SGP distribution at each position with my players marked.
+
+    Violin plots show the full distribution shape without cluttering with individual
+    outlier points like boxplots do.
+
+    Args:
+        slot_data: Dict mapping slot name to eligible players DataFrame
+                   with columns: Name, SGP, status (available/my_roster/opponent)
+        slots: Optional list of slots to include
+
+    Returns:
+        matplotlib Figure with 2 panels (hitting and pitching)
+    """
+    from .data_loader import HITTING_SLOTS, PITCHING_SLOTS
+
+    hitting_slots = slots if slots else list(HITTING_SLOTS.keys())
+    pitching_slots = slots if slots else list(PITCHING_SLOTS.keys())
+
+    # Filter to actual slots in data
+    hitting_slots = [s for s in hitting_slots if s in slot_data and s in HITTING_SLOTS]
+    pitching_slots = [
+        s for s in pitching_slots if s in slot_data and s in PITCHING_SLOTS
+    ]
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+
+    # Hitting positions
+    ax1 = axes[0]
+    hitting_data = []
+    for slot in hitting_slots:
+        # Include available (FA) players only for distribution (not opponents)
+        available = slot_data[slot][slot_data[slot]["status"] == "available"]
+        for _, row in available.iterrows():
+            hitting_data.append({"slot": slot, "sgp": row["SGP"]})
+
+    if hitting_data:
+        hitting_df = pd.DataFrame(hitting_data)
+
+        # Violin plot with seaborn
+        sns.violinplot(
+            data=hitting_df,
+            x="slot",
+            y="sgp",
+            order=hitting_slots,
+            ax=ax1,
+            color="lightblue",
+            alpha=0.7,
+            inner="quartile",  # Show quartile lines inside violin
+            cut=0,  # Don't extend past data range
+        )
+
+        # Overlay my players as red dots
+        for i, slot in enumerate(hitting_slots):
+            my_at_slot = slot_data[slot][slot_data[slot]["status"] == "my_roster"]
+            for _, row in my_at_slot.iterrows():
+                ax1.scatter(
+                    i,  # 0-indexed for seaborn
+                    row["SGP"],
+                    color="red",
+                    s=120,
+                    zorder=5,
+                    edgecolors="black",
+                    linewidth=1.5,
+                )
+
+    ax1.set_xlabel("")
+    ax1.set_ylabel("SGP")
+    ax1.set_title(
+        "Hitting Position SGP Distributions\n(Red dots = my players)", fontweight="bold"
+    )
+    ax1.grid(True, alpha=0.3, axis="y")
+
+    # Pitching positions
+    ax2 = axes[1]
+    pitching_data = []
+    for slot in pitching_slots:
+        available = slot_data[slot][slot_data[slot]["status"] == "available"]
+        for _, row in available.iterrows():
+            pitching_data.append({"slot": slot, "sgp": row["SGP"]})
+
+    if pitching_data:
+        pitching_df = pd.DataFrame(pitching_data)
+
+        sns.violinplot(
+            data=pitching_df,
+            x="slot",
+            y="sgp",
+            order=pitching_slots,
+            ax=ax2,
+            color="lightblue",
+            alpha=0.7,
+            inner="quartile",
+            cut=0,
+        )
+
+        for i, slot in enumerate(pitching_slots):
+            my_at_slot = slot_data[slot][slot_data[slot]["status"] == "my_roster"]
+            for _, row in my_at_slot.iterrows():
+                ax2.scatter(
+                    i,  # 0-indexed for seaborn
+                    row["SGP"],
+                    color="red",
+                    s=120,
+                    zorder=5,
+                    edgecolors="black",
+                    linewidth=1.5,
+                )
+
+    ax2.set_xlabel("")
+    ax2.set_ylabel("SGP")
+    ax2.set_title(
+        "Pitching Position SGP Distributions\n(Red dots = my players)",
+        fontweight="bold",
+    )
+    ax2.grid(True, alpha=0.3, axis="y")
+
+    plt.tight_layout()
+    return fig
+
+
+def plot_upgrade_opportunities(
+    slot_data: dict[str, pd.DataFrame],
+) -> plt.Figure:
+    """
+    Horizontal bar chart showing SGP gap between best FA and my worst player at each position.
+
+    Positive gap = there's a better free agent available than my worst player.
+
+    Args:
+        slot_data: Dict mapping slot name to eligible players DataFrame
+                   with columns: Name, SGP, status
+
+    Returns:
+        matplotlib Figure
+    """
+    opportunities = []
+
+    for slot, eligible in slot_data.items():
+        my_at_slot = eligible[eligible["status"] == "my_roster"]
+        available = eligible[eligible["status"] == "available"]
+
+        if my_at_slot.empty or available.empty:
+            continue
+
+        # Explicitly get worst (min SGP) and best (max SGP) - don't rely on sort order
+        my_worst_sgp = my_at_slot["SGP"].min()
+        best_fa_sgp = available["SGP"].max()
+
+        opportunities.append(
+            {
+                "slot": slot,
+                "my_worst_sgp": my_worst_sgp,
+                "best_fa_sgp": best_fa_sgp,
+                "gap": best_fa_sgp - my_worst_sgp,
+            }
+        )
+
+    if not opportunities:
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.text(0.5, 0.5, "No upgrade opportunities found", ha="center", va="center")
+        ax.axis("off")
+        return fig
+
+    opp_df = pd.DataFrame(opportunities).sort_values("gap", ascending=True)
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    colors = [WIN_COLOR if g > 0 else LOSS_COLOR for g in opp_df["gap"]]
+    ax.barh(opp_df["slot"], opp_df["gap"], color=colors, alpha=0.7)
+    ax.axvline(x=0, color="black", linewidth=0.5)
+    ax.set_xlabel("SGP Gap (Best FA - My Worst)")
+    ax.set_ylabel("Position Slot")
+    ax.set_title(
+        "Upgrade Opportunity by Position\n(Green = clear upgrade available)",
+        fontweight="bold",
+    )
+    ax.grid(True, alpha=0.3, axis="x")
+
     plt.tight_layout()
     return fig
 
@@ -997,86 +1793,108 @@ def plot_player_value_scatter(
     """
     fig, ax = plt.subplots(figsize=(12, 10))
 
-    # Separate by roster status and player type
-    for player_type in ["hitter", "pitcher"]:
-        subset = player_values[player_values["player_type"] == player_type]
+    # Separate by roster status
+    on_roster = player_values[player_values["on_my_roster"]]
+    off_roster = player_values[~player_values["on_my_roster"]]
 
-        my_players = subset[subset["on_my_roster"]]
-        opp_players = subset[~subset["on_my_roster"]]
+    # Plot off-roster (hollow circles)
+    hitters_off = off_roster[off_roster["player_type"] == "hitter"]
+    pitchers_off = off_roster[off_roster["player_type"] == "pitcher"]
 
-        # Plot opponent players (hollow)
-        if len(opp_players) > 0:
-            ax.scatter(
-                opp_players["generic_value"],
-                opp_players["delta_V_acquire"],
-                c=TEAM_COLORS["opponent"] if player_type == "hitter" else "#8B4513",
-                s=50,
-                alpha=0.5,
-                marker="o",
-                facecolors="none",
-                edgecolors=TEAM_COLORS["opponent"]
-                if player_type == "hitter"
-                else "#8B4513",
-                label=f"Opponent {player_type}s",
-            )
+    ax.scatter(
+        hitters_off["generic_value"],
+        hitters_off["ewa_acquire"],
+        s=50,
+        facecolors="none",
+        edgecolors="blue",
+        alpha=0.6,
+        label="Hitters (available)",
+    )
+    ax.scatter(
+        pitchers_off["generic_value"],
+        pitchers_off["ewa_acquire"],
+        s=50,
+        facecolors="none",
+        edgecolors="red",
+        alpha=0.6,
+        label="Pitchers (available)",
+    )
 
-        # Plot my players (filled)
-        if len(my_players) > 0:
-            ax.scatter(
-                my_players["generic_value"],
-                my_players["delta_V_acquire"],
-                c=TEAM_COLORS["me"] if player_type == "hitter" else "#228B22",
-                s=80,
-                alpha=0.8,
-                marker="o",
-                label=f"My {player_type}s",
-            )
+    # Plot on-roster (filled circles)
+    hitters_on = on_roster[on_roster["player_type"] == "hitter"]
+    pitchers_on = on_roster[on_roster["player_type"] == "pitcher"]
+
+    ax.scatter(
+        hitters_on["generic_value"],
+        hitters_on["ewa_acquire"],
+        s=80,
+        c="blue",
+        alpha=0.8,
+        label="Hitters (my roster)",
+    )
+    ax.scatter(
+        pitchers_on["generic_value"],
+        pitchers_on["ewa_acquire"],
+        s=80,
+        c="red",
+        alpha=0.8,
+        label="Pitchers (my roster)",
+    )
 
     # Add quadrant lines
     ax.axhline(y=0, color="gray", linestyle="--", linewidth=0.5)
-    ax.axvline(x=0, color="gray", linestyle="--", linewidth=0.5)
+    ax.axvline(
+        x=player_values["generic_value"].median(),
+        color="gray",
+        linestyle="--",
+        linewidth=0.5,
+    )
 
-    # Add quadrant labels
+    ax.set_xlabel("Generic Value (SGP)")
+    ax.set_ylabel("Contextual Value (EWA)")
+    ax.set_title("Player Value: Generic vs Contextual", fontweight="bold")
+    ax.legend(loc="upper right")
+
+    # Annotate quadrants
     xlim = ax.get_xlim()
     ylim = ax.get_ylim()
 
     ax.text(
-        xlim[1] * 0.7,
-        ylim[1] * 0.8,
-        "Great targets\n(high generic, high context)",
+        xlim[1] * 0.95,
+        ylim[1] * 0.95,
+        "Great targets\n(high both)",
+        ha="right",
+        va="top",
         fontsize=9,
         alpha=0.7,
-        ha="center",
     )
     ax.text(
-        xlim[0] * 0.7,
-        ylim[1] * 0.8,
-        "Undervalued for me\n(low generic, high context)",
+        xlim[0] * 1.05,
+        ylim[1] * 0.95,
+        "Hidden gems\n(high context)",
+        ha="left",
+        va="top",
         fontsize=9,
         alpha=0.7,
-        ha="center",
     )
     ax.text(
-        xlim[1] * 0.7,
-        ylim[0] * 0.8,
-        "Overvalued for me\n(high generic, low context)",
+        xlim[1] * 0.95,
+        ylim[0] * 1.05,
+        "Overvalued\n(high generic)",
+        ha="right",
+        va="bottom",
         fontsize=9,
         alpha=0.7,
-        ha="center",
     )
     ax.text(
-        xlim[0] * 0.7,
-        ylim[0] * 0.8,
-        "Avoid\n(low generic, low context)",
+        xlim[0] * 1.05,
+        ylim[0] * 1.05,
+        "Avoid\n(low both)",
+        ha="left",
+        va="bottom",
         fontsize=9,
         alpha=0.7,
-        ha="center",
     )
-
-    ax.set_xlabel("Generic Value (z-score sum)")
-    ax.set_ylabel("Contextual Value (ΔV if acquired)")
-    ax.set_title("Player Values: Generic vs Contextual")
-    ax.legend(loc="upper left")
 
     plt.tight_layout()
     return fig

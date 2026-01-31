@@ -8,6 +8,14 @@ This document establishes the coding standards, architectural constraints, and i
 
 ---
 
+## Cross-References
+
+**Depends on:** None (foundational document)
+
+**Used by:** All other specs — every module must follow these guidelines
+
+---
+
 ## Implementation Priorities
 
 When making decisions, prioritize in this order:
@@ -106,8 +114,8 @@ mlb_fantasy_roster_optimizer/
 ├── data/
 │   ├── fangraphs-steamer-projections-hitters.csv
 │   ├── fangraphs-steamer-projections-pitchers.csv
-│   ├── fantrax_cookies.json  # API authentication (not in git)
 │   └── optimizer.db          # SQLite database (generated, PRIMARY DATA SOURCE)
+├── config.json               # All configuration including Fantrax cookies (not in git)
 ├── implementation_specs/     # This documentation
 ├── notebook.py               # Marimo notebook (at project root)
 └── pyproject.toml
@@ -251,81 +259,17 @@ def plot_category_margins(
 
 ### Player Names Are Globally Unique
 
-All player names include a `-H` (hitter) or `-P` (pitcher) suffix:
-- `"Mike Trout-H"`, `"Gerrit Cole-P"`
-- `"Shohei Ohtani-H"`, `"Shohei Ohtani-P"` (two-way players appear twice)
-
-This eliminates all name collision issues:
-- Luis Castillo the pitcher vs. Luis Castillo the hitter
-- Duplicate names in different player pools
-
-**Display functions strip the suffix** for cleaner output using `strip_name_suffix()` from `data_loader.py`:
-```python
-from .data_loader import strip_name_suffix
-
-# In display code:
-display_name = strip_name_suffix(player_name)  # "Mike Trout-H" → "Mike Trout"
-```
+All player names include a `-H` (hitter) or `-P` (pitcher) suffix for uniqueness. Display functions strip the suffix using `strip_name_suffix()` from `data_loader.py`.
 
 **Important:** `strip_name_suffix()` is defined ONLY in `data_loader.py` and imported everywhere else. Do NOT duplicate this function.
 
-### Name Handling Flow
+See `01a_config.md` and `01c_fantrax_api.md` for detailed name handling (corrections, normalization, suffix management).
 
-There are two distinct name operations:
+### Ratio Stats and SGP Calculation
 
-1. **Name corrections** — Fix spelling differences between data sources (FanGraphs vs Fantrax)
-   - Applied to raw names BEFORE adding suffix
-   - Example: `"Julio Rodriguez"` → `"Julio Rodríguez"` → `"Julio Rodríguez-H"`
-   
-2. **Name normalization** — For fuzzy matching when corrections don't cover all cases
-   - Used for comparing names from different sources
-   - Handles accents, suffixes (Jr./Sr.), case
-   - Preserves the `-H`/`-P` suffix
+**Critical:** Ratio stats (OPS, ERA, WHIP) must be computed as weighted averages, not sums. SGP calculation weights rate stats by playing time.
 
-```
-FanGraphs CSV: "Ronald Acuña Jr."
-                     ↓ Apply corrections (if any)
-                "Ronald Acuña Jr."
-                     ↓ Add suffix based on player_type
-                "Ronald Acuña Jr.-H"
-                     ↓ Stored in database
-                     
-Fantrax API: "Ronald Acuna Jr."
-                     ↓ Apply corrections
-                "Ronald Acuña Jr."
-                     ↓ Add suffix based on position
-                "Ronald Acuña Jr.-H"
-                     ↓ Matches database!
-```
-
-### Ratio Stats Are Never Summed Directly
-
-```python
-# CORRECT - Weighted average
-team_ops = (hitters['PA'] * hitters['OPS']).sum() / hitters['PA'].sum()
-team_era = (pitchers['IP'] * pitchers['ERA']).sum() / pitchers['IP'].sum()
-
-# WRONG - Never sum ratio stats
-team_ops = hitters['OPS'].sum()  # Meaningless!
-```
-
-### SGP Calculation Weights Rate Stats by Playing Time
-
-**This is important.** The canonical SGP methodology (Smart Fantasy Baseball) weights rate stats by playing time. A .850 OPS player with 600 PA is worth more than the same OPS with 100 PA because they contribute more to the team's ratio.
-
-```python
-# CORRECT - Playing time weighted impact on team ratio
-avg_player_pa = 500  # Baseline
-remaining_pa = 7000 - avg_player_pa
-team_ops = (player_pa * player_ops + remaining_pa * league_avg_ops) / (player_pa + remaining_pa)
-ops_impact = team_ops - league_avg_ops
-ops_sgp = ops_impact / 0.010  # SGP denominator
-
-# WRONG - No playing time weighting
-ops_sgp = (player_ops - league_avg_ops) / 0.010  # Ignores PA entirely
-```
-
-See `01a_config.md` for the complete `compute_sgp_value()` implementation.
+See `01a_config.md` for detailed implementation of `compute_sgp_value()` and ratio stat handling.
 
 ### Sign Conventions for "Lower is Better" Stats
 

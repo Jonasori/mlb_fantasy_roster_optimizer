@@ -26,7 +26,8 @@ from .data_loader import (
 )
 from .roster_optimizer import (
     build_and_solve_milp,
-    compute_player_sensitivity,
+    compute_percentile_sensitivity,
+    compute_position_sensitivity,
     compute_roster_change_values,
     compute_standings,
     filter_candidates,
@@ -56,3 +57,4 @@ from .visualizations import (
     plot_win_matrix,
     plot_win_probability_breakdown,
 )
+from .mlb_api import fetch_player_ages

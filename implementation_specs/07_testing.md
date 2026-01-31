@@ -2,11 +2,30 @@
 
 ## Overview
 
-This document specifies a minimal test suite that provides guardrails during implementation. Tests verify imports, core calculations, and function signatures without complex infrastructure.
+This document specifies the test suite for the MLB Fantasy Roster Optimizer. Tests are organized into two files:
 
-**Test file:** `tests/test_core.py`  
+1. **Core tests** (`tests/test_core.py`): Unit tests for optimizer logic
+2. **Dashboard tests** (`tests/test_dashboard.py`): End-to-end browser tests for the Streamlit dashboard
+
 **Test runner:** `pytest`  
-**Philosophy:** Simple, self-contained tests. No classes, no fixtures, no mocking.
+**Browser automation:** Playwright  
+**Philosophy:** Simple, self-contained tests. Module-level functions, no classes.
+
+---
+
+## Cross-References
+
+**Depends on:**
+- [00_agent_guidelines.md](00_agent_guidelines.md) — test philosophy (fail fast, no classes)
+- [01a_config.md](01a_config.md) — constants to verify
+- [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — MILP constants to verify
+- [02a_variance_penalized_objective.md](02a_variance_penalized_objective.md) — balance tests
+- [03_trade_engine.md](03_trade_engine.md) — MEV/MVAR tables, win probability
+- [04_visualizations.md](04_visualizations.md) — radar chart sorting
+- [05_notebook_integration.md](05_notebook_integration.md) — notebook as integration test
+- [06_streamlit_dashboard.md](06_streamlit_dashboard.md) — dashboard browser tests
+
+**Used by:** None (terminal node — validates all other specs)
 
 ---
 
@@ -14,7 +33,8 @@ This document specifies a minimal test suite that provides guardrails during imp
 
 ```
 tests/
-└── test_core.py    # All tests in one file
+├── test_core.py        # Unit tests for optimizer logic (17 tests)
+└── test_dashboard.py   # End-to-end browser tests (44 tests)
 ```
 
 ---
@@ -352,7 +372,179 @@ def test_trade_fairness_threshold():
     from optimizer.trade_engine import FAIRNESS_THRESHOLD_PERCENT, MIN_MEANINGFUL_IMPROVEMENT
     
     assert FAIRNESS_THRESHOLD_PERCENT == 0.10
-    assert MIN_MEANINGFUL_IMPROVEMENT == 0.001
+    assert MIN_MEANINGFUL_IMPROVEMENT == 0.1
+
+
+# =============================================================================
+# RADAR CHART SORTING TESTS
+# =============================================================================
+
+def test_radar_sorting_hitting_pitching_opposite_directions():
+    """
+    Radar chart sorting should have hitting descending and pitching ascending.
+    This makes the maxima of hitting and pitching meet in the middle.
+    """
+    from optimizer.data_loader import HITTING_CATEGORIES, PITCHING_CATEGORIES
+    from optimizer.visualizations import sort_categories_for_radar
+
+    # Create test data where "My Team" is best in R, HR and W, K
+    my_totals = {
+        "R": 900, "HR": 280, "RBI": 750, "SB": 80, "OPS": 0.760,  # Best: R, HR
+        "W": 100, "SV": 60, "K": 1500, "ERA": 4.00, "WHIP": 1.30,  # Best: W, K
+    }
+
+    opponent_totals = {
+        1: {"R": 800, "HR": 240, "RBI": 780, "SB": 100, "OPS": 0.800,
+            "W": 85, "SV": 75, "K": 1350, "ERA": 3.50, "WHIP": 1.15}
+    }
+
+    sorted_cats = sort_categories_for_radar(my_totals, opponent_totals)
+
+    # Extract hitting and pitching portions
+    hitting_portion = [c for c in sorted_cats if c in HITTING_CATEGORIES]
+    pitching_portion = [c for c in sorted_cats if c in PITCHING_CATEGORIES]
+
+    # Hitting should come before pitching
+    hitting_indices = [sorted_cats.index(c) for c in hitting_portion]
+    pitching_indices = [sorted_cats.index(c) for c in pitching_portion]
+    assert max(hitting_indices) < min(pitching_indices)
+
+    # R and HR should be near the START of hitting (best first)
+    assert hitting_portion.index("R") < hitting_portion.index("OPS")
+    assert hitting_portion.index("HR") < hitting_portion.index("OPS")
+
+    # W and K should be near the END of pitching (best last, since ascending)
+    assert pitching_portion.index("ERA") < pitching_portion.index("W")
+    assert pitching_portion.index("ERA") < pitching_portion.index("K")
+```
+
+---
+
+## Dashboard Tests (`tests/test_dashboard.py`)
+
+End-to-end browser tests using Playwright. These tests start the Streamlit server, navigate through all pages, click buttons, and verify the UI behaves correctly.
+
+### Dependencies
+
+Add to `pyproject.toml`:
+```toml
+[dependency-groups]
+dev = ["pytest>=8.0", "playwright>=1.40", "pytest-playwright>=0.4"]
+```
+
+Install browsers:
+```bash
+uv run playwright install chromium
+```
+
+### Test Categories
+
+```python
+# =============================================================================
+# NAVIGATION TESTS (6 tests)
+# =============================================================================
+# - test_sidebar_exists
+# - test_all_navigation_options_present
+# - test_navigate_to_all_pages
+# - test_sidebar_has_team_selector
+# - test_sidebar_has_refresh_button
+# - test_sidebar_shows_navigation
+
+# =============================================================================
+# PAGE-SPECIFIC TESTS (20 tests)
+# =============================================================================
+# Overview page (2 tests)
+# My Team page (2 tests)
+# Trades page (5 tests) - includes parameter controls, trade builder
+# Free Agents page (8 tests) - free agent browser + simulator
+# Players page (2 tests)
+
+# =============================================================================
+# INTERACTIVITY TESTS (4 tests)
+# =============================================================================
+# - test_refresh_data_button_works
+# - test_button_click_does_not_crash
+# - test_simulator_multiselect_opens
+# - test_simulator_filter_player_type
+
+# =============================================================================
+# LAYOUT/CONTENT TESTS (6 tests)
+# =============================================================================
+# - test_no_error_messages_on_load
+# - test_pages_have_reasonable_content
+# - test_dataframes_render_correctly
+# - test_my_team_has_radar_chart_option
+# - test_simulator_slider_exists
+# - test_trade_parameter_sliders_exist
+
+# =============================================================================
+# COMPREHENSIVE CRAWL TEST (1 test)
+# =============================================================================
+# - test_full_dashboard_crawl
+
+# =============================================================================
+# DATA-LOADED TESTS (4 tests)
+# =============================================================================
+# These tests click "Refresh Data" first, then verify functionality:
+# - test_with_data_simulator_shows_free_agents
+# - test_with_data_my_team_shows_roster
+# - test_with_data_trades_shows_interface
+# - test_with_data_players_shows_database
+
+# =============================================================================
+# ROBUSTNESS TESTS (4 tests)
+# =============================================================================
+# - test_recover_from_invalid_nav_state
+# - test_rapid_navigation_stability
+# - test_pages_have_headers
+# - test_primary_buttons_have_text
+```
+
+### Key Implementation Patterns
+
+**Server Fixture:**
+```python
+@pytest.fixture(scope="module")
+def streamlit_server():
+    """Start Streamlit server for test module, shut down after."""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = PROJECT_ROOT
+    
+    process = subprocess.Popen(
+        ["streamlit", "run", "dashboard/app.py", 
+         "--server.port", "8501", "--server.headless", "true"],
+        cwd=PROJECT_ROOT, env=env
+    )
+    
+    # Wait for server ready (curl returns 200)
+    # ... polling logic ...
+    
+    yield process
+    process.terminate()
+```
+
+**Page Navigation Helper:**
+```python
+def navigate_to_page(page: Page, page_name: str):
+    """Navigate via sidebar navigation buttons."""
+    nav_button = page.locator(f'[data-testid="stSidebar"] button:has-text("{page_name}")')
+    nav_button.wait_for(timeout=5000)
+    nav_button.click()
+    page.wait_for_timeout(1000)
+```
+
+**Handling Data-Loaded vs No-Data States:**
+
+Tests should pass in both states (data loaded or not):
+```python
+def test_simulator_has_free_agent_browser(dashboard_page: Page):
+    navigate_to_page(dashboard_page, "🔍 Free Agents")
+    page_text = get_visible_text(dashboard_page)
+    
+    has_fa = "Free Agent" in page_text
+    has_load_msg = "Load data" in page_text or "No roster" in page_text
+    
+    assert has_fa or has_load_msg, "Should show content or load message"
 ```
 
 ---
@@ -360,21 +552,35 @@ def test_trade_fairness_threshold():
 ## Running Tests
 
 ```bash
-# Install pytest
-uv add --dev pytest
+# Install dependencies
+uv sync --group dev
+uv run playwright install chromium
 
-# Run all tests
+# Run all tests (core + dashboard)
+uv run pytest tests/ -v
+
+# Run only core tests (fast, ~5 seconds)
 uv run pytest tests/test_core.py -v
 
-# Run with output shown
-uv run pytest tests/test_core.py -v -s
+# Run only dashboard tests (~2 minutes)
+uv run pytest tests/test_dashboard.py -v
+
+# Run dashboard tests with visible browser
+uv run pytest tests/test_dashboard.py -v --headed
+
+# Run specific test
+uv run pytest tests/test_dashboard.py::test_full_dashboard_crawl -v
 ```
 
 ---
 
 ## Expected Results
 
-All tests should pass. Expected runtime: < 5 seconds.
+All tests should pass.
+
+### Core Tests (`test_core.py`)
+
+Expected runtime: < 5 seconds.
 
 | Category | Tests | Purpose |
 |----------|-------|---------|
@@ -386,8 +592,31 @@ All tests should pass. Expected runtime: < 5 seconds.
 | MILP coefficients | 1 | Sign conventions |
 | Win probability | 2 | Bounds + ordering |
 | Trade constants | 2 | MEV/MVAR + thresholds |
+| Radar sorting | 1 | Hitting/pitching opposite directions |
 
-**Total: 16 tests**
+**Total: 17 tests**
+
+### Dashboard Tests (`test_dashboard.py`)
+
+Expected runtime: ~2 minutes (browser automation).
+
+| Category | Tests | Purpose |
+|----------|-------|---------|
+| Navigation | 6 | Sidebar, routing |
+| Overview page | 2 | Content, buttons |
+| My Team page | 2 | Roster display |
+| Trades page | 5 | Parameters, builder |
+| Free Agents page | 8 | Browser + simulator |
+| Players page | 2 | Search, stats |
+| Interactivity | 4 | Buttons, widgets |
+| Layout/content | 6 | Structure, no errors |
+| Full crawl | 1 | Comprehensive smoke test |
+| Data-loaded | 4 | Post-refresh behavior |
+| Robustness | 4 | Edge cases, stability |
+
+**Total: 44 tests**
+
+### Combined Total: 61 tests
 
 ---
 

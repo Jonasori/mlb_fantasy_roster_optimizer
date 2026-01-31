@@ -4,264 +4,546 @@
 
 A Streamlit dashboard for in-season fantasy baseball management. Surfaces optimizer results, enables trade/roster simulation, and provides a searchable player database.
 
-**Module:** `dashboard/app.py`
+**Module:** `dashboard/app.py` (single file with all pages)
+**Components:** `dashboard/components.py` (reusable UI elements)
+
+---
+
+## Cross-References
+
+**Depends on:**
+- [00_agent_guidelines.md](00_agent_guidelines.md) — code style
+- [01a_config.md](01a_config.md) — `compute_team_totals()`, config constants
+- [01c_fantrax_api.md](01c_fantrax_api.md) — `MY_TEAM_NAME` constant
+- [01d_database.md](01d_database.md) — `refresh_all_data()`, database queries
+- [02_free_agent_optimizer.md](02_free_agent_optimizer.md) — `build_and_solve_milp()`, `compute_roster_change_values()`
+- [02b_position_sensitivity.md](02b_position_sensitivity.md) — `compute_position_sensitivity()`, `compute_percentile_sensitivity()`
+- [03_trade_engine.md](03_trade_engine.md) — `compute_roster_situation()`, `compute_player_values()`, trade evaluation
+- [04_visualizations.md](04_visualizations.md) — `plot_team_dashboard()`, `plot_comparison_dashboard()`, position sensitivity plots
+
+**Used by:**
+- [07_testing.md](07_testing.md) — dashboard browser tests
+
+---
 
 **Data layer:** Uses functions from:
-- `optimizer/database.py` — `refresh_all_data()`, queries (see `01d_database.md`)
-- `optimizer/fantrax_api.py` — API calls, `MY_TEAM_NAME` constant (see `01c_fantrax_api.md`)
-- `optimizer/data_loader.py` — `compute_team_totals()`, config constants (see `01a_config.md`, `01b_fangraphs_loading.md`)
+- `optimizer/database.py` — `refresh_all_data()`, queries (see [01d_database.md](01d_database.md))
+- `optimizer/fantrax_api.py` — API calls, `MY_TEAM_NAME` constant (see [01c_fantrax_api.md](01c_fantrax_api.md))
+- `optimizer/data_loader.py` — `compute_team_totals()`, `estimate_projection_uncertainty()`, config constants (see [01a_config.md](01a_config.md), [01b_fangraphs_loading.md](01b_fangraphs_loading.md))
 - `optimizer/trade_engine.py` — `compute_roster_situation()`, `compute_player_values()`, trade evaluation
-- `optimizer/roster_optimizer.py` — `build_and_solve_milp()`, `compute_roster_change_values()`
-- `optimizer/visualizations.py` — All plotting functions
+- `optimizer/roster_optimizer.py` — `build_and_solve_milp()`, `compute_roster_change_values()`, `compute_position_sensitivity()`, `compute_percentile_sensitivity()`
+- `optimizer/visualizations.py` — All plotting functions (including `plot_position_sensitivity_dashboard()`, `plot_upgrade_opportunities()`, `plot_percentile_ewa_curves()`, `plot_position_distributions()`)
 
 ---
 
 ## Goals
 
-1. **Visibility**: Surface computed metrics (SGP, WPA, win probability, trade recommendations) in one place
+1. **Visibility**: Surface computed metrics (SGP, EWA, win probability, trade recommendations) in one place
 2. **Simulation**: Explore "what-if" scenarios (trades, add/drops) with instant visual feedback
 3. **Actionability**: Clear recommendations on what to do right now
 
 ---
 
-## File Structure
+## Architecture
+
+### Single-File Structure
+
+The dashboard uses a single `app.py` with page routing via navigation buttons (not Streamlit's multi-page system):
 
 ```
 dashboard/
-├── app.py              # Main Streamlit entry point
-├── components.py       # Reusable UI components (cards, tables, charts)
-└── pages/
-    ├── 1_my_team.py
-    ├── 2_free_agents.py
-    ├── 3_trades.py
-    ├── 4_simulator.py
-    ├── 5_players.py
-    └── 6_settings.py
+├── app.py              # Main entry point with all page functions
+└── components.py       # Reusable UI components (radar chart, etc.)
+```
+
+### Navigation Pattern
+
+Use session state for navigation with button-based navigation:
+
+```python
+PAGES = [
+    ("🏠 Overview", "Overview"),
+    ("📊 My Team", "My Team"),
+    ("🔄 Trades", "Trades"),
+    ("🔍 Free Agents", "Free Agents"),  # Combined free agent browser + roster simulator
+    ("📋 All Players", "All Players"),
+]
+
+def navigate_to(page: str):
+    """Navigate to a specific page programmatically."""
+    st.session_state.nav_page = page
+```
+
+In sidebar:
+```python
+st.markdown("---")
+st.markdown("#### Navigation")
+
+current_page = st.session_state.nav_page
+
+for page_key, page_label in PAGES:
+    # Highlight current page with primary button style
+    is_current = current_page == page_key
+    button_type = "primary" if is_current else "secondary"
+    
+    if st.button(
+        page_key,
+        key=f"nav_{page_key}",
+        width="stretch",  # NOTE: use width="stretch" not use_container_width (deprecated)
+        type=button_type,
+    ):
+        navigate_to(page_key)
+        st.rerun()
+```
+
+**Benefits of button navigation:**
+- Clear visual distinction between current page (primary) and others (secondary)
+- Works consistently across light/dark themes
+- No custom CSS required
+- Larger, more clickable targets
+
+---
+
+## Session State
+
+Initialize all state variables at startup:
+
+```python
+def init_session_state():
+    if "data_loaded" not in st.session_state:
+        st.session_state.data_loaded = False
+        st.session_state.projections = None
+        st.session_state.my_roster = None
+        st.session_state.opponent_rosters = None
+        st.session_state.standings = None  # Actual standings from Fantrax
+        st.session_state.last_refresh = None
+    if "nav_page" not in st.session_state:
+        st.session_state.nav_page = "🏠 Overview"
+    # Trade analysis cache
+    if "trade_results" not in st.session_state:
+        st.session_state.trade_results = None
+    if "player_values" not in st.session_state:
+        st.session_state.player_values = None
+    if "situation" not in st.session_state:
+        st.session_state.situation = None
+    if "trade_targets" not in st.session_state:
+        st.session_state.trade_targets = None
+    if "trade_pieces" not in st.session_state:
+        st.session_state.trade_pieces = None
+    if "opponent_totals" not in st.session_state:
+        st.session_state.opponent_totals = None
+    # Position sensitivity analysis cache (My Team page)
+    if "position_sensitivity" not in st.session_state:
+        st.session_state.position_sensitivity = None
+```
+
+**Critical:** Store all data including standings, and clear cached results when data refreshes:
+```python
+def load_data():
+    data = refresh_all_data(skip_fantrax=True)  # Uses cached Fantrax data from DB
+    
+    st.session_state.projections = data["projections"]
+    st.session_state.my_roster = data["my_roster"]
+    st.session_state.opponent_rosters = data["opponent_rosters"]
+    st.session_state.standings = data["standings"]  # Actual Fantrax standings
+    st.session_state.data_loaded = True
+    
+    # Clear cached results
+    st.session_state.trade_results = None
+    st.session_state.player_values = None
+    st.session_state.situation = None
+    st.session_state.trade_targets = None
+    st.session_state.trade_pieces = None
 ```
 
 ---
 
 ## Page Specifications
 
-### Page 1: My Team Overview
+### Page 1: Overview (`show_overview`)
 
-**Purpose:** Quick health check on current roster status.
+**Purpose:** League overview with standings and navigation shortcuts.
 
-**Components:**
-
-1. **Win Probability Card**
-   ```
-   ┌────────────────────────┐
-   │  Win Probability       │
-   │       31.4%            │
-   │  Projected: 2nd-3rd    │
-   └────────────────────────┘
-   ```
-
-2. **Category Strength/Weakness Chart**
-   - Horizontal bar chart showing rank in each category (1-7)
-   - Color coding: green (1st-2nd), yellow (3rd-5th), red (6th-7th)
-   - Identifies categories where improvement is most impactful
-
-3. **Head-to-Head Matchup Grid**
-   - Heatmap: my team vs. each opponent in each category
-   - Cell value: projected win probability for that matchup
-   - Reuse existing `plot_win_matrix()` from `visualizations.py`
-
-4. **Current vs. Optimal Roster Diff**
-   - Side-by-side table comparison
-   - Highlighted rows for players to add/drop
-   - "Apply Optimal" button → populates simulator with changes
-
-5. **Roster Table**
-   - All 26 players with key stats (Position, Team, PA/IP, key category stats, SGP)
-   - Sortable columns
-   - Click row to expand detailed stats
-
----
-
-### Page 2: Free Agent Recommendations
-
-**Purpose:** Prioritized waiver wire targets.
+**Title:** "League Overview"
 
 **Components:**
 
-1. **Top Free Agents Table**
+1. **Quick Actions** (3 buttons at top)
+   - "📊 View My Team" → navigates to My Team
+   - "🔍 Free Agents" → navigates to Free Agents
+   - "🔄 Analyze Trades" → navigates to Trades
+   - Use `navigate_to()` + `st.rerun()` on click
 
-   | Rank | Player | Pos | Team | WPA | SGP | Key Stats | Recommendation |
-   |------|--------|-----|------|-----|-----|-----------|----------------|
-   | 1 | J. Doe-H | OF | NYY | +0.023 | 12.5 | HR: 25, SB: 15 | **Take Now** |
-   | 2 | J. Smith-P | RP | LAD | +0.018 | 8.2 | SV: 28 | Monitor |
+2. **Actual League Standings** (from Fantrax)
+   - Check `st.session_state.standings` for actual Fantrax standings
+   - If available, display with `st.subheader("League Standings")`
+   - Caption shows date: "Actual standings from Fantrax (as of {date})"
+   - Columns: (indicator), Rank, Team, Total Points
+   - User's team indicated with "👉" emoji (matching MY_TEAM_NAME)
+   - Status message: "Season hasn't started yet" if total_points is null
+   - If no standings available: "No standings data available. Click 'Refresh Data' to fetch from Fantrax."
 
-   **Recommendation Logic:**
-   - **Take Now**: WPA > 0.015 AND fills a category weakness
-   - **Monitor**: WPA > 0.005
-   - **Pass**: WPA ≤ 0.005
+3. **Projected Standings** (in expander)
+   - `st.expander("📊 Projected Standings (based on FanGraphs projections)")`
+   - Caption: "How teams would rank if projections played out perfectly."
+   - Computes roto standings from projected category totals
+   - Shows DataFrame with: (indicator), Rank, Team, Total Points, R, HR, RBI, SB, OPS, W, SV, K, ERA, WHIP
+   - Each category column shows team's projected rank (1-7)
+   - User's team indicated with "👉" emoji for "My Team"
 
-2. **Filters**
-   - Position dropdown (C, 1B, 2B, SS, 3B, OF, SP, RP, All)
-   - Category focus dropdown (show players who help specific category)
-   - Min SGP slider
-
-3. **Quick Actions**
-   - "Simulate Add" button → navigates to simulator with player pre-selected
+4. **My Roster Summary** (if roster loaded)
+   - 4 metric columns: Hitters count, Pitchers count, Total SGP, Avg SGP
 
 ---
 
-### Page 3: Trade Analysis
+### Page 2: My Team (`show_my_team`)
+
+**Purpose:** View current roster composition, team totals, performance visualizations, and position sensitivity analysis.
+
+**Components:**
+
+1. **Two-Column Roster Display**
+   - Left: Hitters table (Name, Position, Team, PA, R, HR, RBI, SB, OPS, SGP)
+   - Right: Pitchers table (Name, Position, Team, IP, W, SV, K, ERA, WHIP, SGP)
+   - Both sorted by SGP descending
+
+2. **Team Totals**
+   - Hitting totals: R, HR, RBI, SB, OPS
+   - Pitching totals: W, SV, K, ERA, WHIP
+
+3. **Team Performance Visualizations** (if opponent data available)
+   - Uses combined `plot_team_dashboard()` function (all 3 charts in one figure)
+   - Display via `display_figure(fig_dashboard, width=2200)`
+   
+   The combined figure shows:
+   - **Panel 1 (left):** Radar chart - league percentile across categories
+   - **Panel 2 (center):** Win/Loss heatmap vs each opponent
+   - **Panel 3 (right):** Roster composition (horizontal bar chart)
+
+4. **Position Sensitivity Analysis** (after `st.divider()`)
+   
+   **Purpose:** Analyze which positions offer the most upgrade opportunity and where your roster is strongest/weakest.
+   
+   **Session State:**
+   ```python
+   if "position_sensitivity" not in st.session_state:
+       st.session_state.position_sensitivity = None
+   ```
+   
+   **"Analyze Positions" Button:**
+   - Shows "📊 Analyze Positions" initially, "🔄 Refresh Analysis" after computation
+   - Triggers `_compute_position_sensitivity()` which:
+     1. Computes `category_sigmas` via `estimate_projection_uncertainty()`
+     2. Gets `opponent_roster_names` from opponent rosters
+     3. Calls `compute_position_sensitivity()` from `roster_optimizer.py`
+     4. Calls `compute_percentile_sensitivity()` from `roster_optimizer.py`
+     5. Stores all results in `st.session_state.position_sensitivity`
+   - Takes ~30 seconds to compute (uses spinner)
+   
+   **Displayed Results** (via `_display_position_sensitivity_plots()`):
+   
+   - **Baseline Expected Wins:** `st.info()` showing current expected wins (e.g., "19.2 / 60")
+   
+   - **Position Sensitivity Dashboard** (always visible after computation)
+     - Uses `plot_position_sensitivity_dashboard(ewa_df, sensitivity_df, slot_data)`
+     - 4-panel visualization:
+       - Panel 1: EWA per SGP by position (which positions give most bang for buck)
+       - Panel 2: EWA from upgrading to best FA at each position
+       - Panel 3: SGP vs EWA scatter by position
+       - Panel 4: Position scarcity curves with my players marked
+     - Display via `display_figure(fig_dashboard, width=1400)`
+   
+   - **Upgrade Opportunities by Position** (in expander)
+     - Uses `plot_upgrade_opportunities(slot_data)`
+     - Horizontal bar chart showing SGP gap between best FA and my worst player
+     - Display via `display_figure(fig, width=1000)`
+   
+   - **EWA vs Percentile Curves** (in expander)
+     - Uses `plot_percentile_ewa_curves(pctl_ewa_df)`
+     - Grid of 6 small charts (C, SS, OF, SP, RP, 2B)
+     - Shows how EWA changes at different percentile levels
+     - Red dashed line marks current worst player's percentile
+     - Display via `display_figure(fig, width=1400)`
+   
+   - **Player Distribution by Position** (in expander)
+     - Uses `plot_position_distributions(slot_data)`
+     - Boxplots showing SGP distributions for hitting and pitching positions
+     - Red dots mark rostered players
+     - Display via `display_figure(fig, width=1400)`
+
+---
+
+### Page 3: Trade Analysis (`show_trades`)
 
 **Purpose:** Find and evaluate trade opportunities.
 
-**Components:**
+**Layout:**
 
-1. **Trade Recommendations Table**
+```
+┌────────────────────────────────────────────────────────────────┐
+│ TRADE ANALYSIS                                                 │
+├────────────────────────────────────────────────────────────────┤
+│ [Success banner: Win probability X% | Expected wins Y/60]      │
+│ (auto-computed when entering page)                             │
+├────────────────────────────────────────────────────────────────┤
+│ 🔧 TRADE BUILDER (available immediately!)                      │
+│ ┌─────────────────────┐ ┌─────────────────────┐                │
+│ │ Players you SEND    │ │ Players you RECEIVE │                │
+│ │ [multiselect]       │ │ [multiselect]       │                │
+│ └─────────────────────┘ └─────────────────────┘                │
+│ [📊 Evaluate Trade]                                            │
+├────────────────────────────────────────────────────────────────┤
+│ 🔍 FIND RECOMMENDED TRADES                                     │
+│ [🔍 Find Trade Targets]                                        │
+├────────────────────────────────────────────────────────────────┤
+│ CATEGORY ANALYSIS                                              │
+│ ┌────────────────────────────────────────────────────────────┐ │
+│ │ Category | My Value | Avg Opponent | Win Prob | Status     │ │
+│ └────────────────────────────────────────────────────────────┘ │
+│ Strengths: [list]        Weaknesses: [list]                    │
+├────────────────────────────────────────────────────────────────┤
+│ (after Find Trade Targets)                                     │
+│ ┌─────────────────────┐ ┌─────────────────────┐                │
+│ │ 🎯 Players to       │ │ 📤 Players to       │                │
+│ │    Acquire          │ │    Offer            │                │
+│ └─────────────────────┘ └─────────────────────┘                │
+├────────────────────────────────────────────────────────────────┤
+│ ⚙️ TRADE SEARCH SETTINGS                                       │
+│ Fairness Threshold: [slider 0-50%, default 30%]                │
+│ Min Win Prob Improvement: [slider -1% to 2%, default 0.3%]     │
+│ [🔄 Re-run with New Settings]                                  │
+├────────────────────────────────────────────────────────────────┤
+│ 💱 RECOMMENDED TRADES                                          │
+│ ┌────────────────────────────────────────────────────────────┐ │
+│ │ # | Partner | You Send | You Get | ΔWin% | Fair? | Rec     │ │
+│ └────────────────────────────────────────────────────────────┘ │
+│ [Expandable details for each trade]                            │
+└────────────────────────────────────────────────────────────────┘
+```
 
-   | Partner | I Give | I Get | ΔWin% | Fairness | Recommendation |
-   |---------|--------|-------|-------|----------|----------------|
-   | Team A | Player X | Player Y | +2.3% | Fair | **Accept** |
+**Key Architecture: Trade Builder is Independent**
 
-   - Sortable by ΔWin%, Fairness
-   - Exposes existing trade engine output
+The Trade Builder appears immediately when entering the Trades tab, separate from recommended trades.
+This is achieved by computing `player_values` during initial situation computation.
 
-2. **Trade Targets Panel** (sidebar or collapsible)
-   - Players to acquire, ranked by acquirability score
-   - Shows: player name, owner, value-to-me, market value (SGP)
+**Implementation Details:**
 
-3. **Trade Pieces Panel** (sidebar or collapsible)
-   - Players to offer, ranked by expendability score
-   - Shows: player name, my value loss, market value (SGP)
+1. **Auto-Compute Situation + Player Values** (on page load via `_compute_roster_situation`)
+   - If `st.session_state.situation` is `None`, automatically computes:
+     - `opponent_totals` via `compute_all_opponent_totals()`
+     - `situation` via `compute_roster_situation()`
+     - `player_values` via `compute_player_values()` - enables Trade Builder immediately
+   - Stores all in session state and calls `st.rerun()`
+   - No separate button needed - Trade Builder ready on first load
 
-4. **Trade Builder**
-   - Two multi-select boxes: "I Give" / "I Get"
-   - Real-time evaluation as players are added/removed
-   - Shows: ΔWin%, SGP differential, fairness assessment, recommendation
+2. **Trade Builder** (`_show_trade_builder`) - SHOWN FIRST, always available
+   - Uses pre-computed `player_values` from session state
+   - Two multiselects: "Players you SEND" (your roster) and "Players you RECEIVE" (opponents)
+   - "📊 Evaluate Trade" button triggers `_evaluate_custom_trade()`
+   - Completely independent from recommended trades search
+
+3. **Find Trade Targets Button** (`_compute_trade_targets`)
+   - Computes trade_targets, trade_pieces, and trade_results (recommendations)
+   - Uses already-computed player_values
+   - Stores results in session state
+   - Calls `st.rerun()`
+
+4. **Category Analysis Table**
+   - Shows after situation computed
+   - Columns: Category, My Value, Avg Opponent, Win Prob, Status
+   - Format ratio stats (OPS, ERA, WHIP) with `.3f`
+   - Format counting stats as integers
+
+5. **Trade Targets/Pieces Panels** (side by side)
+   - Shows after trade targets computed
+   - Targets: Player, Pos, Owner, Value (+X.XX%), SGP
+   - Pieces: Player, Pos, Lose Cost, SGP
+   - Use `strip_name_suffix()` for display names
+   - Map opponent IDs to team names
+
+6. **Trade Search Settings** (below targets, above recommended trades)
+   - Visible section with `st.subheader("⚙️ Trade Search Settings")`
+   - **Fairness Threshold slider (0-50%, default 30%)**
+   - **Min Win Prob Improvement slider (-1% to 2%, default 0.3%)**
+   - "🔄 Re-run with New Settings" button to recompute with new parameters
+
+7. **Recommended Trades Table**
+   - Check `if st.session_state.trade_results is not None:` (handles empty list)
+   - Columns: #, Partner, You Send, You Get, ΔWin%, Fairness, Rec
+   - Show "No favorable fair trades found" if empty list
+   - Expandable details for first 10 trades
+   - Options format: `"PlayerName (SGP: X.X)"`
+   - "Evaluate Trade" button calls `_evaluate_custom_trade()`
+
+8. **Custom Trade Evaluation** (`_evaluate_custom_trade`)
+   - Uses `evaluate_trade()` from trade_engine
+   - Checks for `invalid_reason` key in result and displays error if present
+   - Uses `plot_comparison_dashboard()` for full visual analysis:
+     - Panel 1: Before/After radar chart
+     - Panel 2: Win/Loss heatmap (after state)
+     - Panel 3: Category-by-category delta bars
+   - Display via `display_figure(fig_dashboard, width=2200)`
+   - Summary row with 3 columns: Trade Summary, You Send, You Receive
+   - Displays: Win Prob Change, Dynasty SGP Change, Fairness, Recommendation
+   - Color-coded results (st.success/st.error/st.info)
+   - Shows player details with SGP totals
+   - Expandable category impact table showing before/after for all 10 categories
 
 ---
 
-### Page 4: Roster Simulator
+### Page 4: Free Agents (`show_simulator`)
 
-**Purpose:** Interactive "what-if" scenario exploration.
+**Purpose:** Combined free agent browser + interactive roster simulator with radar visualization.
 
 **Layout:**
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ ROSTER SIMULATOR                                                │
+│ FREE AGENTS                                                     │
+├─────────────────────────────────────────────────────────────────┤
+│ 🔍 FREE AGENT BROWSER                                           │
+│ Browse available free agents, then use the simulator below      │
+├───────────────────┬───────────────────┬─────────────────────────┤
+│ Player Type ▼     │ Position ▼        │ Min SGP [slider]        │
+├───────────────────┴───────────────────┴─────────────────────────┤
+│ **X free agents found**                                         │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │ Name | Position | Team | Stats... | SGP                     │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│ ─────────────────── [divider] ───────────────────               │
+├─────────────────────────────────────────────────────────────────┤
+│ 🎮 SIMULATE ROSTER CHANGES                                      │
+│ Test roster changes and see their impact on your win probability│
 ├───────────────────────────────┬─────────────────────────────────┤
-│ INPUTS                        │ RESULTS                         │
-│                               │                                 │
-│ Players to ADD:               │ ┌─────────────────────────────┐ │
-│ [Multi-select dropdown]       │ │     Radar Chart             │ │
-│   - Free agents               │ │  (All teams + "After")      │ │
-│   - Opponent players          │ │                             │ │
-│                               │ │  Current: solid line        │ │
-│ Players to DROP:              │ │  After: dashed line         │ │
-│ [Multi-select dropdown]       │ │  Opponents: gray lines      │ │
-│   - My roster only            │ └─────────────────────────────┘ │
-│                               │                                 │
-│ [Simulate] [Reset]            │ IMPACT SUMMARY                  │
-│                               │ ┌─────────────────────────────┐ │
-│                               │ │ Win Prob: 23.1% → 28.4%     │ │
-│                               │ │ Change: +5.3%               │ │
-│                               │ │                             │ │
-│                               │ │ Category Changes:           │ │
-│                               │ │  HR: 4th → 3rd (+4 wins)    │ │
-│                               │ │  SB: 5th → 4th (+2 wins)    │ │
-│                               │ │  ERA: 2nd → 2nd (no change) │ │
-│                               │ └─────────────────────────────┘ │
-└───────────────────────────────┴─────────────────────────────────┘
+│ **Players to ADD**            │ **Players to DROP**             │
+│ [multiselect: FA + opponents] │ [multiselect: my roster]        │
+├───────────────────────────────┴─────────────────────────────────┤
+│ [🎮 Simulate]                 [🔄 Reset]                        │
+├─────────────────────────────────────────────────────────────────┤
+│ (after Simulate)                                                │
+│ ┌─────────────────────────┐ ┌─────────────────────────────────┐ │
+│ │   Radar Chart           │ │ Impact Summary                  │ │
+│ │   Comparison            │ │ Win Probability: XX% → YY%      │ │
+│ │                         │ │ Change: +Z.ZZ%                  │ │
+│ │   (sorted by perf)      │ │                                 │ │
+│ │                         │ │ Players Added: [list]           │ │
+│ │                         │ │ Players Dropped: [list]         │ │
+│ └─────────────────────────┘ └─────────────────────────────────┘ │
+├─────────────────────────────────────────────────────────────────┤
+│ Category Impact Details                                         │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │ Category | Before | After | Change                          │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-**Inputs:**
-- "Players to ADD" multi-select: populated from free agents + all opponent rosters
-- "Players to DROP" multi-select: populated from my roster only
-- "Simulate" button: triggers recomputation
-- "Reset" button: clears selections
+**Implementation Details:**
 
-**Outputs:**
-- Radar chart with overlay (current vs after)
-- Win probability before/after with delta
-- Category-by-category rank changes with win impact
+**Section 1: Free Agent Browser**
 
-**Radar Chart Implementation:**
-- Base: `plot_team_radar()` from `visualizations.py`
-- Add second trace for "After" team totals (dashed line, different color)
-- Legend distinguishes Current, After, and Opponents
+1. **Filter Controls:** Player Type (All/Hitters/Pitchers), Position dropdown, Min SGP slider (0-20, default 3.0)
+
+2. **Free Agent Table:** Filters `projections[projections["owner"].isna()]`. Columns vary by player type filter. Sorted by SGP descending, limited to top 50. Shows count: "**X free agents found**"
+
+**Section 2: Roster Simulator** (after `st.divider()`)
+
+3. **Players to ADD Multiselect:** Combines top 100 free agents + top 50 opponent players. Format: `"PlayerName (Position, SGP: X.X)"`
+
+4. **Players to DROP Multiselect:** My roster only, sorted by SGP ascending (worst first)
+
+5. **Action Buttons:** "🎮 Simulate" (primary) triggers `_run_simulation()`, "🔄 Reset" clears session state
+
+6. **Simulation Results:** Computes old/new totals and win probability.
+
+7. **Comparison Dashboard:** Uses `plot_comparison_dashboard()` from `optimizer/visualizations.py`
+   - Panel 1: Before/After radar chart
+   - Panel 2: Win/Loss heatmap (after state)
+   - Panel 3: Category-by-category delta bars
+   - Display via `display_figure(fig_dashboard, width=2200)`
+
+8. **Summary Row:** 3 columns with Impact Summary, Players Added, Players Dropped
+   - Win probability change displayed inline
+
+9. **Category Impact Table:** In expander, showing all 10 categories with Before/After/Change columns
 
 ---
 
-### Page 5: Player Database
+### Page 5: All Player Data (`show_players`)
 
-**Purpose:** Searchable reference for all players.
+**Purpose:** Searchable reference for all players with full stats.
+
+**Title:** "All Player Data"
 
 **Components:**
 
 1. **Search Bar**
-   - Search by name (case-insensitive, partial match)
-   - Instant filtering as you type
+   - Text input with placeholder
+   - Case-insensitive partial match on Name
 
-2. **Filter Panel** (sidebar)
-   - Position: multi-select checkboxes
-   - Owner: My Team / Free Agent / [Opponent names] / All
-   - Player type: Hitter / Pitcher / All
-   - Min SGP slider
+2. **Filters** (3 columns)
+   - Player Type: All / Hitters / Pitchers
+   - Ownership: All / Free Agents / Rostered
+   - Min SGP slider (0-20)
 
-3. **Results Table**
+3. **Dynamic Column Display**
+   - Core columns: Name, Position, Team, owner
+   - Hitter stats: PA, R, HR, RBI, SB, OPS
+   - Pitcher stats: IP, W, SV, K, ERA, WHIP, GS
+   - Value columns: SGP, WAR
+   - Extra columns: age, dynasty_SGP
 
-   | Name | Pos | Team | Owner | PA/IP | R/W | HR/SV | RBI/K | SB/ERA | OPS/WHIP | WAR | SGP |
-   |------|-----|------|-------|-------|-----|-------|-------|--------|----------|-----|-----|
+   Column set depends on Player Type filter:
+   - Hitters: core + hitter stats + value + extra
+   - Pitchers: core + pitcher stats + value + extra
+   - All: core + player_type + all stats + value + extra
 
-   - Sortable columns (click header to sort)
-   - Paginated (50 per page)
-   - Click row to expand detailed view
+4. **Table Configuration**
+   Use `st.column_config` for formatting:
+   ```python
+   column_config = {
+       "Name": st.column_config.TextColumn("Name", width="medium"),
+       "PA": st.column_config.NumberColumn("PA", format="%d"),
+       "OPS": st.column_config.NumberColumn("OPS", format="%.3f"),
+       "ERA": st.column_config.NumberColumn("ERA", format="%.2f"),
+       # etc.
+   }
+   ```
 
-4. **Player Detail View** (expandable row or modal)
-   - Full projected stat line
-   - SGP breakdown by category
-   - Current owner
-   - "Simulate Add" button (if not on my team)
-
----
-
-### Page 6: Settings & Data Refresh
-
-**Purpose:** Configure data sources and trigger refreshes.
-
-**Components:**
-
-1. **Data Status Panel**
-   - Last refresh timestamp
-   - Data source: "Fantrax API" or "CSV files"
-   - Player count, roster counts
-
-2. **Refresh Actions**
-   - "Refresh All Data" button → calls `refresh_all_data()` from data layer
-   - Progress indicator during refresh
-
-3. **Current Standings** (from Fantrax)
-   - Table showing all teams: rank, total points, category breakdown
-   - My team row highlighted
-
-4. **Configuration Display** (read-only, for reference)
-   - Fantrax League ID
-   - My Team Name
-   - File paths
+5. **Stat Legend** (expandable)
+   - Explains all hitter stats
+   - Explains all pitcher stats
+   - Explains value stats (SGP, WAR, Dynasty SGP)
 
 ---
 
-## Shared Components
-
-Define reusable components in `dashboard/components.py`:
+## Shared Components (`dashboard/components.py`)
 
 ```python
-def metric_card(label: str, value: str, delta: str | None = None) -> None:
+import io
+
+def display_figure(fig: plt.Figure, width: int = 400) -> None:
     """
-    Display a metric in a styled card.
+    Display a matplotlib figure at a specific pixel width.
     
-    Example:
-        metric_card("Win Probability", "31.4%", "+2.3%")
+    This gives precise control over display size while maintaining
+    high resolution from the underlying figure.
+    
+    Implementation:
+        1. Save figure to BytesIO buffer as PNG (dpi=200, bbox_inches="tight")
+        2. Display via st.image(buf, width=width)
+        3. Close the figure with plt.close(fig)
+    
+    This approach decouples figure resolution (set in matplotlib figsize)
+    from display size (controlled by width parameter).
+    
+    Common widths:
+        - 600: Single radar chart or comparison
+        - 2200: Full-width combined dashboard
     """
 
+def metric_card(label: str, value: str, delta: str | None = None) -> None:
+    """Display a metric in a styled card using st.metric()."""
 
 def player_table(
     df: pd.DataFrame,
@@ -269,17 +551,13 @@ def player_table(
     sortable: bool = True,
     on_row_click: Callable | None = None,
 ) -> None:
-    """
-    Display a formatted player table with optional sorting.
-    """
+    """Display a formatted player table."""
 
-
-def category_rank_chart(ranks: dict[str, int], title: str = "Category Ranks") -> plt.Figure:
-    """
-    Horizontal bar chart of category ranks (1-7).
-    Color-coded by rank tier.
-    """
-
+def category_rank_chart(
+    ranks: dict[str, int],
+    title: str = "Category Ranks"
+) -> plt.Figure:
+    """Horizontal bar chart of category ranks (1-7), color-coded."""
 
 def radar_chart_with_overlay(
     current_totals: dict[str, float],
@@ -288,45 +566,49 @@ def radar_chart_with_overlay(
     categories: list[str],
 ) -> plt.Figure:
     """
-    Radar chart comparing current team, simulated team, and opponents.
+    Radar chart comparing current team vs simulated team.
+    
+    Visual Design:
+        - Figure size: 8x8 inches (high resolution, display controlled by display_figure)
+        - Radial bounds: [-0.5, 1.1] for cleaner center
+        - Reference circles at r=0 and r=1 (black, alpha=0.5)
+        - Y-ticks only at [0, 0.5, 1] with "League Percentile" label
+        - Current: blue solid line with fill
+        - After: green dashed line with fill
+        - Opponents: faded gray lines in background (linewidth=0.5, alpha=0.2)
+    
+    Normalization (CRITICAL):
+        - Min-max normalized against LEAGUE values only (current + opponents)
+        - Does NOT include after_totals in baseline (would distort comparison)
+        - For negative categories (ERA, WHIP), normalization is inverted
+        - Values clamped to [0, 1] if after-trade values fall outside league range
+    
+    Uses shared sorting logic from optimizer/visualizations.py:
+    - Hitting: sorted DESCENDING (best first, clockwise from top)
+    - Pitching: sorted ASCENDING (worst first, so best ends adjacent to hitting's best)
     """
 ```
 
----
+**Radar Chart Sorting Logic:**
 
-## Session State
-
-Streamlit reruns the script on each interaction. Use `st.session_state` to persist computed results:
+Implemented in `optimizer/visualizations.py` as `sort_categories_for_radar()`:
 
 ```python
-# Initialize once at app startup
-if "data_loaded" not in st.session_state:
-    st.session_state.data_loaded = False
-    st.session_state.projections = None
-    st.session_state.my_roster = None
-    st.session_state.opponent_rosters = None
-    st.session_state.optimizer_results = None
-    st.session_state.last_refresh = None
+from optimizer.visualizations import sort_categories_for_radar
 
-# After data refresh
-def on_refresh():
-    from optimizer.data_loader import MY_TEAM_NAME  # Single source of truth
-    from optimizer.database import refresh_all_data
-    from datetime import datetime
-    
-    # refresh_all_data returns dict with projections, rosters, standings
-    data = refresh_all_data()
-    
-    st.session_state.projections = data["projections"]
-    st.session_state.rosters = data["rosters"]  # Dict: team_name → set of player names
-    st.session_state.standings = data["standings"]
-    st.session_state.my_roster = data["rosters"][MY_TEAM_NAME]
-    st.session_state.opponent_rosters = {
-        k: v for k, v in data["rosters"].items() if k != MY_TEAM_NAME
-    }
-    st.session_state.data_loaded = True
-    st.session_state.last_refresh = datetime.now()
+# Single source of truth for sorting - used by both plot_team_radar() and 
+# radar_chart_with_overlay()
+sorted_categories = sort_categories_for_radar(current_totals, opponent_totals, categories)
 ```
+
+The sorting works as follows:
+1. Compute normalized performance score for each category (higher = better for my team)
+2. For NEGATIVE_CATEGORIES (ERA, WHIP), invert so lower values = higher scores
+3. Sort hitting categories DESCENDING (best first, clockwise from 12 o'clock)
+4. Sort pitching categories ASCENDING (worst first, so best is last)
+5. Concatenate: `sorted_hitting + sorted_pitching`
+
+This makes hitting maxima appear at the top-left and pitching maxima appear at the bottom-left, consolidating the team's strengths visually.
 
 ---
 
@@ -352,25 +634,37 @@ streamlit run dashboard/app.py
 
 ---
 
-## Implementation Priorities
+## Implementation Notes
 
-### Phase 1: Foundation
-1. Basic app structure with navigation
-2. Settings page with data refresh
-3. Player Database page (query from database)
+1. **Session State is Critical**: Always use `st.rerun()` after modifying session state from button callbacks to see updates.
 
-### Phase 2: Core Views
-4. My Team Overview (win prob, category chart, roster table)
-5. Free Agent Recommendations (waiver priority list)
-6. Current vs Optimal roster diff
+2. **Button State Display**: Use `type="primary"` for main action buttons, `type="secondary"` for already-completed actions.
 
-### Phase 3: Simulation
-7. Roster Simulator with radar overlay
-8. Real-time impact calculation
+3. **Empty List Handling**: Check `if results is not None:` not `if results:` to distinguish between "not computed yet" and "computed but empty".
 
-### Phase 4: Trade Analysis
-9. Trade recommendations table
-10. Trade builder with evaluation
+4. **Name Suffix Stripping**: Always use `strip_name_suffix()` when displaying player names to remove `-H`/`-P` suffixes.
+
+5. **Opponent Roster Indexing**: Convert opponent rosters dict to indexed format before passing to trade engine:
+   ```python
+   opponent_rosters_indexed = {
+       i + 1: names for i, (team, names) in enumerate(opponent_rosters.items())
+   }
+   ```
+
+6. **Column Availability**: Always filter display columns to those that exist in the DataFrame:
+   ```python
+   available_cols = [c for c in display_cols if c in df.columns]
+   ```
+
+7. **Streamlit Deprecation**: Use `width="stretch"` instead of `use_container_width=True` (deprecated after 2025-12-31) for `st.button`, `st.dataframe`, and similar widgets.
+
+8. **Figure Display**: Use `display_figure(fig, width=N)` from `dashboard/components.py` instead of `st.pyplot()` for precise control over display size. This saves the figure to a buffer and uses `st.image()` with explicit width.
+
+9. **Combined Dashboards**: For Trade Builder and Free Agents, use `plot_comparison_dashboard()` from `optimizer/visualizations.py` to show before/after analysis. Display at `width=2200` for full-width view.
+
+10. **Actual vs Projected Standings**: The Overview page shows both:
+    - Actual standings from `st.session_state.standings` (fetched from Fantrax, stored in DB)
+    - Projected standings computed from projections (in a collapsible expander)
 
 ---
 
