@@ -7,9 +7,9 @@ This document specifies the test suite for the MLB Fantasy Roster Optimizer. Tes
 1. **Core tests** (`tests/test_core.py`): Unit tests for optimizer logic
 2. **Dashboard tests** (`tests/test_dashboard.py`): End-to-end browser tests for the Streamlit dashboard
 
-**Test runner:** `pytest`  
-**Browser automation:** Playwright  
-**Philosophy:** Simple, self-contained tests. Module-level functions, no classes.
+**Test runner:** `pytest`
+**Browser automation:** Playwright
+**Philosophy:** Simple, self-contained tests. Module-level functions, no classes, no fixtures, no mocking.
 
 ---
 
@@ -33,13 +33,14 @@ This document specifies the test suite for the MLB Fantasy Roster Optimizer. Tes
 
 ```
 tests/
-├── test_core.py        # Unit tests for optimizer logic (17 tests)
-└── test_dashboard.py   # End-to-end browser tests (44 tests)
+├── test_core.py        # Unit tests for optimizer logic
+├── test_playing_time.py # Unit tests for playing time adjustments
+└── test_dashboard.py   # End-to-end browser tests
 ```
 
 ---
 
-## Test Implementation
+## Test Implementation (`tests/test_core.py`)
 
 ```python
 """
@@ -72,7 +73,7 @@ def test_import_data_loader():
         compute_team_totals,
         estimate_projection_uncertainty,
     )
-    
+
     assert len(ALL_CATEGORIES) == 10
     assert ROSTER_SIZE == 26
     assert NUM_OPPONENTS == 6
@@ -85,10 +86,11 @@ def test_import_roster_optimizer():
     from optimizer.roster_optimizer import (
         filter_candidates,
         build_and_solve_milp,
+        compute_slot_eligibility,
         BIG_M_COUNTING,
         EPSILON_RATIO,
     )
-    
+
     assert BIG_M_COUNTING == 10000
     assert EPSILON_RATIO == 0.001
 
@@ -102,7 +104,7 @@ def test_import_trade_engine():
         MEV_TABLE,
         MVAR_TABLE,
     )
-    
+
     assert MEV_TABLE[6] == 1.267
     assert MVAR_TABLE[6] == 0.416
 
@@ -115,6 +117,28 @@ def test_import_visualizations():
     )
 
 
+def test_import_mlb_api():
+    """MLB Stats API module is importable."""
+    from optimizer.mlb_api import fetch_player_ages
+
+    assert callable(fetch_player_ages)
+
+
+def test_fetch_player_ages_real_api():
+    """Fetch player ages from real MLB Stats API."""
+    from optimizer.mlb_api import fetch_player_ages
+
+    # Known MLBAM IDs: Shohei Ohtani, Mike Trout, Aaron Judge
+    test_ids = [660271, 545361, 592450]
+
+    df = fetch_player_ages(test_ids)
+
+    assert set(df.columns) == {"mlbam_id", "name", "birth_date", "age"}
+    assert len(df) == 3
+    assert set(df["mlbam_id"].tolist()) == set(test_ids)
+    assert (df["age"] > 0).all()
+
+
 # =============================================================================
 # NAME HANDLING TESTS
 # =============================================================================
@@ -122,7 +146,7 @@ def test_import_visualizations():
 def test_strip_name_suffix():
     """strip_name_suffix removes -H and -P correctly."""
     from optimizer.data_loader import strip_name_suffix
-    
+
     assert strip_name_suffix("Mike Trout-H") == "Mike Trout"
     assert strip_name_suffix("Gerrit Cole-P") == "Gerrit Cole"
     assert strip_name_suffix("Shohei Ohtani-H") == "Shohei Ohtani"
@@ -137,7 +161,7 @@ def test_strip_name_suffix():
 def test_compute_sgp_value_hitter():
     """SGP calculation for hitters produces reasonable values."""
     from optimizer.data_loader import compute_sgp_value
-    
+
     # Create a realistic hitter row as pd.Series
     hitter = pd.Series({
         "player_type": "hitter",
@@ -148,9 +172,9 @@ def test_compute_sgp_value_hitter():
         "SB": 15,
         "OPS": 0.820,
     })
-    
+
     sgp = compute_sgp_value(hitter)
-    
+
     # Rough expected: R/20 + HR/8 + RBI/20 + SB/7 + (OPS-0.75)/0.01
     # = 4.75 + 3.5 + 4.25 + 2.14 + 7.0 = ~21.6
     assert 15 < sgp < 30, f"Hitter SGP {sgp} outside reasonable range"
@@ -159,7 +183,7 @@ def test_compute_sgp_value_hitter():
 def test_compute_sgp_value_pitcher():
     """SGP calculation for pitchers produces reasonable values."""
     from optimizer.data_loader import compute_sgp_value
-    
+
     # Create a realistic pitcher row as pd.Series
     pitcher = pd.Series({
         "player_type": "pitcher",
@@ -170,9 +194,9 @@ def test_compute_sgp_value_pitcher():
         "ERA": 3.25,
         "WHIP": 1.10,
     })
-    
+
     sgp = compute_sgp_value(pitcher)
-    
+
     # Rough expected: W/3.5 + SV/8 + K/35 + (4.0-ERA)/0.18 + (1.25-WHIP)/0.03
     # = 4.0 + 0 + 5.7 + 4.2 + 5.0 = ~18.9
     assert 10 < sgp < 30, f"Pitcher SGP {sgp} outside reasonable range"
@@ -185,14 +209,15 @@ def test_compute_sgp_value_pitcher():
 def test_compute_team_totals_counting_stats():
     """Counting stats are summed correctly."""
     from optimizer.data_loader import compute_team_totals
-    
+
     projections = pd.DataFrame([
         {"Name": "Player A-H", "player_type": "hitter", "PA": 500, "R": 80, "HR": 25, "RBI": 70, "SB": 10, "OPS": 0.850, "IP": 0, "W": 0, "SV": 0, "K": 0, "ERA": 0, "WHIP": 0},
         {"Name": "Player B-H", "player_type": "hitter", "PA": 400, "R": 60, "HR": 15, "RBI": 50, "SB": 5, "OPS": 0.750, "IP": 0, "W": 0, "SV": 0, "K": 0, "ERA": 0, "WHIP": 0},
+        {"Name": "Pitcher A-P", "player_type": "pitcher", "PA": 0, "R": 0, "HR": 0, "RBI": 0, "SB": 0, "OPS": 0, "IP": 100, "W": 8, "SV": 0, "K": 100, "ERA": 3.50, "WHIP": 1.15},
     ])
-    
-    totals = compute_team_totals({"Player A-H", "Player B-H"}, projections)
-    
+
+    totals = compute_team_totals({"Player A-H", "Player B-H", "Pitcher A-P"}, projections)
+
     assert totals["R"] == 140, f"R should be 80+60=140, got {totals['R']}"
     assert totals["HR"] == 40, f"HR should be 25+15=40, got {totals['HR']}"
     assert totals["RBI"] == 120, f"RBI should be 70+50=120, got {totals['RBI']}"
@@ -202,14 +227,15 @@ def test_compute_team_totals_counting_stats():
 def test_compute_team_totals_ratio_stats():
     """Ratio stats use PA/IP-weighted averages, not sums."""
     from optimizer.data_loader import compute_team_totals
-    
+
     projections = pd.DataFrame([
         {"Name": "Player A-H", "player_type": "hitter", "PA": 600, "R": 100, "HR": 30, "RBI": 90, "SB": 10, "OPS": 0.900, "IP": 0, "W": 0, "SV": 0, "K": 0, "ERA": 0, "WHIP": 0},
         {"Name": "Player B-H", "player_type": "hitter", "PA": 400, "R": 60, "HR": 15, "RBI": 50, "SB": 5, "OPS": 0.700, "IP": 0, "W": 0, "SV": 0, "K": 0, "ERA": 0, "WHIP": 0},
+        {"Name": "Pitcher A-P", "player_type": "pitcher", "PA": 0, "R": 0, "HR": 0, "RBI": 0, "SB": 0, "OPS": 0, "IP": 100, "W": 8, "SV": 0, "K": 100, "ERA": 3.50, "WHIP": 1.15},
     ])
-    
-    totals = compute_team_totals({"Player A-H", "Player B-H"}, projections)
-    
+
+    totals = compute_team_totals({"Player A-H", "Player B-H", "Pitcher A-P"}, projections)
+
     # Weighted average: (600*0.9 + 400*0.7) / (600+400) = 820/1000 = 0.820
     expected_ops = (600 * 0.900 + 400 * 0.700) / 1000
     assert abs(totals["OPS"] - expected_ops) < 0.001, (
@@ -220,20 +246,21 @@ def test_compute_team_totals_ratio_stats():
 def test_compute_team_totals_pitcher_ratio_stats():
     """Pitcher ratio stats (ERA, WHIP) use IP-weighted averages."""
     from optimizer.data_loader import compute_team_totals
-    
+
     projections = pd.DataFrame([
+        {"Name": "Hitter A-H", "player_type": "hitter", "PA": 500, "R": 80, "HR": 25, "RBI": 70, "SB": 10, "OPS": 0.800, "IP": 0, "W": 0, "SV": 0, "K": 0, "ERA": 0, "WHIP": 0},
         {"Name": "Pitcher A-P", "player_type": "pitcher", "PA": 0, "R": 0, "HR": 0, "RBI": 0, "SB": 0, "OPS": 0, "IP": 180, "W": 12, "SV": 0, "K": 180, "ERA": 3.00, "WHIP": 1.00},
         {"Name": "Pitcher B-P", "player_type": "pitcher", "PA": 0, "R": 0, "HR": 0, "RBI": 0, "SB": 0, "OPS": 0, "IP": 60, "W": 4, "SV": 10, "K": 70, "ERA": 4.50, "WHIP": 1.40},
     ])
-    
-    totals = compute_team_totals({"Pitcher A-P", "Pitcher B-P"}, projections)
-    
+
+    totals = compute_team_totals({"Hitter A-H", "Pitcher A-P", "Pitcher B-P"}, projections)
+
     # ERA weighted average: (180*3.0 + 60*4.5) / 240 = 810/240 = 3.375
     expected_era = (180 * 3.00 + 60 * 4.50) / 240
     assert abs(totals["ERA"] - expected_era) < 0.01, (
         f"ERA should be weighted average {expected_era:.2f}, got {totals['ERA']:.2f}"
     )
-    
+
     # Counting stats should sum
     assert totals["W"] == 16
     assert totals["SV"] == 10
@@ -247,10 +274,10 @@ def test_compute_team_totals_pitcher_ratio_stats():
 def test_estimate_projection_uncertainty():
     """Uncertainty estimation returns reasonable values."""
     from optimizer.data_loader import estimate_projection_uncertainty
-    
+
     my_totals = {"R": 800, "HR": 240, "RBI": 780, "SB": 100, "OPS": 0.770,
                  "W": 85, "SV": 75, "K": 1350, "ERA": 3.80, "WHIP": 1.20}
-    
+
     opponent_totals = {
         1: {"R": 820, "HR": 250, "RBI": 800, "SB": 110, "OPS": 0.780, "W": 88, "SV": 70, "K": 1400, "ERA": 3.70, "WHIP": 1.18},
         2: {"R": 780, "HR": 230, "RBI": 760, "SB": 95, "OPS": 0.760, "W": 80, "SV": 80, "K": 1300, "ERA": 3.90, "WHIP": 1.22},
@@ -259,15 +286,120 @@ def test_estimate_projection_uncertainty():
         5: {"R": 810, "HR": 235, "RBI": 770, "SB": 115, "OPS": 0.775, "W": 86, "SV": 72, "K": 1380, "ERA": 3.75, "WHIP": 1.19},
         6: {"R": 830, "HR": 255, "RBI": 810, "SB": 100, "OPS": 0.785, "W": 90, "SV": 74, "K": 1420, "ERA": 3.65, "WHIP": 1.16},
     }
-    
+
     sigmas = estimate_projection_uncertainty(my_totals, opponent_totals)
-    
+
     # Should have all 10 categories
     assert len(sigmas) == 10
-    
+
     # All values should be positive
     for cat, sigma in sigmas.items():
         assert sigma > 0, f"Sigma for {cat} should be positive, got {sigma}"
+
+
+# =============================================================================
+# SLOT ELIGIBILITY TESTS
+# =============================================================================
+
+def test_slot_eligibility_single_position_hitter():
+    """Single-position hitter maps to position + UTIL."""
+    from optimizer.roster_optimizer import compute_slot_eligibility
+
+    candidates = pd.DataFrame([
+        {"Name": "Player A-H", "Position": "SS", "player_type": "hitter"},
+    ])
+
+    eligibility = compute_slot_eligibility(candidates)
+
+    assert "SS" in eligibility[0]
+    assert "UTIL" in eligibility[0]
+    assert "2B" not in eligibility[0]
+
+
+def test_slot_eligibility_multi_position_hitter():
+    """Multi-position hitter maps to all positions + UTIL."""
+    from optimizer.roster_optimizer import compute_slot_eligibility
+
+    candidates = pd.DataFrame([
+        {"Name": "Player A-H", "Position": "SS,2B", "player_type": "hitter"},
+    ])
+
+    eligibility = compute_slot_eligibility(candidates)
+
+    assert "SS" in eligibility[0]
+    assert "2B" in eligibility[0]
+    assert "UTIL" in eligibility[0]
+    assert "3B" not in eligibility[0]
+
+
+def test_slot_eligibility_pitcher():
+    """Pitcher maps only to pitching slots, no UTIL."""
+    from optimizer.roster_optimizer import compute_slot_eligibility
+
+    candidates = pd.DataFrame([
+        {"Name": "Pitcher A-P", "Position": "SP", "player_type": "pitcher"},
+        {"Name": "Pitcher B-P", "Position": "RP", "player_type": "pitcher"},
+        {"Name": "Pitcher C-P", "Position": "SP,RP", "player_type": "pitcher"},
+    ])
+
+    eligibility = compute_slot_eligibility(candidates)
+
+    assert eligibility[0] == {"SP"}
+    assert eligibility[1] == {"RP"}
+    assert eligibility[2] == {"SP", "RP"}
+
+
+def test_slot_eligibility_dh_only():
+    """DH-only player maps only to UTIL."""
+    from optimizer.roster_optimizer import compute_slot_eligibility
+
+    candidates = pd.DataFrame([
+        {"Name": "Player A-H", "Position": "DH", "player_type": "hitter"},
+    ])
+
+    eligibility = compute_slot_eligibility(candidates)
+
+    assert eligibility[0] == {"UTIL"}
+
+
+# =============================================================================
+# ROSTER SLOT CONFIGURATION TESTS
+# =============================================================================
+
+def test_slot_counts_sum_correctly():
+    """Slot counts sum to expected starting lineup size."""
+    from optimizer.data_loader import HITTING_SLOTS, PITCHING_SLOTS
+
+    # Verify individual slot counts match config.json
+    assert HITTING_SLOTS["C"] == 1
+    assert HITTING_SLOTS["1B"] == 1
+    assert HITTING_SLOTS["2B"] == 1
+    assert HITTING_SLOTS["SS"] == 1
+    assert HITTING_SLOTS["3B"] == 1
+    assert HITTING_SLOTS["OF"] == 3
+    assert HITTING_SLOTS["UTIL"] == 1
+    assert PITCHING_SLOTS["SP"] == 5
+    assert PITCHING_SLOTS["RP"] == 2
+
+    # Verify totals
+    hitting_total = sum(HITTING_SLOTS.values())
+    pitching_total = sum(PITCHING_SLOTS.values())
+    assert hitting_total == 9, f"Hitting slots should sum to 9, got {hitting_total}"
+    assert pitching_total == 7, f"Pitching slots should sum to 7, got {pitching_total}"
+
+
+def test_roster_composition_bounds():
+    """Roster composition constants allow valid 26-player rosters."""
+    from optimizer.data_loader import MIN_HITTERS, MAX_HITTERS, MIN_PITCHERS, MAX_PITCHERS, ROSTER_SIZE
+
+    assert MIN_HITTERS == 12
+    assert MAX_HITTERS == 16
+    assert MIN_PITCHERS == 10
+    assert MAX_PITCHERS == 14
+
+    # Verify bounds allow valid rosters
+    assert MIN_HITTERS + MIN_PITCHERS <= ROSTER_SIZE
+    assert MAX_HITTERS + MAX_PITCHERS >= ROSTER_SIZE
 
 
 # =============================================================================
@@ -278,18 +410,18 @@ def test_ratio_stat_coefficient_signs():
     """Verify coefficient signs for ratio stat linearization are correct."""
     # OPS (higher is better): coeff = PA * (player_OPS - opponent_OPS)
     # ERA (lower is better): coeff = IP * (opponent_ERA - player_ERA)
-    
+
     player_ops = 0.850
     player_era = 3.00
     opponent_ops = 0.770
     opponent_era = 3.85
     player_pa = 600
     player_ip = 180
-    
+
     # OPS coefficient: positive when player is better (higher OPS)
     ops_coeff = player_pa * (player_ops - opponent_ops)
     assert ops_coeff > 0, "Good OPS player should have positive coefficient"
-    
+
     # ERA coefficient: positive when player is better (lower ERA)
     era_coeff = player_ip * (opponent_era - player_era)
     assert era_coeff > 0, "Good ERA player should have positive coefficient"
@@ -302,10 +434,10 @@ def test_ratio_stat_coefficient_signs():
 def test_win_probability_bounds():
     """Win probability is between 0 and 1."""
     from optimizer.trade_engine import compute_win_probability
-    
+
     my_totals = {"R": 820, "HR": 250, "RBI": 800, "SB": 105, "OPS": 0.775,
                  "W": 85, "SV": 75, "K": 1350, "ERA": 3.75, "WHIP": 1.18}
-    
+
     opponent_totals = {
         1: {"R": 820, "HR": 240, "RBI": 780, "SB": 110, "OPS": 0.765, "W": 85, "SV": 70, "K": 1350, "ERA": 3.85, "WHIP": 1.22},
         2: {"R": 795, "HR": 255, "RBI": 810, "SB": 95, "OPS": 0.782, "W": 78, "SV": 82, "K": 1280, "ERA": 3.72, "WHIP": 1.18},
@@ -314,12 +446,12 @@ def test_win_probability_bounds():
         5: {"R": 835, "HR": 245, "RBI": 795, "SB": 105, "OPS": 0.770, "W": 88, "SV": 72, "K": 1380, "ERA": 3.80, "WHIP": 1.20},
         6: {"R": 805, "HR": 252, "RBI": 805, "SB": 100, "OPS": 0.778, "W": 82, "SV": 75, "K": 1340, "ERA": 3.75, "WHIP": 1.19},
     }
-    
+
     category_sigmas = {"R": 25, "HR": 12, "RBI": 25, "SB": 12, "OPS": 0.012,
                        "W": 5, "SV": 5, "K": 50, "ERA": 0.10, "WHIP": 0.03}
-    
+
     V, diagnostics = compute_win_probability(my_totals, opponent_totals, category_sigmas)
-    
+
     assert 0 <= V <= 1, f"Win probability {V} out of bounds"
     assert "expected_wins" in diagnostics
 
@@ -327,7 +459,7 @@ def test_win_probability_bounds():
 def test_better_team_higher_probability():
     """Strictly better team has higher win probability."""
     from optimizer.trade_engine import compute_win_probability
-    
+
     opponent_totals = {
         1: {"R": 800, "HR": 240, "RBI": 780, "SB": 100, "OPS": 0.770, "W": 84, "SV": 74, "K": 1340, "ERA": 3.80, "WHIP": 1.20},
         2: {"R": 800, "HR": 240, "RBI": 780, "SB": 100, "OPS": 0.770, "W": 84, "SV": 74, "K": 1340, "ERA": 3.80, "WHIP": 1.20},
@@ -336,21 +468,21 @@ def test_better_team_higher_probability():
         5: {"R": 800, "HR": 240, "RBI": 780, "SB": 100, "OPS": 0.770, "W": 84, "SV": 74, "K": 1340, "ERA": 3.80, "WHIP": 1.20},
         6: {"R": 800, "HR": 240, "RBI": 780, "SB": 100, "OPS": 0.770, "W": 84, "SV": 74, "K": 1340, "ERA": 3.80, "WHIP": 1.20},
     }
-    
+
     category_sigmas = {"R": 30, "HR": 15, "RBI": 30, "SB": 12, "OPS": 0.015,
                        "W": 6, "SV": 6, "K": 60, "ERA": 0.15, "WHIP": 0.04}
-    
+
     # Average team (same as opponents)
     avg_totals = {"R": 800, "HR": 240, "RBI": 780, "SB": 100, "OPS": 0.770,
                   "W": 84, "SV": 74, "K": 1340, "ERA": 3.80, "WHIP": 1.20}
-    
+
     # Clearly better team (better in every category)
     good_totals = {"R": 900, "HR": 280, "RBI": 880, "SB": 130, "OPS": 0.820,
                    "W": 100, "SV": 90, "K": 1500, "ERA": 3.40, "WHIP": 1.08}
-    
+
     V_avg, _ = compute_win_probability(avg_totals, opponent_totals, category_sigmas)
     V_good, _ = compute_win_probability(good_totals, opponent_totals, category_sigmas)
-    
+
     assert V_good > V_avg, f"Better team ({V_good:.3f}) should beat average ({V_avg:.3f})"
 
 
@@ -358,19 +490,10 @@ def test_better_team_higher_probability():
 # TRADE ENGINE CONSTANTS
 # =============================================================================
 
-def test_mev_mvar_tables():
-    """MEV and MVAR tables have correct values from literature."""
-    from optimizer.trade_engine import MEV_TABLE, MVAR_TABLE
-    
-    # From Teichroew (1956) / Rosenof (2025)
-    assert abs(MEV_TABLE[6] - 1.267) < 0.001, f"MEV[6] should be 1.267, got {MEV_TABLE[6]}"
-    assert abs(MVAR_TABLE[6] - 0.416) < 0.001, f"MVAR[6] should be 0.416, got {MVAR_TABLE[6]}"
-
-
 def test_trade_fairness_threshold():
     """Fairness threshold is percentage-based at 10%."""
     from optimizer.trade_engine import FAIRNESS_THRESHOLD_PERCENT, MIN_MEANINGFUL_IMPROVEMENT
-    
+
     assert FAIRNESS_THRESHOLD_PERCENT == 0.10
     assert MIN_MEANINGFUL_IMPROVEMENT == 0.1
 
@@ -416,6 +539,27 @@ def test_radar_sorting_hitting_pitching_opposite_directions():
     # W and K should be near the END of pitching (best last, since ascending)
     assert pitching_portion.index("ERA") < pitching_portion.index("W")
     assert pitching_portion.index("ERA") < pitching_portion.index("K")
+
+
+# =============================================================================
+# BALANCE LAMBDA TESTS
+# =============================================================================
+
+def test_balance_lambda_validation():
+    """Invalid λ values should raise assertion error."""
+    import pytest
+    from optimizer.roster_optimizer import build_and_solve_milp
+
+    # Minimal data that will fail validation before solve
+    candidates = pd.DataFrame([{"Name": "Test-H", "Position": "OF", "player_type": "hitter"}])
+    opponent_totals = {1: {"R": 100}}
+    current_names = set()
+
+    with pytest.raises(AssertionError, match="balance_lambda must be in"):
+        build_and_solve_milp(candidates, opponent_totals, current_names, balance_lambda=-0.5)
+
+    with pytest.raises(AssertionError, match="balance_lambda must be in"):
+        build_and_solve_milp(candidates, opponent_totals, current_names, balance_lambda=3.0)
 ```
 
 ---
@@ -509,16 +653,16 @@ def streamlit_server():
     """Start Streamlit server for test module, shut down after."""
     env = os.environ.copy()
     env["PYTHONPATH"] = PROJECT_ROOT
-    
+
     process = subprocess.Popen(
-        ["streamlit", "run", "dashboard/app.py", 
+        ["streamlit", "run", "dashboard/app.py",
          "--server.port", "8501", "--server.headless", "true"],
         cwd=PROJECT_ROOT, env=env
     )
-    
+
     # Wait for server ready (curl returns 200)
     # ... polling logic ...
-    
+
     yield process
     process.terminate()
 ```
@@ -540,10 +684,10 @@ Tests should pass in both states (data loaded or not):
 def test_simulator_has_free_agent_browser(dashboard_page: Page):
     navigate_to_page(dashboard_page, "🔍 Free Agents")
     page_text = get_visible_text(dashboard_page)
-    
+
     has_fa = "Free Agent" in page_text
     has_load_msg = "Load data" in page_text or "No roster" in page_text
-    
+
     assert has_fa or has_load_msg, "Should show content or load message"
 ```
 
@@ -584,17 +728,20 @@ Expected runtime: < 5 seconds.
 
 | Category | Tests | Purpose |
 |----------|-------|---------|
-| Smoke tests | 4 | Verify imports work |
+| Smoke tests | 6 | Verify imports work, MLB API |
 | Name handling | 1 | Suffix stripping |
 | SGP calculation | 2 | Hitter/pitcher SGP |
 | Team totals | 3 | Counting + ratio stats |
 | Uncertainty | 1 | Category sigmas |
+| Slot eligibility | 4 | Position → slot mapping |
+| Roster config | 2 | Slot counts, composition bounds |
 | MILP coefficients | 1 | Sign conventions |
 | Win probability | 2 | Bounds + ordering |
-| Trade constants | 2 | MEV/MVAR + thresholds |
+| Trade constants | 1 | Fairness threshold |
 | Radar sorting | 1 | Hitting/pitching opposite directions |
+| Balance lambda | 1 | Validation |
 
-**Total: 17 tests**
+**Total: 25 tests**
 
 ### Dashboard Tests (`test_dashboard.py`)
 
@@ -616,7 +763,7 @@ Expected runtime: ~2 minutes (browser automation).
 
 **Total: 44 tests**
 
-### Combined Total: 61 tests
+### Combined Total: 69 tests
 
 ---
 
@@ -625,9 +772,10 @@ Expected runtime: ~2 minutes (browser automation).
 1. **Import errors** — module structure is correct
 2. **SGP math errors** — counting vs rate stat handling
 3. **Ratio stat bugs** — weighted average vs simple sum
-4. **Sign convention bugs** — ERA/WHIP coefficient directions
-5. **Win probability bugs** — bounds violations, ordering violations
-6. **Constant typos** — MEV/MVAR values from literature
+4. **Slot eligibility bugs** — position → slot mapping for single/multi-position players
+5. **Sign convention bugs** — ERA/WHIP coefficient directions
+6. **Win probability bugs** — bounds violations, ordering violations
+7. **Constant typos** — MEV/MVAR values from literature, slot counts
 
 ---
 
