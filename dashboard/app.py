@@ -1237,7 +1237,7 @@ def show_simulator():
         )
 
     with filter_col3:
-        fa_min_sgp = st.slider("Min SGP", 0.0, 20.0, 3.0, key="fa_min_sgp")
+        fa_min_sgp = st.slider("Min SGP", 0.0, 20.0, 0.0, key="fa_min_sgp")
 
     # Apply filters
     filtered_fa = all_free_agents.copy()
@@ -1251,8 +1251,14 @@ def show_simulator():
             filtered_fa["Position"].str.contains(fa_position, na=False)
         ]
 
-    filtered_fa = filtered_fa[filtered_fa["SGP"] >= fa_min_sgp]
-    filtered_fa = filtered_fa.sort_values("SGP", ascending=False)
+    # Filter by SGP, handling NaN values: include them if min_sgp is 0
+    if fa_min_sgp == 0.0:
+        filtered_fa = filtered_fa[
+            (filtered_fa["SGP"] >= fa_min_sgp) | (filtered_fa["SGP"].isna())
+        ]
+    else:
+        filtered_fa = filtered_fa[filtered_fa["SGP"] >= fa_min_sgp]
+    filtered_fa = filtered_fa.sort_values("SGP", ascending=False, na_position="last")
 
     st.markdown(f"**{len(filtered_fa)} free agents found**")
 
@@ -1302,9 +1308,16 @@ def show_simulator():
     st.caption("Test roster changes and see their impact on your win probability")
 
     # Get free agents sorted by SGP for dropdown
-    free_agents = all_free_agents[all_free_agents["SGP"] > 0].sort_values(
-        "SGP", ascending=False
-    )
+    # Use the same minimum SGP filter as the browser above
+    # Handle NaN SGP values: include them if min_sgp is 0, otherwise exclude
+    if fa_min_sgp == 0.0:
+        free_agents = all_free_agents[
+            (all_free_agents["SGP"] >= fa_min_sgp) | (all_free_agents["SGP"].isna())
+        ].sort_values("SGP", ascending=False, na_position="last")
+    else:
+        free_agents = all_free_agents[all_free_agents["SGP"] >= fa_min_sgp].sort_values(
+            "SGP", ascending=False
+        )
 
     # Also include opponent players as potential additions
     opponent_names = set()
@@ -1523,6 +1536,8 @@ def _run_simulation(add_selections, drop_selections, fa_name_map, roster_name_ma
 
 def show_players():
     """Show searchable player database with full stats."""
+    from optimizer.config import SGP_METRIC
+
     st.title("All Player Data")
 
     projections = st.session_state.projections
@@ -1582,7 +1597,9 @@ def show_players():
     value_cols = ["SGP", "WAR"]
 
     # Additional columns if available
-    extra_cols = ["age", "dynasty_SGP"]
+    extra_cols = ["age"]
+    if SGP_METRIC == "dynasty":
+        extra_cols.append("dynasty_SGP")
 
     if type_filter == "Hitters":
         # Show only hitter stats
@@ -1669,12 +1686,16 @@ def show_players():
             - **WHIP** - Walks + Hits per IP
             - **GS** - Games Started
             """)
-        st.markdown("""
+        value_stats_text = """
         **Value Stats:**
         - **SGP** - Standings Gain Points (fantasy value)
         - **WAR** - Wins Above Replacement
+        """
+        if SGP_METRIC == "dynasty":
+            value_stats_text += """
         - **Dynasty SGP** - Age-adjusted SGP for dynasty leagues
-        """)
+        """
+        st.markdown(value_stats_text)
 
 
 def _compute_position_sensitivity(

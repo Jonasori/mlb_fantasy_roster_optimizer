@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 import seaborn as sns
 
+from .config import SGP_METRIC
 from .data_loader import (
     ALL_CATEGORIES,
     HITTING_CATEGORIES,
@@ -1063,16 +1064,20 @@ Change: {trade_eval["ewa"]:+.2f}
     send_sgp = sum(g[1] for g in trade_eval["send_generics"])
     receive_sgp = sum(g[1] for g in trade_eval["receive_generics"])
 
+    # Use appropriate label based on SGP_METRIC config
+    sgp_label = "dynasty SGP" if SGP_METRIC == "dynasty" else "SGP"
+    value_title = "Dynasty Value" if SGP_METRIC == "dynasty" else "Value"
+
     value_text = f"""
 VALUE COMPARISON
 
-Sending: {send_sgp:.1f} dynasty SGP
-Receiving: {receive_sgp:.1f} dynasty SGP
+Sending: {send_sgp:.1f} {sgp_label}
+Receiving: {receive_sgp:.1f} {sgp_label}
 
-Net: {trade_eval["delta_generic"]:+.1f} dynasty SGP
+Net: {trade_eval["delta_generic"]:+.1f} {sgp_label}
 """
     ax4.text(0.3, 0.5, value_text, fontsize=14, family="monospace", va="center")
-    ax4.set_title("Dynasty Value", fontweight="bold")
+    ax4.set_title(value_title, fontweight="bold")
 
     plt.tight_layout()
     return fig

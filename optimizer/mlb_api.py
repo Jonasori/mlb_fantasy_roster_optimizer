@@ -48,6 +48,13 @@ def fetch_player_ages(mlbam_ids: list[int], batch_size: int = 100) -> pd.DataFra
 
     df = pd.DataFrame(results)
     assert len(df) > 0, "No ages returned from API"
-    assert df["age"].notna().all(), "Some players missing age"
+
+    # Check for missing ages and warn (but don't fail - sync_ages_to_db handles missing ages)
+    missing_age_count = df["age"].isna().sum()
+    if missing_age_count > 0:
+        missing_ids = df[df["age"].isna()]["mlbam_id"].tolist()
+        print(
+            f"  Warning: {missing_age_count} players missing age data (MLBAM IDs: {missing_ids[:10]}{'...' if len(missing_ids) > 10 else ''})"
+        )
 
     return df

@@ -323,6 +323,7 @@ from optimizer.config import (
 **SGP Denominators:** "how much of stat X gains one standing point"
 - Based on Smart Fantasy Baseball analysis of 12-team leagues, adjusted for 7-team.
 - See: https://www.smartfantasybaseball.com/2013/03/create-your-own-fantasy-baseball-rankings-part-5-understanding-standings-gain-points/
+- **TODO:** Document the exact source/reference for the denominator values in config.json (e.g., which year's denominators, how they were adjusted for 7-team league, whether replacement level is already accounted for)
 
 **SGP Rate Stats:** `(denominator, league_average, higher_is_better)`
 - Denominator is per-unit change in team ratio that gains one standings point

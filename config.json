@@ -77,11 +77,11 @@
   },
   "projections": {
     "data_dir": "data/",
-    "raw_hitters": "data/fangraphs-atc-projections-hitters.csv",
-    "raw_pitchers": "data/fangraphs-atc-projections-pitchers.csv",
+    "raw_hitters": "data/fangraphs-steamer-projections-hitters.csv",
+    "raw_pitchers": "data/fangraphs-steamer-projections-pitchers.csv",
     "adjusted_hitters": "data/fangraphs-atc-pt-adjusted-hitters.csv",
     "adjusted_pitchers": "data/fangraphs-atc-pt-adjusted-pitchers.csv",
-    "use_adjusted": true
+    "use_adjusted": false
   },
   "fantrax": {
     "cookies": {
