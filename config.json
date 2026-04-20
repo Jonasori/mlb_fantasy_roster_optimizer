@@ -11,9 +11,9 @@
       "Shohei Me The (Betting) Money!": "9z72hkg2mkfnc7kw",
       "The Big Dumpers": "zhh2uwcamkfnc7kw"
     },
-    "roster_size": 26,
+    "roster_size": 28,
     "min_hitters": 12,
-    "max_hitters": 16,
+    "max_hitters": 18,
     "min_pitchers": 10,
     "max_pitchers": 14,
     "hitting_slots": {
@@ -22,7 +22,7 @@
       "2B": 1,
       "SS": 1,
       "3B": 1,
-      "OF": 3,
+      "OF": 5,
       "UTIL": 1
     },
     "pitching_slots": {
@@ -36,7 +36,7 @@
       "SS": ["SS"],
       "3B": ["3B"],
       "OF": ["OF"],
-      "UTIL": ["C", "1B", "2B", "SS", "3B", "OF", "DH"],
+      "UTIL": ["C", "1B", "2B", "SS", "3B", "OF", "DH", "UT"],
       "SP": ["SP"],
       "RP": ["RP"]
     },
@@ -50,30 +50,13 @@
     },
     "fantrax_active_status_ids": ["1", "2"],
     "min_stat_standard_deviation": 0.001,
-    "balance_lambda_default": 0.5
+    "balance_lambda_default": 0.0
   },
   "trade_engine": {
     "fairness_threshold_percent": 0.10,
     "max_trade_size": 3,
     "min_meaningful_improvement": 0.1,
     "lose_cost_scale": 2
-  },
-  "sgp": {
-    "denominators": {
-      "R": 20.0,
-      "HR": 8.0,
-      "RBI": 20.0,
-      "SB": 7.0,
-      "W": 3.5,
-      "SV": 8.0,
-      "K": 35.0
-    },
-    "rate_stats": {
-      "OPS": [0.010, 0.750, true],
-      "ERA": [0.18, 4.00, false],
-      "WHIP": [0.030, 1.25, false]
-    },
-    "metric": "raw"
   },
   "projections": {
     "data_dir": "data/",
