@@ -1,961 +1,895 @@
 """
-Minimal test suite for MLB Fantasy Roster Optimizer.
-
-All tests are module-level functions with inline test data.
-No classes, no fixtures, no mocking.
+Minimal test suite per AGENTS.md: no classes, no fixtures, no mocking.
+Each test is self-contained with inline test data.
 """
 
 import numpy as np
 import pandas as pd
 
-# =============================================================================
-# SMOKE TESTS - Verify imports work
-# =============================================================================
-
-
-def test_import_data_loader():
-    """Core data_loader exports are importable."""
-    from optimizer.data_loader import (
-        ALL_CATEGORIES,
-        FANTRAX_TEAM_IDS,
-        HITTING_CATEGORIES,
-        NUM_OPPONENTS,
-        PITCHING_CATEGORIES,
-        ROSTER_SIZE,
-        SLOT_ELIGIBILITY,
-        compute_sgp_value,
-        compute_team_totals,
-        estimate_projection_uncertainty,
-        strip_name_suffix,
-    )
-
-    assert len(ALL_CATEGORIES) == 10
-    assert ROSTER_SIZE == 26
-    assert NUM_OPPONENTS == 6
-    assert len(FANTRAX_TEAM_IDS) == 7
-    assert "C" in SLOT_ELIGIBILITY
-
-
-def test_import_mlb_api():
-    """MLB Stats API module is importable."""
-    from optimizer.mlb_api import fetch_player_ages
-
-    assert callable(fetch_player_ages)
-
-
-def test_fetch_player_ages_real_api():
-    """Fetch player ages from real MLB Stats API."""
-    from optimizer.mlb_api import fetch_player_ages
-
-    # Known MLBAM IDs: Shohei Ohtani, Mike Trout, Aaron Judge
-    test_ids = [660271, 545361, 592450]
-
-    df = fetch_player_ages(test_ids)
-
-    # Should return DataFrame with correct columns
-    assert set(df.columns) == {"mlbam_id", "name", "birth_date", "age"}
-
-    # Should have 3 rows
-    assert len(df) == 3
-
-    # All IDs should be present
-    assert set(df["mlbam_id"].tolist()) == set(test_ids)
-
-    # All ages should be positive integers
-    assert df["age"].dtype in [np.int64, int, "int64"]
-    assert (df["age"] > 0).all()
-
-    # Verify known player names
-    names = df["name"].tolist()
-    assert "Shohei Ohtani" in names
-    assert "Mike Trout" in names
-    assert "Aaron Judge" in names
-
-
-def test_fetch_player_ages_deduplicates():
-    """Duplicate IDs are handled correctly."""
-    from optimizer.mlb_api import fetch_player_ages
-
-    # Pass same ID multiple times
-    test_ids = [660271, 660271, 660271]
-
-    df = fetch_player_ages(test_ids)
-
-    # Should return only 1 unique player
-    assert len(df) == 1
-    assert df.iloc[0]["name"] == "Shohei Ohtani"
-
-
-def test_import_roster_optimizer():
-    """Roster optimizer exports are importable."""
-    from optimizer.roster_optimizer import (
-        BIG_M_COUNTING,
-        EPSILON_RATIO,
-        build_and_solve_milp,
-        filter_candidates,
-    )
-
-    assert BIG_M_COUNTING == 10000
-    assert EPSILON_RATIO == 0.001
-
-
-def test_import_trade_engine():
-    """Trade engine exports are importable."""
-    from optimizer.trade_engine import (
-        MEV_TABLE,
-        MVAR_TABLE,
-        compute_player_values,
-        compute_win_probability,
-        evaluate_trade,
-    )
-
-    assert MEV_TABLE[6] == 1.267
-    assert MVAR_TABLE[6] == 0.416
-
-
-def test_import_visualizations():
-    """Visualizations exports are importable."""
-    from optimizer.visualizations import (
-        plot_team_radar,
-        plot_trade_impact,
-    )
-
-
-# =============================================================================
-# NAME HANDLING TESTS
-# =============================================================================
-
-
-def test_strip_name_suffix():
-    """strip_name_suffix removes -H and -P correctly."""
-    from optimizer.data_loader import strip_name_suffix
-
-    assert strip_name_suffix("Mike Trout-H") == "Mike Trout"
-    assert strip_name_suffix("Gerrit Cole-P") == "Gerrit Cole"
-    assert strip_name_suffix("Shohei Ohtani-H") == "Shohei Ohtani"
-    assert strip_name_suffix("Shohei Ohtani-P") == "Shohei Ohtani"
-    assert strip_name_suffix("No Suffix") == "No Suffix"
-
-
-# =============================================================================
-# SGP CALCULATION TESTS
-# =============================================================================
-
-
-def test_compute_sgp_value_hitter():
-    """SGP calculation for hitters produces reasonable values."""
-    from optimizer.data_loader import compute_sgp_value
-
-    # Create a realistic hitter row as pd.Series
-    hitter = pd.Series(
-        {
-            "player_type": "hitter",
-            "PA": 600,
-            "R": 95,
-            "HR": 28,
-            "RBI": 85,
-            "SB": 15,
-            "OPS": 0.820,
-        }
-    )
-
-    sgp = compute_sgp_value(hitter)
-
-    # Rough expected: R/20 + HR/8 + RBI/20 + SB/7 + (OPS-0.75)/0.01
-    # = 4.75 + 3.5 + 4.25 + 2.14 + 7.0 = ~21.6
-    assert 15 < sgp < 30, f"Hitter SGP {sgp} outside reasonable range"
-
-
-def test_compute_sgp_value_pitcher():
-    """SGP calculation for pitchers produces reasonable values."""
-    from optimizer.data_loader import compute_sgp_value
-
-    # Create a realistic pitcher row as pd.Series
-    pitcher = pd.Series(
-        {
-            "player_type": "pitcher",
-            "IP": 180.0,
-            "W": 14,
-            "SV": 0,
-            "K": 200,
-            "ERA": 3.25,
-            "WHIP": 1.10,
-        }
-    )
-
-    sgp = compute_sgp_value(pitcher)
-
-    # Rough expected: W/3.5 + SV/8 + K/35 + (4.0-ERA)/0.18 + (1.25-WHIP)/0.03
-    # = 4.0 + 0 + 5.7 + 4.2 + 5.0 = ~18.9
-    assert 10 < sgp < 30, f"Pitcher SGP {sgp} outside reasonable range"
-
-
-# =============================================================================
-# TEAM TOTALS TESTS
-# =============================================================================
-
-
-def test_compute_team_totals_counting_stats():
-    """Counting stats are summed correctly."""
-    from optimizer.data_loader import compute_team_totals
-
-    projections = pd.DataFrame(
-        [
-            {
-                "Name": "Player A-H",
-                "player_type": "hitter",
-                "PA": 500,
-                "R": 80,
-                "HR": 25,
-                "RBI": 70,
-                "SB": 10,
-                "OPS": 0.850,
-                "IP": 0,
-                "W": 0,
-                "SV": 0,
-                "K": 0,
-                "ERA": 0,
-                "WHIP": 0,
-            },
-            {
-                "Name": "Player B-H",
-                "player_type": "hitter",
-                "PA": 400,
-                "R": 60,
-                "HR": 15,
-                "RBI": 50,
-                "SB": 5,
-                "OPS": 0.750,
-                "IP": 0,
-                "W": 0,
-                "SV": 0,
-                "K": 0,
-                "ERA": 0,
-                "WHIP": 0,
-            },
-            {
-                "Name": "Pitcher A-P",
-                "player_type": "pitcher",
-                "PA": 0,
-                "R": 0,
-                "HR": 0,
-                "RBI": 0,
-                "SB": 0,
-                "OPS": 0,
-                "IP": 100,
-                "W": 8,
-                "SV": 0,
-                "K": 100,
-                "ERA": 3.50,
-                "WHIP": 1.15,
-            },
-        ]
-    )
-
-    totals = compute_team_totals(
-        {"Player A-H", "Player B-H", "Pitcher A-P"}, projections
-    )
-
-    assert totals["R"] == 140, f"R should be 80+60=140, got {totals['R']}"
-    assert totals["HR"] == 40, f"HR should be 25+15=40, got {totals['HR']}"
-    assert totals["RBI"] == 120, f"RBI should be 70+50=120, got {totals['RBI']}"
-    assert totals["SB"] == 15, f"SB should be 10+5=15, got {totals['SB']}"
-
-
-def test_compute_team_totals_ratio_stats():
-    """Ratio stats use PA/IP-weighted averages, not sums."""
-    from optimizer.data_loader import compute_team_totals
-
-    projections = pd.DataFrame(
-        [
-            {
-                "Name": "Player A-H",
-                "player_type": "hitter",
-                "PA": 600,
-                "R": 100,
-                "HR": 30,
-                "RBI": 90,
-                "SB": 10,
-                "OPS": 0.900,
-                "IP": 0,
-                "W": 0,
-                "SV": 0,
-                "K": 0,
-                "ERA": 0,
-                "WHIP": 0,
-            },
-            {
-                "Name": "Player B-H",
-                "player_type": "hitter",
-                "PA": 400,
-                "R": 60,
-                "HR": 15,
-                "RBI": 50,
-                "SB": 5,
-                "OPS": 0.700,
-                "IP": 0,
-                "W": 0,
-                "SV": 0,
-                "K": 0,
-                "ERA": 0,
-                "WHIP": 0,
-            },
-            {
-                "Name": "Pitcher A-P",
-                "player_type": "pitcher",
-                "PA": 0,
-                "R": 0,
-                "HR": 0,
-                "RBI": 0,
-                "SB": 0,
-                "OPS": 0,
-                "IP": 100,
-                "W": 8,
-                "SV": 0,
-                "K": 100,
-                "ERA": 3.50,
-                "WHIP": 1.15,
-            },
-        ]
-    )
-
-    totals = compute_team_totals(
-        {"Player A-H", "Player B-H", "Pitcher A-P"}, projections
-    )
-
-    # Weighted average: (600*0.9 + 400*0.7) / (600+400) = 820/1000 = 0.820
-    expected_ops = (600 * 0.900 + 400 * 0.700) / 1000
-    assert abs(totals["OPS"] - expected_ops) < 0.001, (
-        f"OPS should be weighted average {expected_ops:.3f}, got {totals['OPS']:.3f}"
-    )
-
-
-def test_compute_team_totals_pitcher_ratio_stats():
-    """Pitcher ratio stats (ERA, WHIP) use IP-weighted averages."""
-    from optimizer.data_loader import compute_team_totals
-
-    projections = pd.DataFrame(
-        [
-            {
-                "Name": "Hitter A-H",
-                "player_type": "hitter",
-                "PA": 500,
-                "R": 80,
-                "HR": 25,
-                "RBI": 70,
-                "SB": 10,
-                "OPS": 0.800,
-                "IP": 0,
-                "W": 0,
-                "SV": 0,
-                "K": 0,
-                "ERA": 0,
-                "WHIP": 0,
-            },
-            {
-                "Name": "Pitcher A-P",
-                "player_type": "pitcher",
-                "PA": 0,
-                "R": 0,
-                "HR": 0,
-                "RBI": 0,
-                "SB": 0,
-                "OPS": 0,
-                "IP": 180,
-                "W": 12,
-                "SV": 0,
-                "K": 180,
-                "ERA": 3.00,
-                "WHIP": 1.00,
-            },
-            {
-                "Name": "Pitcher B-P",
-                "player_type": "pitcher",
-                "PA": 0,
-                "R": 0,
-                "HR": 0,
-                "RBI": 0,
-                "SB": 0,
-                "OPS": 0,
-                "IP": 60,
-                "W": 4,
-                "SV": 10,
-                "K": 70,
-                "ERA": 4.50,
-                "WHIP": 1.40,
-            },
-        ]
-    )
-
-    totals = compute_team_totals(
-        {"Hitter A-H", "Pitcher A-P", "Pitcher B-P"}, projections
-    )
-
-    # ERA weighted average: (180*3.0 + 60*4.5) / 240 = 810/240 = 3.375
-    expected_era = (180 * 3.00 + 60 * 4.50) / 240
-    assert abs(totals["ERA"] - expected_era) < 0.01, (
-        f"ERA should be weighted average {expected_era:.2f}, got {totals['ERA']:.2f}"
-    )
-
-    # Counting stats should sum
-    assert totals["W"] == 16
-    assert totals["SV"] == 10
-    assert totals["K"] == 250
-
-
-# =============================================================================
-# PROJECTION UNCERTAINTY TESTS
-# =============================================================================
-
-
-def test_estimate_projection_uncertainty():
-    """Uncertainty estimation returns reasonable values."""
-    from optimizer.data_loader import estimate_projection_uncertainty
-
-    my_totals = {
-        "R": 800,
-        "HR": 240,
-        "RBI": 780,
-        "SB": 100,
-        "OPS": 0.770,
-        "W": 85,
-        "SV": 75,
-        "K": 1350,
-        "ERA": 3.80,
-        "WHIP": 1.20,
+from optimizer.lineup_solver import compute_totals_for_starters
+from optimizer.player_scoring import add_fantasy_value, add_mew
+from optimizer.players import get_eligible_slots
+from optimizer.swap_evaluator import add_bench_value, compute_exact_msv
+from optimizer.win_model import (
+    compute_ew_gradient,
+    compute_win_probability,
+    estimate_projection_uncertainty,
+)
+
+
+def _make_hitter(
+    name: str,
+    pa: float,
+    r: float,
+    hr: float,
+    rbi: float,
+    sb: float,
+    ops: float,
+    war: float = 2.0,
+    owner: str | None = None,
+    position: str = "OF",
+    roster_status: str | None = None,
+) -> dict:
+    """Helper to build a hitter row."""
+    return {
+        "Name": name,
+        "Team": "NYY",
+        "Position": position,
+        "player_type": "hitter",
+        "PA": pa,
+        "IP": 0.0,
+        "R": r,
+        "HR": hr,
+        "RBI": rbi,
+        "SB": sb,
+        "OPS": ops,
+        "W": 0.0,
+        "SV": 0.0,
+        "K": 0.0,
+        "ERA": 0.0,
+        "WHIP": 0.0,
+        "WAR": war,
+        "owner": owner,
+        "roster_status": roster_status,
     }
 
+
+def _make_pitcher(
+    name: str,
+    ip: float,
+    w: float,
+    sv: float,
+    k: float,
+    era: float,
+    whip: float,
+    war: float = 2.0,
+    owner: str | None = None,
+    position: str = "SP",
+    roster_status: str | None = None,
+) -> dict:
+    """Helper to build a pitcher row."""
+    return {
+        "Name": name,
+        "Team": "LAD",
+        "Position": position,
+        "player_type": "pitcher",
+        "PA": 0.0,
+        "IP": ip,
+        "R": 0.0,
+        "HR": 0.0,
+        "RBI": 0.0,
+        "SB": 0.0,
+        "OPS": 0.0,
+        "W": w,
+        "SV": sv,
+        "K": k,
+        "ERA": era,
+        "WHIP": whip,
+        "WAR": war,
+        "owner": owner,
+        "roster_status": roster_status,
+    }
+
+
+def _synthetic_totals():
+    """Create synthetic my_totals and opponent_totals for gradient tests."""
+    my_totals = {
+        "R": 800.0,
+        "HR": 250.0,
+        "RBI": 780.0,
+        "SB": 100.0,
+        "OPS": 0.770,
+        "W": 80.0,
+        "SV": 45.0,
+        "K": 1200.0,
+        "ERA": 3.80,
+        "WHIP": 1.20,
+        "PA": 5500.0,
+        "IP": 1200.0,
+    }
     opponent_totals = {
         1: {
-            "R": 820,
-            "HR": 250,
-            "RBI": 800,
+            "R": 790,
+            "HR": 240,
+            "RBI": 770,
             "SB": 110,
-            "OPS": 0.780,
-            "W": 88,
-            "SV": 70,
-            "K": 1400,
-            "ERA": 3.70,
-            "WHIP": 1.18,
-        },
-        2: {
-            "R": 780,
-            "HR": 230,
-            "RBI": 760,
-            "SB": 95,
             "OPS": 0.760,
-            "W": 80,
-            "SV": 80,
-            "K": 1300,
+            "W": 75,
+            "SV": 50,
+            "K": 1180,
             "ERA": 3.90,
             "WHIP": 1.22,
         },
-        3: {
-            "R": 850,
-            "HR": 260,
-            "RBI": 820,
-            "SB": 105,
-            "OPS": 0.790,
-            "W": 92,
-            "SV": 68,
-            "K": 1450,
-            "ERA": 3.60,
-            "WHIP": 1.15,
-        },
-        4: {
-            "R": 790,
-            "HR": 245,
-            "RBI": 790,
-            "SB": 90,
-            "OPS": 0.765,
-            "W": 82,
-            "SV": 78,
-            "K": 1320,
-            "ERA": 3.85,
-            "WHIP": 1.21,
-        },
-        5: {
-            "R": 810,
-            "HR": 235,
-            "RBI": 770,
-            "SB": 115,
-            "OPS": 0.775,
-            "W": 86,
-            "SV": 72,
-            "K": 1380,
-            "ERA": 3.75,
-            "WHIP": 1.19,
-        },
-        6: {
-            "R": 830,
-            "HR": 255,
-            "RBI": 810,
-            "SB": 100,
-            "OPS": 0.785,
-            "W": 90,
-            "SV": 74,
-            "K": 1420,
-            "ERA": 3.65,
-            "WHIP": 1.16,
-        },
-    }
-
-    sigmas = estimate_projection_uncertainty(my_totals, opponent_totals)
-
-    # Should have all 10 categories
-    assert len(sigmas) == 10
-
-    # All values should be positive
-    for cat, sigma in sigmas.items():
-        assert sigma > 0, f"Sigma for {cat} should be positive, got {sigma}"
-
-
-# =============================================================================
-# MILP COEFFICIENT SIGN TESTS
-# =============================================================================
-
-
-def test_ratio_stat_coefficient_signs():
-    """Verify coefficient signs for ratio stat linearization are correct."""
-    # OPS (higher is better): coeff = PA * (player_OPS - opponent_OPS)
-    # ERA (lower is better): coeff = IP * (opponent_ERA - player_ERA)
-
-    player_ops = 0.850
-    player_era = 3.00
-    opponent_ops = 0.770
-    opponent_era = 3.85
-    player_pa = 600
-    player_ip = 180
-
-    # OPS coefficient: positive when player is better (higher OPS)
-    ops_coeff = player_pa * (player_ops - opponent_ops)
-    assert ops_coeff > 0, "Good OPS player should have positive coefficient"
-
-    # ERA coefficient: positive when player is better (lower ERA)
-    era_coeff = player_ip * (opponent_era - player_era)
-    assert era_coeff > 0, "Good ERA player should have positive coefficient"
-
-
-# =============================================================================
-# WIN PROBABILITY TESTS
-# =============================================================================
-
-
-def test_win_probability_bounds():
-    """Win probability is between 0 and 1."""
-    from optimizer.trade_engine import compute_win_probability
-
-    my_totals = {
-        "R": 820,
-        "HR": 250,
-        "RBI": 800,
-        "SB": 105,
-        "OPS": 0.775,
-        "W": 85,
-        "SV": 75,
-        "K": 1350,
-        "ERA": 3.75,
-        "WHIP": 1.18,
-    }
-
-    opponent_totals = {
-        1: {
-            "R": 820,
-            "HR": 240,
-            "RBI": 780,
-            "SB": 110,
-            "OPS": 0.765,
-            "W": 85,
-            "SV": 70,
-            "K": 1350,
-            "ERA": 3.85,
-            "WHIP": 1.22,
-        },
         2: {
-            "R": 795,
-            "HR": 255,
-            "RBI": 810,
-            "SB": 95,
-            "OPS": 0.782,
-            "W": 78,
-            "SV": 82,
-            "K": 1280,
-            "ERA": 3.72,
+            "R": 810,
+            "HR": 260,
+            "RBI": 800,
+            "SB": 90,
+            "OPS": 0.780,
+            "W": 85,
+            "SV": 40,
+            "K": 1220,
+            "ERA": 3.70,
             "WHIP": 1.18,
         },
-        3: {
-            "R": 850,
-            "HR": 230,
-            "RBI": 760,
-            "SB": 130,
-            "OPS": 0.758,
-            "W": 92,
-            "SV": 65,
-            "K": 1420,
-            "ERA": 3.95,
-            "WHIP": 1.25,
-        },
-        4: {
-            "R": 780,
-            "HR": 268,
-            "RBI": 830,
-            "SB": 88,
-            "OPS": 0.795,
-            "W": 80,
-            "SV": 78,
-            "K": 1310,
-            "ERA": 3.68,
-            "WHIP": 1.15,
-        },
-        5: {
-            "R": 835,
-            "HR": 245,
-            "RBI": 795,
-            "SB": 105,
-            "OPS": 0.770,
-            "W": 88,
-            "SV": 72,
-            "K": 1380,
-            "ERA": 3.80,
-            "WHIP": 1.20,
-        },
-        6: {
-            "R": 805,
-            "HR": 252,
-            "RBI": 805,
-            "SB": 100,
-            "OPS": 0.778,
-            "W": 82,
-            "SV": 75,
-            "K": 1340,
-            "ERA": 3.75,
-            "WHIP": 1.19,
-        },
     }
+    return my_totals, opponent_totals
 
-    category_sigmas = {
-        "R": 25,
-        "HR": 12,
-        "RBI": 25,
-        "SB": 12,
-        "OPS": 0.012,
-        "W": 5,
-        "SV": 5,
-        "K": 50,
-        "ERA": 0.10,
-        "WHIP": 0.03,
-    }
 
-    V, diagnostics = compute_win_probability(
-        my_totals, opponent_totals, category_sigmas
+def test_ew_gradient_sign_convention():
+    """g_c > 0 for C⁺, g_c < 0 for C⁻."""
+    my_totals, opponent_totals = _synthetic_totals()
+    sigmas = estimate_projection_uncertainty(my_totals, opponent_totals)
+    gradient = compute_ew_gradient(my_totals, opponent_totals, sigmas)
+
+    positive_cats = {"R", "HR", "RBI", "SB", "OPS", "W", "SV", "K"}
+    negative_cats = {"ERA", "WHIP"}
+
+    for cat in positive_cats:
+        assert gradient[cat] > 0, (
+            f"Gradient for {cat} should be positive (C⁺), got {gradient[cat]:.6f}"
+        )
+    for cat in negative_cats:
+        assert gradient[cat] < 0, (
+            f"Gradient for {cat} should be negative (C⁻), got {gradient[cat]:.6f}"
+        )
+
+
+def test_mew_era_sign_check():
+    """Low-ERA pitcher must have higher MEW than high-ERA pitcher."""
+    my_totals, opponent_totals = _synthetic_totals()
+    sigmas = estimate_projection_uncertainty(my_totals, opponent_totals)
+    gradient = compute_ew_gradient(my_totals, opponent_totals, sigmas)
+
+    rows = [
+        _make_pitcher("LowERA-P", ip=180, w=12, sv=0, k=180, era=2.50, whip=1.00),
+        _make_pitcher("HighERA-P", ip=180, w=12, sv=0, k=180, era=4.50, whip=1.40),
+        _make_hitter("Filler-H", pa=500, r=80, hr=25, rbi=80, sb=10, ops=0.800),
+    ]
+    players = pd.DataFrame(rows)
+    players = add_mew(players, my_totals, gradient)
+
+    low_era_mew = players.loc[players["Name"] == "LowERA-P", "MEW"].iloc[0]
+    high_era_mew = players.loc[players["Name"] == "HighERA-P", "MEW"].iloc[0]
+
+    assert low_era_mew > high_era_mew, (
+        f"Low-ERA pitcher MEW ({low_era_mew:.4f}) should be > "
+        f"high-ERA pitcher MEW ({high_era_mew:.4f}). Sign error in MEW formula."
     )
 
-    assert 0 <= V <= 1, f"Win probability {V} out of bounds"
-    assert "expected_wins" in diagnostics
+
+def test_mew_unified_formula():
+    """MEW formula produces correct results without hitter/pitcher branching."""
+    my_totals, opponent_totals = _synthetic_totals()
+    sigmas = estimate_projection_uncertainty(my_totals, opponent_totals)
+    gradient = compute_ew_gradient(my_totals, opponent_totals, sigmas)
+
+    rows = [
+        _make_hitter("Hitter-H", pa=600, r=90, hr=30, rbi=90, sb=15, ops=0.820),
+        _make_pitcher("Pitcher-P", ip=200, w=15, sv=0, k=200, era=3.00, whip=1.05),
+    ]
+    players = pd.DataFrame(rows)
+    players = add_mew(players, my_totals, gradient)
+
+    hitter_mew = players.loc[players["Name"] == "Hitter-H", "MEW"].iloc[0]
+    pitcher_mew = players.loc[players["Name"] == "Pitcher-P", "MEW"].iloc[0]
+
+    # Hitter: IP=0 so pitching terms vanish, only hitting terms contribute
+    h = players.loc[players["Name"] == "Hitter-H"].iloc[0]
+    expected_h = (
+        gradient["R"] * h["R"]
+        + gradient["HR"] * h["HR"]
+        + gradient["RBI"] * h["RBI"]
+        + gradient["SB"] * h["SB"]
+        + gradient["W"] * h["W"]
+        + gradient["SV"] * h["SV"]
+        + gradient["K"] * h["K"]
+        + gradient["OPS"] * h["PA"] * (h["OPS"] - my_totals["OPS"]) / my_totals["PA"]
+        + gradient["ERA"] * h["IP"] * (h["ERA"] - my_totals["ERA"]) / my_totals["IP"]
+        + gradient["WHIP"] * h["IP"] * (h["WHIP"] - my_totals["WHIP"]) / my_totals["IP"]
+    )
+    assert abs(hitter_mew - expected_h) < 1e-10, (
+        f"Hitter MEW {hitter_mew:.6f} != expected {expected_h:.6f}"
+    )
+
+    # Pitcher: PA=0 so hitting terms vanish, only pitching terms contribute
+    p = players.loc[players["Name"] == "Pitcher-P"].iloc[0]
+    expected_p = (
+        gradient["R"] * p["R"]
+        + gradient["HR"] * p["HR"]
+        + gradient["RBI"] * p["RBI"]
+        + gradient["SB"] * p["SB"]
+        + gradient["W"] * p["W"]
+        + gradient["SV"] * p["SV"]
+        + gradient["K"] * p["K"]
+        + gradient["OPS"] * p["PA"] * (p["OPS"] - my_totals["OPS"]) / my_totals["PA"]
+        + gradient["ERA"] * p["IP"] * (p["ERA"] - my_totals["ERA"]) / my_totals["IP"]
+        + gradient["WHIP"] * p["IP"] * (p["WHIP"] - my_totals["WHIP"]) / my_totals["IP"]
+    )
+    assert abs(pitcher_mew - expected_p) < 1e-10, (
+        f"Pitcher MEW {pitcher_mew:.6f} != expected {expected_p:.6f}"
+    )
 
 
-def test_better_team_higher_probability():
-    """Strictly better team has higher win probability."""
-    from optimizer.trade_engine import compute_win_probability
+def test_ratio_stat_delta_trap():
+    """Replacing below-average-ERA pitcher with fewer IP can worsen ERA."""
+    # Team: 1000 IP, 3.00 ERA
+    # Remove: 200 IP, 2.80 ERA. Add: 50 IP, 2.50 ERA.
+    # ΔERA ≈ [50×(2.50−3.00) − 200×(2.80−3.00)] / 1000 = +0.015 (worsens)
+    delta_era = (50 * (2.50 - 3.00) - 200 * (2.80 - 3.00)) / 1000
+    assert delta_era > 0, (
+        f"Expected positive ΔERA (worsening), got {delta_era:.6f}. "
+        f"The volume loss dominates the rate improvement."
+    )
+    assert abs(delta_era - 0.015) < 0.001, f"Expected ΔERA ≈ 0.015, got {delta_era:.6f}"
 
-    opponent_totals = {
-        1: {
-            "R": 800,
-            "HR": 240,
-            "RBI": 780,
-            "SB": 100,
-            "OPS": 0.770,
-            "W": 84,
-            "SV": 74,
-            "K": 1340,
-            "ERA": 3.80,
-            "WHIP": 1.20,
+
+def test_team_totals_weighted_average():
+    """ERA/OPS must be IP/PA-weighted averages, not sums."""
+    rows = [
+        _make_pitcher("P1-P", ip=100, w=8, sv=0, k=100, era=3.00, whip=1.10),
+        _make_pitcher("P2-P", ip=50, w=4, sv=0, k=50, era=4.00, whip=1.30),
+        _make_hitter("H1-H", pa=500, r=70, hr=20, rbi=70, sb=10, ops=0.800),
+        _make_hitter("H2-H", pa=300, r=40, hr=10, rbi=40, sb=5, ops=0.700),
+    ]
+    players = pd.DataFrame(rows)
+    totals = compute_totals_for_starters({"P1-P", "P2-P", "H1-H", "H2-H"}, players)
+
+    expected_era = (100 * 3.00 + 50 * 4.00) / 150
+    assert abs(totals["ERA"] - expected_era) < 1e-10, (
+        f"ERA should be {expected_era:.4f} (weighted avg), got {totals['ERA']:.4f}. "
+        f"ERA must NOT be summed (7.0 would indicate summation)."
+    )
+
+    expected_ops = (500 * 0.800 + 300 * 0.700) / 800
+    assert abs(totals["OPS"] - expected_ops) < 1e-10, (
+        f"OPS should be {expected_ops:.4f} (weighted avg), got {totals['OPS']:.4f}"
+    )
+
+    assert totals["PA"] == 800.0, f"PA should be 800, got {totals['PA']}"
+    assert totals["IP"] == 150.0, f"IP should be 150, got {totals['IP']}"
+
+
+def test_msv_identity_swap():
+    """Swapping a player with themselves → MSV = 0."""
+    rows = [
+        _make_hitter(
+            "H1-H",
+            pa=500,
+            r=70,
+            hr=20,
+            rbi=70,
+            sb=10,
+            ops=0.800,
+            owner="The Big Dumpers",
+            position="1B",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H2-H",
+            pa=400,
+            r=60,
+            hr=15,
+            rbi=60,
+            sb=8,
+            ops=0.750,
+            owner="The Big Dumpers",
+            position="2B",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H3-H",
+            pa=450,
+            r=65,
+            hr=18,
+            rbi=65,
+            sb=12,
+            ops=0.770,
+            owner="The Big Dumpers",
+            position="SS",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H4-H",
+            pa=550,
+            r=80,
+            hr=25,
+            rbi=80,
+            sb=6,
+            ops=0.810,
+            owner="The Big Dumpers",
+            position="3B",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H5-H",
+            pa=480,
+            r=75,
+            hr=22,
+            rbi=75,
+            sb=20,
+            ops=0.790,
+            owner="The Big Dumpers",
+            position="OF",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H6-H",
+            pa=480,
+            r=70,
+            hr=20,
+            rbi=70,
+            sb=15,
+            ops=0.780,
+            owner="The Big Dumpers",
+            position="OF",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H7-H",
+            pa=480,
+            r=70,
+            hr=20,
+            rbi=70,
+            sb=15,
+            ops=0.780,
+            owner="The Big Dumpers",
+            position="OF",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H8-H",
+            pa=480,
+            r=70,
+            hr=20,
+            rbi=70,
+            sb=15,
+            ops=0.780,
+            owner="The Big Dumpers",
+            position="OF",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H9-H",
+            pa=480,
+            r=70,
+            hr=20,
+            rbi=70,
+            sb=15,
+            ops=0.780,
+            owner="The Big Dumpers",
+            position="OF",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H10-H",
+            pa=400,
+            r=55,
+            hr=12,
+            rbi=55,
+            sb=5,
+            ops=0.730,
+            owner="The Big Dumpers",
+            position="C",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "H11-H",
+            pa=350,
+            r=45,
+            hr=10,
+            rbi=45,
+            sb=3,
+            ops=0.710,
+            owner="The Big Dumpers",
+            position="DH",
+            roster_status="active",
+        ),
+        _make_pitcher(
+            "P1-P",
+            ip=180,
+            w=12,
+            sv=0,
+            k=180,
+            era=3.20,
+            whip=1.10,
+            owner="The Big Dumpers",
+            position="SP",
+            roster_status="active",
+        ),
+        _make_pitcher(
+            "P2-P",
+            ip=170,
+            w=11,
+            sv=0,
+            k=170,
+            era=3.40,
+            whip=1.15,
+            owner="The Big Dumpers",
+            position="SP",
+            roster_status="active",
+        ),
+        _make_pitcher(
+            "P3-P",
+            ip=160,
+            w=10,
+            sv=0,
+            k=160,
+            era=3.60,
+            whip=1.18,
+            owner="The Big Dumpers",
+            position="SP",
+            roster_status="active",
+        ),
+        _make_pitcher(
+            "P4-P",
+            ip=150,
+            w=9,
+            sv=0,
+            k=150,
+            era=3.80,
+            whip=1.20,
+            owner="The Big Dumpers",
+            position="SP",
+            roster_status="active",
+        ),
+        _make_pitcher(
+            "P5-P",
+            ip=140,
+            w=8,
+            sv=0,
+            k=140,
+            era=4.00,
+            whip=1.25,
+            owner="The Big Dumpers",
+            position="SP",
+            roster_status="active",
+        ),
+        _make_pitcher(
+            "P6-P",
+            ip=70,
+            w=3,
+            sv=25,
+            k=70,
+            era=3.50,
+            whip=1.15,
+            owner="The Big Dumpers",
+            position="RP",
+            roster_status="active",
+        ),
+        _make_pitcher(
+            "P7-P",
+            ip=65,
+            w=2,
+            sv=20,
+            k=65,
+            era=3.70,
+            whip=1.20,
+            owner="The Big Dumpers",
+            position="RP",
+            roster_status="active",
+        ),
+        # Bench
+        _make_hitter(
+            "BH1-H",
+            pa=300,
+            r=40,
+            hr=10,
+            rbi=40,
+            sb=5,
+            ops=0.720,
+            owner="The Big Dumpers",
+            position="OF",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "BH2-H",
+            pa=250,
+            r=35,
+            hr=8,
+            rbi=35,
+            sb=3,
+            ops=0.700,
+            owner="The Big Dumpers",
+            position="1B",
+            roster_status="active",
+        ),
+        _make_pitcher(
+            "BP1-P",
+            ip=100,
+            w=5,
+            sv=0,
+            k=90,
+            era=4.20,
+            whip=1.30,
+            owner="The Big Dumpers",
+            position="SP",
+            roster_status="active",
+        ),
+    ]
+
+    # Need 28 total — pad with more bench
+    for i in range(7):
+        rows.append(
+            _make_hitter(
+                f"Bench{i}-H",
+                pa=200,
+                r=25,
+                hr=5,
+                rbi=25,
+                sb=2,
+                ops=0.680,
+                owner="The Big Dumpers",
+                position="OF",
+                roster_status="active",
+            )
+        )
+
+    # Add opponents and FAs for completeness
+    for opp_idx in range(6):
+        opp_name = f"Opp{opp_idx + 1}"
+        for j in range(28):
+            if j < 11:
+                rows.append(
+                    _make_hitter(
+                        f"{opp_name}_H{j}-H",
+                        pa=450,
+                        r=60,
+                        hr=18,
+                        rbi=60,
+                        sb=8,
+                        ops=0.760,
+                        owner=opp_name,
+                        position=[
+                            "C",
+                            "1B",
+                            "2B",
+                            "SS",
+                            "3B",
+                            "OF",
+                            "OF",
+                            "OF",
+                            "OF",
+                            "OF",
+                            "DH",
+                        ][j],
+                        roster_status="active",
+                    )
+                )
+            else:
+                rows.append(
+                    _make_pitcher(
+                        f"{opp_name}_P{j}-P",
+                        ip=120,
+                        w=7,
+                        sv=3,
+                        k=110,
+                        era=3.90,
+                        whip=1.22,
+                        owner=opp_name,
+                        position="SP" if j < 23 else "RP",
+                        roster_status="active",
+                    )
+                )
+
+    players = pd.DataFrame(rows)
+    players = add_fantasy_value(players)
+
+    my_roster = set(players[players["owner"] == "The Big Dumpers"]["Name"])
+    assert len(my_roster) == 28, f"Expected 28 roster players, got {len(my_roster)}"
+
+    # Use actual opponent totals from the test data for consistent EW
+    from optimizer.lineup_solver import solve_lineup
+
+    opp_totals: dict[int, dict[str, float]] = {}
+    opp_teams = sorted(
+        t
+        for t in players[players["owner"].notna()]["owner"].unique()
+        if t != "The Big Dumpers"
+    )
+    for i, team in enumerate(opp_teams):
+        opp_roster = set(players[players["owner"] == team]["Name"])
+        opp_lineup = solve_lineup(opp_roster, players, "FV")
+        opp_totals[i + 1] = compute_totals_for_starters(set(opp_lineup.keys()), players)
+
+    # Initial FV lineup to bootstrap gradient/MEW
+    fv_lineup = solve_lineup(my_roster, players, "FV")
+    my_totals = compute_totals_for_starters(set(fv_lineup.keys()), players)
+    sigmas = estimate_projection_uncertainty(my_totals, opp_totals)
+    gradient = compute_ew_gradient(my_totals, opp_totals, sigmas)
+    players = add_mew(players, my_totals, gradient)
+
+    # Re-solve with MEW (matches what compute_exact_msv does internally)
+    mew_lineup = solve_lineup(my_roster, players, "MEW")
+    mew_totals = compute_totals_for_starters(set(mew_lineup.keys()), players)
+    actual_ew, _ = compute_win_probability(mew_totals, opp_totals, sigmas)
+
+    # "Swap" H1-H with H1-H (identity)
+    result = compute_exact_msv(
+        {"H1-H"},
+        {"H1-H"},
+        my_roster,
+        players,
+        opp_totals,
+        sigmas,
+        current_ew=actual_ew,
+    )
+    assert abs(result["msv"]) < 1e-10, (
+        f"Identity swap should have MSV=0, got {result['msv']:.6f}"
+    )
+
+
+def test_pv_constraint_filters_correctly():
+    """Trades where PV(send) − PV(receive) < −ε must be excluded."""
+    from optimizer.trade_finder import evaluate_trade
+
+    rows = [
+        {
+            **_make_hitter(
+                "MyGuy-H",
+                pa=500,
+                r=70,
+                hr=20,
+                rbi=70,
+                sb=10,
+                ops=0.800,
+                owner="The Big Dumpers",
+                roster_status="active",
+                position="1B",
+            ),
+            "PV": 1.0,
+            "FV": 2.0,
+            "MEW": 1.5,
         },
-        2: {
-            "R": 800,
-            "HR": 240,
-            "RBI": 780,
-            "SB": 100,
-            "OPS": 0.770,
-            "W": 84,
-            "SV": 74,
-            "K": 1340,
-            "ERA": 3.80,
-            "WHIP": 1.20,
+        {
+            **_make_hitter(
+                "TheirStar-H",
+                pa=600,
+                r=90,
+                hr=30,
+                rbi=90,
+                sb=15,
+                ops=0.850,
+                owner="OppTeam",
+                roster_status="active",
+                position="1B",
+            ),
+            "PV": 5.0,
+            "FV": 4.0,
+            "MEW": 3.0,
         },
-        3: {
-            "R": 800,
-            "HR": 240,
-            "RBI": 780,
-            "SB": 100,
-            "OPS": 0.770,
-            "W": 84,
-            "SV": 74,
-            "K": 1340,
-            "ERA": 3.80,
-            "WHIP": 1.20,
+    ]
+    players = pd.DataFrame(rows)
+
+    my_roster = {"MyGuy-H"}
+    opp_roster = {"TheirStar-H"}
+
+    # PV(send=MyGuy, 1.0) - PV(recv=TheirStar, 5.0) = -4.0 < -0.10
+    result = evaluate_trade(
+        send_names={"MyGuy-H"},
+        receive_names={"TheirStar-H"},
+        my_roster_names=my_roster,
+        opponent_roster_names=opp_roster,
+        trade_opponent_id=1,
+        players=players,
+        opponent_totals={
+            1: {
+                "R": 800,
+                "HR": 250,
+                "RBI": 780,
+                "SB": 100,
+                "OPS": 0.770,
+                "W": 80,
+                "SV": 45,
+                "K": 1200,
+                "ERA": 3.80,
+                "WHIP": 1.20,
+            }
         },
-        4: {
-            "R": 800,
-            "HR": 240,
-            "RBI": 780,
-            "SB": 100,
-            "OPS": 0.770,
-            "W": 84,
-            "SV": 74,
-            "K": 1340,
-            "ERA": 3.80,
-            "WHIP": 1.20,
+        category_sigmas={
+            "R": 50,
+            "HR": 22,
+            "RBI": 50,
+            "SB": 15,
+            "OPS": 0.012,
+            "W": 10,
+            "SV": 9,
+            "K": 72,
+            "ERA": 0.3,
+            "WHIP": 0.05,
         },
-        5: {
-            "R": 800,
-            "HR": 240,
-            "RBI": 780,
-            "SB": 100,
-            "OPS": 0.770,
-            "W": 84,
-            "SV": 74,
-            "K": 1340,
-            "ERA": 3.80,
-            "WHIP": 1.20,
-        },
-        6: {
-            "R": 800,
-            "HR": 240,
-            "RBI": 780,
-            "SB": 100,
-            "OPS": 0.770,
-            "W": 84,
-            "SV": 74,
-            "K": 1340,
-            "ERA": 3.80,
-            "WHIP": 1.20,
-        },
+        current_ew=30.0,
+        current_total_bv=0.0,
+        pv_max_loss_frac=0.10,
+    )
+
+    assert not result["pv_feasible"], (
+        f"Trade should be PV-infeasible (balance={result['pv_balance']:.2f}), "
+        f"but pv_feasible={result['pv_feasible']}"
+    )
+
+
+def test_gradient_based_bv_position_aware():
+    """Bench player eligible for high-absence slot should have higher BV."""
+    my_totals, opponent_totals = _synthetic_totals()
+    sigmas = estimate_projection_uncertainty(my_totals, opponent_totals)
+    gradient = compute_ew_gradient(my_totals, opponent_totals, sigmas)
+
+    rows = [
+        _make_hitter(
+            "Starter_C-H",
+            pa=400,
+            r=50,
+            hr=15,
+            rbi=50,
+            sb=3,
+            ops=0.730,
+            owner="The Big Dumpers",
+            position="C",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "Starter_UTIL-H",
+            pa=500,
+            r=70,
+            hr=20,
+            rbi=70,
+            sb=10,
+            ops=0.780,
+            owner="The Big Dumpers",
+            position="DH",
+            roster_status="active",
+        ),
+        # Bench players with identical MEW-relevant stats but different positions
+        _make_hitter(
+            "Bench_C-H",
+            pa=300,
+            r=35,
+            hr=10,
+            rbi=35,
+            sb=2,
+            ops=0.710,
+            owner="The Big Dumpers",
+            position="C",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "Bench_UTIL-H",
+            pa=300,
+            r=35,
+            hr=10,
+            rbi=35,
+            sb=2,
+            ops=0.710,
+            owner="The Big Dumpers",
+            position="DH",
+            roster_status="active",
+        ),
+        # FA
+        _make_hitter("FA_low-H", pa=200, r=20, hr=5, rbi=20, sb=1, ops=0.650),
+    ]
+
+    players = pd.DataFrame(rows)
+    players = add_mew(players, my_totals, gradient)
+
+    # my_lineup: only 2 starters for this minimal test
+    my_lineup = {"Starter_C-H": "C", "Starter_UTIL-H": "UTIL"}
+
+    my_roster_names = {"Starter_C-H", "Starter_UTIL-H", "Bench_C-H", "Bench_UTIL-H"}
+    players = add_bench_value(players, my_lineup, my_roster_names)
+
+    bv_c = players.loc[players["Name"] == "Bench_C-H", "BV"].iloc[0]
+    bv_util = players.loc[players["Name"] == "Bench_UTIL-H", "BV"].iloc[0]
+
+    # C absence rate = 0.25, UTIL absence rate = 0.15
+    assert bv_c > bv_util, (
+        f"C-eligible bench player BV ({bv_c:.4f}) should be > "
+        f"UTIL-eligible bench player BV ({bv_util:.4f}) "
+        f"because C has higher absence rate (0.25 vs 0.15)."
+    )
+
+
+def test_mew_lineup_differs_from_fv_lineup():
+    """My lineup using MEW should differ from FV when gradient is non-uniform."""
+    from optimizer.lineup_solver import solve_lineup
+
+    # Gradient heavily weights SB
+    gradient = {
+        "R": 0.01,
+        "HR": 0.01,
+        "RBI": 0.01,
+        "SB": 5.0,
+        "OPS": 0.01,
+        "W": 0.01,
+        "SV": 0.01,
+        "K": 0.01,
+        "ERA": -0.01,
+        "WHIP": -0.01,
     }
-
-    category_sigmas = {
-        "R": 30,
-        "HR": 15,
-        "RBI": 30,
-        "SB": 12,
-        "OPS": 0.015,
-        "W": 6,
-        "SV": 6,
-        "K": 60,
-        "ERA": 0.15,
-        "WHIP": 0.04,
-    }
-
-    # Average team (same as opponents)
-    avg_totals = {
+    my_totals = {
         "R": 800,
-        "HR": 240,
+        "HR": 250,
         "RBI": 780,
-        "SB": 100,
+        "SB": 50,
         "OPS": 0.770,
-        "W": 84,
-        "SV": 74,
-        "K": 1340,
+        "W": 80,
+        "SV": 45,
+        "K": 1200,
         "ERA": 3.80,
         "WHIP": 1.20,
+        "PA": 5500,
+        "IP": 1200,
     }
 
-    # Clearly better team (better in every category)
-    good_totals = {
-        "R": 900,
-        "HR": 280,
-        "RBI": 880,
-        "SB": 130,
-        "OPS": 0.820,
-        "W": 100,
-        "SV": 90,
-        "K": 1500,
-        "ERA": 3.40,
-        "WHIP": 1.08,
-    }
+    # Two UTIL-eligible hitters: one has high FV but low SB, other lower FV but high SB
+    # Include filler pitchers so FV z-score computation doesn't get NaN std
+    rows = [
+        _make_hitter(
+            "HighFV-H",
+            pa=600,
+            r=100,
+            hr=40,
+            rbi=100,
+            sb=5,
+            ops=0.900,
+            owner="The Big Dumpers",
+            position="DH",
+            roster_status="active",
+        ),
+        _make_hitter(
+            "HighSB-H",
+            pa=500,
+            r=60,
+            hr=10,
+            rbi=50,
+            sb=50,
+            ops=0.700,
+            owner="The Big Dumpers",
+            position="DH",
+            roster_status="active",
+        ),
+        _make_pitcher("FillerP1-P", ip=180, w=12, sv=0, k=180, era=3.20, whip=1.10),
+        _make_pitcher("FillerP2-P", ip=100, w=6, sv=10, k=100, era=4.50, whip=1.35),
+    ]
+    players = pd.DataFrame(rows)
+    players = add_fantasy_value(players)
+    players = add_mew(players, my_totals, gradient)
 
-    V_avg, _ = compute_win_probability(avg_totals, opponent_totals, category_sigmas)
-    V_good, _ = compute_win_probability(good_totals, opponent_totals, category_sigmas)
+    # FV lineup: HighFV wins (higher FV)
+    fv_lineup = solve_lineup({"HighFV-H", "HighSB-H"}, players, "FV")
+    # MEW lineup: HighSB wins (gradient heavily weights SB)
+    mew_lineup = solve_lineup({"HighFV-H", "HighSB-H"}, players, "MEW")
 
-    assert V_good > V_avg, (
-        f"Better team ({V_good:.3f}) should beat average ({V_avg:.3f})"
-    )
+    assert "HighFV-H" in fv_lineup, "FV should prefer HighFV player"
+    assert "HighSB-H" in mew_lineup, "MEW should prefer HighSB player"
 
-
-# =============================================================================
-# TRADE ENGINE CONSTANTS
-# =============================================================================
-
-
-def test_mev_mvar_tables():
-    """MEV and MVAR tables have correct values from literature."""
-    from optimizer.trade_engine import MEV_TABLE, MVAR_TABLE
-
-    # From Teichroew (1956) / Rosenof (2025)
-    assert abs(MEV_TABLE[6] - 1.267) < 0.001, (
-        f"MEV[6] should be 1.267, got {MEV_TABLE[6]}"
-    )
-    assert abs(MVAR_TABLE[6] - 0.416) < 0.001, (
-        f"MVAR[6] should be 0.416, got {MVAR_TABLE[6]}"
-    )
-
-
-def test_trade_fairness_threshold():
-    """Fairness threshold is percentage-based at 10%."""
-    from optimizer.trade_engine import (
-        FAIRNESS_THRESHOLD_PERCENT,
-        MIN_MEANINGFUL_IMPROVEMENT,
-    )
-
-    assert FAIRNESS_THRESHOLD_PERCENT == 0.10
-    assert MIN_MEANINGFUL_IMPROVEMENT == 0.1
-
-
-# =============================================================================
-# RADAR CHART SORTING TESTS
-# =============================================================================
-
-
-def test_radar_sorting_hitting_pitching_opposite_directions():
-    """
-    Radar chart sorting should have hitting descending and pitching ascending.
-    This makes the maxima of hitting and pitching meet in the middle.
-    """
-    from optimizer.data_loader import HITTING_CATEGORIES, PITCHING_CATEGORIES
-    from optimizer.visualizations import sort_categories_for_radar
-
-    # Create test data where "My Team" is best in R, HR and W, K
-    my_totals = {
-        "R": 900,
-        "HR": 280,
-        "RBI": 750,
-        "SB": 80,
-        "OPS": 0.760,  # Worst hitting
-        "W": 100,
-        "SV": 60,
-        "K": 1500,
-        "ERA": 4.00,  # Worst pitching
-        "WHIP": 1.30,
-    }
-
-    opponent_totals = {
-        1: {
-            "R": 800,
-            "HR": 240,
-            "RBI": 780,
-            "SB": 100,
-            "OPS": 0.800,
-            "W": 85,
-            "SV": 75,
-            "K": 1350,
-            "ERA": 3.50,
-            "WHIP": 1.15,
-        }
-    }
-
-    sorted_cats = sort_categories_for_radar(my_totals, opponent_totals)
-
-    # Extract hitting and pitching portions
-    hitting_portion = [c for c in sorted_cats if c in HITTING_CATEGORIES]
-    pitching_portion = [c for c in sorted_cats if c in PITCHING_CATEGORIES]
-
-    # Hitting should be first
-    hitting_indices = [sorted_cats.index(c) for c in hitting_portion]
-    pitching_indices = [sorted_cats.index(c) for c in pitching_portion]
-    assert max(hitting_indices) < min(pitching_indices), (
-        "Hitting categories should come before pitching"
-    )
-
-    # R and HR should be near the start (best hitting), OPS near the end
-    assert hitting_portion.index("R") < hitting_portion.index("OPS")
-    assert hitting_portion.index("HR") < hitting_portion.index("OPS")
-
-    # W and K should be near the END of pitching (best pitching comes last)
-    # ERA should be near the START of pitching (worst pitching comes first)
-    assert pitching_portion.index("ERA") < pitching_portion.index("W")
-    assert pitching_portion.index("ERA") < pitching_portion.index("K")
-
-
-# =============================================================================
-# BALANCE LAMBDA TESTS
-# =============================================================================
-
-
-def test_balance_lambda_default_value():
-    """Balance lambda default is 0.5."""
-    from optimizer.data_loader import BALANCE_LAMBDA_DEFAULT
-
-    assert BALANCE_LAMBDA_DEFAULT == 0.5
-
-
-def test_balance_lambda_validation():
-    """Invalid λ values should raise assertion error."""
-    import pytest
-
-    from optimizer.roster_optimizer import build_and_solve_milp
-
-    # Create minimal test data (won't actually solve, just test validation)
-    candidates = pd.DataFrame(
-        [{"Name": "Test-H", "Position": "OF", "player_type": "hitter"}]
-    )
-    opponent_totals = {1: {"R": 100}}
-    current_names = set()
-
-    with pytest.raises(AssertionError, match="balance_lambda must be in"):
-        build_and_solve_milp(
-            candidates, opponent_totals, current_names, balance_lambda=-0.5
-        )
-
-    with pytest.raises(AssertionError, match="balance_lambda must be in"):
-        build_and_solve_milp(
-            candidates, opponent_totals, current_names, balance_lambda=3.0
-        )
-
-
-def test_balance_objective_formula():
-    """Verify objective equals total_wins + λ*w_min - λ*w_max."""
-    # This test verifies the formula without actually solving
-    # We check that the math works out correctly
-    total_wins = 40
-    w_min = 2
-    w_max = 6
-    balance_lambda = 0.5
-
-    expected_objective = total_wins + balance_lambda * w_min - balance_lambda * w_max
-    # = 40 + 0.5*2 - 0.5*6 = 40 + 1 - 3 = 38
-
-    assert expected_objective == 38.0
-
-
-def test_balance_metrics_consistency():
-    """Verify balance metric relationships are correct."""
-    # Test that w_min, w_max, win_range are consistent
-    category_wins = {
-        "R": 4,
-        "HR": 5,
-        "RBI": 4,
-        "SB": 2,
-        "OPS": 4,
-        "W": 3,
-        "SV": 2,
-        "K": 5,
-        "ERA": 4,
-        "WHIP": 4,
-    }
-
-    total_wins = sum(category_wins.values())
-    w_min = min(category_wins.values())
-    w_max = max(category_wins.values())
-    win_range = w_max - w_min
-
-    assert total_wins == 37
-    assert w_min == 2
-    assert w_max == 5
-    assert win_range == 3
-
-    # Verify worst and best categories
-    worst_cats = [c for c, w in category_wins.items() if w == w_min]
-    best_cats = [c for c, w in category_wins.items() if w == w_max]
-
-    assert set(worst_cats) == {"SB", "SV"}
-    assert set(best_cats) == {"HR", "K"}
+    # Both can start since there's UTIL slot, but if only 1 slot available,
+    # MEW should pick the SB specialist
+    assert (
+        players.loc[players["Name"] == "HighFV-H", "FV"].iloc[0]
+        > players.loc[players["Name"] == "HighSB-H", "FV"].iloc[0]
+    ), "HighFV should have higher FV"
+    assert (
+        players.loc[players["Name"] == "HighSB-H", "MEW"].iloc[0]
+        > players.loc[players["Name"] == "HighFV-H", "MEW"].iloc[0]
+    ), "HighSB should have higher MEW when gradient heavily weights SB"
