@@ -1,9 +1,11 @@
 """
 Scrape FanGraphs projections via their internal JSON API.
 
-Uses Brave browser cookies for authentication, fetches Steamer and ATC
-projections for hitters and pitchers, and writes CSVs that match the
-exact format produced by the FanGraphs "Export Data" button.
+Uses Brave browser cookies for authentication, fetches the in-season
+rest-of-season Steamer and ATC DC projections for hitters and pitchers, and
+writes CSVs that match the exact format produced by the FanGraphs "Export
+Data" button. These are the most recent (rest-of-season) feeds, not the
+preseason-frozen projections — see PROJECTION_TYPES.
 
 Usage:
     uv run python -m data_prep.scrape_fangraphs           # scrape to data/pulled_YYYYMMDD/
@@ -21,9 +23,15 @@ import requests
 
 FANGRAPHS_API_URL = "https://www.fangraphs.com/api/projections"
 
+# Logical name -> FanGraphs API `type` param. We pull the in-season
+# rest-of-season feeds (NOT the preseason-frozen "steamer"/"atc" feeds, which
+# never update once the season starts). FanGraphs prefixes RoS feeds with "r";
+# "ratcdc" is ATC's in-season DC variant (the only working updated ATC feed —
+# the full-season "atcdc" endpoint returns HTTP 500). These return remaining
+# (rest-of-season) PA/IP and totals, not full-season projections.
 PROJECTION_TYPES = {
-    "steamer": "steamer",
-    "atc": "atc",
+    "steamer": "steamerr",
+    "atc": "ratcdc",
 }
 
 # ── Column order in FanGraphs CSV exports ──────────────────────────────────
@@ -221,11 +229,13 @@ PERCENTILE_RENAMES = {
 
 # ── Output filenames ───────────────────────────────────────────────────────
 
+# Files carry a _ros suffix to make the rest-of-season vintage explicit and to
+# avoid colliding with any legacy preseason-frozen pulls on disk.
 FILE_NAMES = {
-    ("steamer", "bat"): "fangraphs-steamer-projections-hitters.csv",
-    ("steamer", "pit"): "fangraphs-steamer-projections-pitchers.csv",
-    ("atc", "bat"): "fangraphs-atc-projections-hitters.csv",
-    ("atc", "pit"): "fangraphs-atc-projections-pitchers.csv",
+    ("steamer", "bat"): "fangraphs-steamer-projections-hitters_ros.csv",
+    ("steamer", "pit"): "fangraphs-steamer-projections-pitchers_ros.csv",
+    ("atc", "bat"): "fangraphs-atc-projections-hitters_ros.csv",
+    ("atc", "pit"): "fangraphs-atc-projections-pitchers_ros.csv",
 }
 
 

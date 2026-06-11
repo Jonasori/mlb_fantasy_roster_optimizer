@@ -51,6 +51,41 @@ def get_player_type(position: str) -> str:
 # HELPERS
 # =============================================================================
 
+# Fantrax encodes player state as `scorer.icons`, a list of {tooltip, typeId}.
+# Injury-relevant codes (catalogued from live packets across all 7 rosters):
+#   typeId "1" -> Day-to-Day (e.g. "Oblique - Day-to-Day"); also non-injury
+#                 absences like "Paternity Leave - Day-to-Day"
+#   typeId "2" -> On the Injured List (e.g. "Injured List - 10-day IL - Oblique")
+# All other typeIds are lineup/handedness/batting-order/news markers (not injury).
+_ICON_INJURED_LIST = "2"
+_ICON_DAY_TO_DAY = "1"
+
+
+def _parse_injury(scorer: dict) -> tuple[str | None, str | None]:
+    """Extract injury state from a Fantrax scorer's icons.
+
+    Returns:
+        (injury_status, injury_detail) where injury_status is "IL", "DTD",
+        or None, and injury_detail is the raw Fantrax tooltip (or None).
+        IL takes precedence over DTD when both icons are present.
+    """
+    icons = scorer.get("icons", []) or []
+    il_detail = None
+    dtd_detail = None
+    for icon in icons:
+        if not isinstance(icon, dict):
+            continue
+        type_id = str(icon.get("typeId", ""))
+        if type_id == _ICON_INJURED_LIST:
+            il_detail = icon.get("tooltip")
+        elif type_id == _ICON_DAY_TO_DAY:
+            dtd_detail = icon.get("tooltip")
+    if il_detail is not None:
+        return "IL", il_detail
+    if dtd_detail is not None:
+        return "DTD", dtd_detail
+    return None, None
+
 
 def _parse_cell(cells: list, idx: int, as_float: bool = False) -> int | float | None:
     """Extract a typed value from a Fantrax API cells array."""
@@ -173,6 +208,7 @@ def fetch_team_roster(session: requests.Session, team_id: str) -> list[dict]:
             scorer = row.get("scorer", {})
             pos = scorer.get("posShortNames", "")
             status_id = str(row.get("statusId", ""))
+            injury_status, injury_detail = _parse_injury(scorer)
 
             cells = row.get("cells", [])
 
@@ -182,6 +218,8 @@ def fetch_team_roster(session: requests.Session, team_id: str) -> list[dict]:
                     "position": pos,
                     "team": scorer.get("teamShortName"),
                     "status_id": status_id,
+                    "injury_status": injury_status,
+                    "injury_detail": injury_detail,
                     "player_type": get_player_type(pos),
                     "age": _parse_cell(cells, 0),
                     "adp": _parse_cell(cells, 2, as_float=True),
@@ -417,6 +455,7 @@ def fetch_player_pool(
     for row in rows:
         scorer = row.get("scorer", {})
         pos = scorer.get("posShortNames", "")
+        injury_status, injury_detail = _parse_injury(scorer)
 
         cells = row.get("cells", [])
 
@@ -434,6 +473,8 @@ def fetch_player_pool(
                 "roster_trend": _parse_cell(cells, 5, as_float=True),
                 "fantrax_rank": _parse_cell(cells, 0),
                 "is_free_agent": status == "FA",
+                "injury_status": injury_status,
+                "injury_detail": injury_detail,
                 "player_type": get_player_type(pos),
                 "rookie": scorer.get("rookie", False),
                 "minors_eligible": scorer.get("minorsEligible", False),

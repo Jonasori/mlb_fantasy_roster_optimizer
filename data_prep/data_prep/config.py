@@ -113,19 +113,21 @@ else:
     _DATA_PREFIX = str(_DATA_DIR) + "/"
     print("No pulled_YYYYMMDD folders found — using data/ directly")
 
+# The `use_adjusted` flag selects the projection system: True -> Steamer,
+# False -> ATC. Both load RAW rest-of-season feeds. The preseason playing-time
+# adjustment (data_prep/playing_time.py) is intentionally NOT applied: RoS
+# projections already reflect current-season playing time, and the adjustment's
+# full-season historical baselines are meaningless against remaining-season PA/IP.
 USE_ADJUSTED_PROJECTIONS = PROJECTIONS_CONFIG["use_adjusted"]
 
-STEAMER_HITTERS_PATH = _DATA_PREFIX + "fangraphs-steamer-projections-hitters.csv"
-STEAMER_PITCHERS_PATH = _DATA_PREFIX + "fangraphs-steamer-projections-pitchers.csv"
-ATC_HITTERS_PATH = _DATA_PREFIX + "fangraphs-atc-pt-adjusted-hitters.csv"
-ATC_PITCHERS_PATH = _DATA_PREFIX + "fangraphs-atc-pt-adjusted-pitchers.csv"
-
-PT_ADJUSTED_HITTERS_PATH = _DATA_PREFIX + "steamer-pt-adjusted-hitters.csv"
-PT_ADJUSTED_PITCHERS_PATH = _DATA_PREFIX + "steamer-pt-adjusted-pitchers.csv"
+STEAMER_HITTERS_PATH = _DATA_PREFIX + "fangraphs-steamer-projections-hitters_ros.csv"
+STEAMER_PITCHERS_PATH = _DATA_PREFIX + "fangraphs-steamer-projections-pitchers_ros.csv"
+ATC_HITTERS_PATH = _DATA_PREFIX + "fangraphs-atc-projections-hitters_ros.csv"
+ATC_PITCHERS_PATH = _DATA_PREFIX + "fangraphs-atc-projections-pitchers_ros.csv"
 
 if USE_ADJUSTED_PROJECTIONS:
-    HITTER_PROJ_PATH = PT_ADJUSTED_HITTERS_PATH
-    PITCHER_PROJ_PATH = PT_ADJUSTED_PITCHERS_PATH
+    HITTER_PROJ_PATH = STEAMER_HITTERS_PATH
+    PITCHER_PROJ_PATH = STEAMER_PITCHERS_PATH
 else:
     HITTER_PROJ_PATH = ATC_HITTERS_PATH
     PITCHER_PROJ_PATH = ATC_PITCHERS_PATH

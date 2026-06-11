@@ -40,3 +40,24 @@ def get_eligible_slots(position_str: str) -> set[str]:
         for slot, valid_positions in SLOT_ELIGIBILITY.items()
         if player_positions & valid_positions
     }
+
+
+def get_startable_slots(position_str: str, injury_status: str | None = None) -> set[str]:
+    """Slots a player can START in, honoring real-world injury state.
+
+    A player on the Injured List ("IL") cannot fill a starting slot, so the
+    lineup MILP must never assign them. Day-to-Day ("DTD") players are still
+    startable (short-term, not roster-blocking). Any other injury_status
+    (including None) is treated as healthy.
+
+    Args:
+        position_str: Comma-separated position string (e.g., "SS,2B").
+        injury_status: "IL", "DTD", None, or NaN (from the silver table's
+            optional injury_status column).
+
+    Returns:
+        Eligible starting slots, or an empty set if the player is on the IL.
+    """
+    if injury_status == "IL":
+        return set()
+    return get_eligible_slots(position_str)

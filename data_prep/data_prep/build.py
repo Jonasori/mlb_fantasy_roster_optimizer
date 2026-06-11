@@ -44,6 +44,8 @@ def load_fangraphs(hitter_csv: str, pitcher_csv: str) -> pd.DataFrame:
 
     combined["owner"] = None
     combined["roster_status"] = None
+    combined["injury_status"] = None
+    combined["injury_detail"] = None
     combined["age"] = None
     combined["fantrax_score"] = None
     combined["pct_rostered"] = None
@@ -106,6 +108,11 @@ def merge_fantrax(players: pd.DataFrame, fantrax_data: dict) -> pd.DataFrame:
                 if val is not None and not pd.isna(val):
                     players.loc[mask, col] = val
 
+            injury_status = row.get("injury_status")
+            if injury_status is not None and not pd.isna(injury_status):
+                players.loc[mask, "injury_status"] = injury_status
+                players.loc[mask, "injury_detail"] = row.get("injury_detail")
+
         print(f"Merged positions for {pool_updated} players from player pool")
 
     roster_sets = fantrax_data["roster_sets"]
@@ -127,17 +134,20 @@ def merge_fantrax(players: pd.DataFrame, fantrax_data: dict) -> pd.DataFrame:
                 suffixed = raw_name + suffix
 
             status_id = str(player.get("status_id", ""))
+            # Authoritative slot meanings from the API's own `statusTotals`
+            # (Active / Reserve / Inj Res / Minors). Do NOT guess these.
             status = {
                 "1": "active",
                 "2": "reserve",
-                "3": "minors",
-                "4": "IR",
-                "9": "taxi",
+                "3": "IR",
+                "9": "minors",
             }.get(status_id, "unknown")
             player_info[suffixed] = {
                 "age": player.get("age"),
                 "status": status,
                 "status_id": status_id,
+                "injury_status": player.get("injury_status"),
+                "injury_detail": player.get("injury_detail"),
                 "position": player.get("position"),
                 "mlb_team": player.get("team"),
             }
@@ -157,6 +167,8 @@ def merge_fantrax(players: pd.DataFrame, fantrax_data: dict) -> pd.DataFrame:
             mask = players["Name"] == proj_name
             players.loc[mask, "owner"] = team_name
             players.loc[mask, "roster_status"] = info.get("status")
+            players.loc[mask, "injury_status"] = info.get("injury_status")
+            players.loc[mask, "injury_detail"] = info.get("injury_detail")
             if info.get("age") is not None:
                 players.loc[mask, "age"] = info["age"]
             if info.get("position"):

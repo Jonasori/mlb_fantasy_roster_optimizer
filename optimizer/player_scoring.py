@@ -90,14 +90,35 @@ _FAME_WAR_THRESHOLD: float = 3.0
 _FAME_WAR_SLOPE: float = 3.0
 
 
-def add_perceived_value(players: pd.DataFrame) -> pd.DataFrame:
+def add_perceived_value(
+    players: pd.DataFrame,
+    season_fraction_remaining: float = 1.0,
+) -> pd.DataFrame:
     """Add 'PV' column: how opponents likely value a player in trade talks.
 
-    PV = max(FV, 0) + max(WAR − 3, 0) × 3
+    PV = max(FV, 0) + max(WAR − threshold, 0) × slope
 
     FV is the base: smart opponents evaluate players by projected fantasy
     production, which is exactly what FV measures (z-score sum across the
     5 scoring categories for the player's type).
+
+    WAR is now a REST-OF-SEASON projection, so it scales down as the season
+    progresses (RoS WAR ≈ full-season WAR × fraction remaining). To keep the
+    fame premium calibrated to the same full-season scale, the threshold is
+    scaled by `season_fraction_remaining` and the slope by its inverse:
+
+        threshold = 3.0 × f
+        slope     = 3.0 / f          (f = season_fraction_remaining, floored)
+
+    This is exact: a player whose full-season WAR is W has RoS WAR ≈ W·f, and
+    max(W·f − 3f, 0) × (3/f) = max(W − 3, 0) × 3 — identical to the preseason
+    premium. With f = 1.0 (default) behavior is unchanged.
+
+    Args:
+        players: DataFrame with FV and WAR columns.
+        season_fraction_remaining: Fraction of the season still to be played
+            (1.0 at season start, →0 at the end). Floored at 0.1 to keep the
+            slope finite near season's end.
 
     The fame premium corrects two biases in raw FV:
       1. FV undervalues elite SPs relative to closers (closers dominate the
@@ -118,10 +139,14 @@ def add_perceived_value(players: pd.DataFrame) -> pd.DataFrame:
         "add_perceived_value: FV column required. Call add_fantasy_value first."
     )
 
+    frac = max(season_fraction_remaining, 0.1)
+    threshold = _FAME_WAR_THRESHOLD * frac
+    slope = _FAME_WAR_SLOPE / frac
+
     fv = players["FV"].clip(lower=0)
     war = players["WAR"].fillna(0).clip(lower=0)
 
-    fame = (war - _FAME_WAR_THRESHOLD).clip(lower=0) * _FAME_WAR_SLOPE
+    fame = (war - threshold).clip(lower=0) * slope
     players["PV"] = fv + fame
 
     rostered_mask = players["owner"].notna()

@@ -14,7 +14,7 @@ from .config import (
     HITTING_SLOTS,
     PITCHING_SLOTS,
 )
-from .players import get_eligible_slots
+from .players import get_startable_slots
 
 # ============================================================================
 # LINEUP ASSIGNMENT (MILP)
@@ -77,8 +77,13 @@ def solve_lineup(
     n_players = len(roster_df)
     name_to_idx = {roster_df.iloc[i]["Name"]: i for i in range(n_players)}
 
+    has_injury_col = "injury_status" in roster_df.columns
     eligibility = {
-        i: get_eligible_slots(roster_df.iloc[i]["Position"]) for i in range(n_players)
+        i: get_startable_slots(
+            roster_df.iloc[i]["Position"],
+            roster_df.iloc[i]["injury_status"] if has_injury_col else None,
+        )
+        for i in range(n_players)
     }
 
     prob = pulp.LpProblem("LineupAssignment", pulp.LpMaximize)

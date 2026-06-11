@@ -50,7 +50,9 @@
     },
     "fantrax_active_status_ids": ["1", "2"],
     "min_stat_standard_deviation": 0.001,
-    "balance_lambda_default": 0.0
+    "balance_lambda_default": 0.0,
+    "season_start": "2026-03-26",
+    "season_end": "2026-09-27"
   },
   "trade_engine": {
     "fairness_threshold_percent": 0.10,
@@ -60,8 +62,8 @@
   },
   "projections": {
     "data_dir": "data/",
-    "raw_hitters": "data/fangraphs-steamer-projections-hitters.csv",
-    "raw_pitchers": "data/fangraphs-steamer-projections-pitchers.csv",
+    "raw_hitters": "data/fangraphs-steamer-projections-hitters_ros.csv",
+    "raw_pitchers": "data/fangraphs-steamer-projections-pitchers_ros.csv",
     "adjusted_hitters": "data/fangraphs-atc-pt-adjusted-hitters.csv",
     "adjusted_pitchers": "data/fangraphs-atc-pt-adjusted-pitchers.csv",
     "use_adjusted": false

@@ -25,7 +25,7 @@ from .lineup_solver import (
     solve_lineup,
 )
 from .player_scoring import add_mew
-from .players import get_eligible_slots
+from .players import get_eligible_slots, get_startable_slots
 from .win_model import (
     compute_ew_gradient,
     compute_win_probability,
@@ -821,8 +821,13 @@ def compute_ew_ceiling(
         f"{N_STARTER_SLOTS} starter slots"
     )
 
+    has_injury_col = "injury_status" in pool.columns
     eligibility = {
-        i: get_eligible_slots(str(pool.iloc[i]["Position"])) for i in range(n)
+        i: get_startable_slots(
+            str(pool.iloc[i]["Position"]),
+            pool.iloc[i]["injury_status"] if has_injury_col else None,
+        )
+        for i in range(n)
     }
 
     prob = pulp.LpProblem("Ceiling", pulp.LpMaximize)

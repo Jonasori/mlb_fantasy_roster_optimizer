@@ -1,6 +1,13 @@
 """
 Playing time adjustment for projection systems.
 
+WARNING: This module is designed for PRESEASON FULL-SEASON projections only.
+It is NOT part of the default pipeline anymore and must NOT be run on
+rest-of-season (RoS) feeds: it compares prior full-season historical PA/IP to
+the projected PA/IP denominator, which is meaningless (and inflating) when the
+projection is remaining-season only. RoS feeds already reflect current playing
+time, so no adjustment is applied.
+
 All projection systems systematically overproject playing time. This module
 applies a three-factor adjustment based on Jeff Zimmerman's research:
 1. Historical PA/IP (strongest predictor)
@@ -38,8 +45,8 @@ _REPO_ROOT = _DATA_PREP_ROOT.parent
 # External historical stats DB (sibling project to repo by default)
 MLB_STATS_DB = _REPO_ROOT.parent / "mlb_player_comps_dashboard" / "mlb_stats.db"
 OPTIMIZER_DB = _DATA_DIR / "optimizer.db"
-DEFAULT_HITTERS_INPUT = _DATA_DIR / "fangraphs-atc-projections-hitters.csv"
-DEFAULT_PITCHERS_INPUT = _DATA_DIR / "fangraphs-atc-projections-pitchers.csv"
+DEFAULT_HITTERS_INPUT = _DATA_DIR / "fangraphs-atc-projections-hitters_ros.csv"
+DEFAULT_PITCHERS_INPUT = _DATA_DIR / "fangraphs-atc-projections-pitchers_ros.csv"
 
 # Output paths (structurally identical to FanGraphs originals)
 DEFAULT_HITTERS_OUTPUT = _DATA_DIR / "fangraphs-atc-pt-adjusted-hitters.csv"

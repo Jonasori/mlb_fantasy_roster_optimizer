@@ -21,10 +21,39 @@ Fantrax is the **source of truth** for roster ownership, roster status, and posi
 
 | Data | Endpoint / source | Notes |
 |------|-------------------|--------|
-| Rosters | `getTeamRosterInfo` | All teams; `statusId` for active/reserve/IR/minors/taxi |
+| Rosters | `getTeamRosterInfo` | All teams; `statusId` for roster slot (see below) |
 | Positions | Roster + player pool | `posShortNames` |
+| Injury status | Roster + player pool | `scorer.icons` — see below |
 | Pool stats | `getPlayerStats` | `fantrax_score`, `%` rostered, etc., for top N players |
 | Standings | `getStandings` | Fetched in `fetch_all_fantrax_data`; not required for silver CSV write |
+
+### `statusId` (roster slot) — authoritative values
+
+From the API's own `statusTotals` (do **not** guess these):
+
+| `statusId` | `roster_status` |
+|------------|-----------------|
+| `1` | `active` |
+| `2` | `reserve` |
+| `3` | `IR` (Inj Res) |
+| `9` | `minors` |
+
+`statusId` is the **fantasy roster slot** the manager chose, **not** a real-world
+injury signal: injured players are frequently left in `active`/`reserve` slots.
+
+### Injury status — `scorer.icons`
+
+Real-world injury state lives in `scorer.icons`, a list of `{tooltip, typeId}`:
+
+| `typeId` | Meaning | `injury_status` |
+|----------|---------|-----------------|
+| `1` | Day-to-Day (e.g. "Oblique - Day-to-Day"); also non-injury absences like Paternity Leave | `DTD` |
+| `2` | On the Injured List (e.g. "Injured List - 10-day IL - Oblique") | `IL` |
+
+`_parse_injury()` extracts `(injury_status, injury_detail)` (IL beats DTD). Both
+the roster and player-pool parsers populate these; they flow to the silver
+`injury_status` / `injury_detail` columns. Other `typeId`s are
+lineup/handedness/batting-order/news markers and are ignored.
 
 Full projections (PA, WAR, pitching depth) still come from **FanGraphs** CSVs.
 

@@ -4,6 +4,7 @@ Configuration loading from repo-root config.json.
 Exposes league constants as module-level variables.
 """
 
+import datetime
 import json
 from pathlib import Path
 
@@ -47,6 +48,25 @@ ALL_TEAM_NAMES: list[str] = sorted(LEAGUE["fantrax_team_ids"].keys())
 
 # Numeric safety
 MIN_STAT_STANDARD_DEVIATION: float = LEAGUE["min_stat_standard_deviation"]  # 0.001
+
+# Regular-season window (used to compute the fraction of season remaining,
+# e.g. for scaling rest-of-season WAR back to a full-season fame premium).
+SEASON_START: datetime.date = datetime.date.fromisoformat(LEAGUE["season_start"])
+SEASON_END: datetime.date = datetime.date.fromisoformat(LEAGUE["season_end"])
+
+
+def season_fraction_remaining(today: datetime.date | None = None) -> float:
+    """Fraction of the regular season still to be played, clamped to [0, 1].
+
+    1.0 before opening day, 0.0 after the final day. Used to rescale
+    rest-of-season quantities (e.g. WAR) to a full-season-equivalent scale.
+    """
+    if today is None:
+        today = datetime.date.today()
+    span = (SEASON_END - SEASON_START).days
+    assert span > 0, f"SEASON_END must be after SEASON_START; got {span} days"
+    remaining = (SEASON_END - today).days
+    return max(0.0, min(1.0, remaining / span))
 
 # Derived
 N_STARTER_SLOTS: int = sum(HITTING_SLOTS.values()) + sum(PITCHING_SLOTS.values())  # 18

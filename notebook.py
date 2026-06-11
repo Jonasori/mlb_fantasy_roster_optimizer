@@ -53,6 +53,7 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
     from datetime import date
     from pathlib import Path
 
+    from optimizer.config import season_fraction_remaining
     from optimizer.league_state import compute_league_state
     from optimizer.lineup_solver import assign_optimal_slots
     from optimizer.player_scoring import add_fantasy_value, add_mew, add_perceived_value
@@ -77,12 +78,12 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
 
     _file_map = {
         "steamer": (
-            "fangraphs-steamer-projections-hitters.csv",
-            "fangraphs-steamer-projections-pitchers.csv",
+            "fangraphs-steamer-projections-hitters_ros.csv",
+            "fangraphs-steamer-projections-pitchers_ros.csv",
         ),
         "atc": (
-            "fangraphs-atc-projections-hitters.csv",
-            "fangraphs-atc-projections-pitchers.csv",
+            "fangraphs-atc-projections-hitters_ros.csv",
+            "fangraphs-atc-projections-pitchers_ros.csv",
         ),
     }
 
@@ -242,7 +243,9 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
             state["opponent_lineups"],
             state["opponent_teams"],
         )
-        players = add_perceived_value(players)
+        players = add_perceived_value(
+            players, season_fraction_remaining=season_fraction_remaining()
+        )
         players = add_mew(players, state["my_totals"], state["gradient"])
         players = add_bench_value(players, state["my_lineup"], state["my_roster_names"])
         print(f"Pipeline complete: {len(players)} players enriched")
@@ -285,7 +288,11 @@ def game_logs_cell(data_ready, players, pd):
                     _group = _sg["group"]["displayName"]
                     for _split in _sg.get("splits", []):
                         game_logs.setdefault(_pid, []).append(
-                            {"group": _group, **_split["stat"]}
+                            {
+                                "group": _group,
+                                "date": _split.get("date"),
+                                **_split["stat"],
+                            }
                         )
 
         _with_data = sum(1 for v in game_logs.values() if v)
@@ -294,6 +301,306 @@ def game_logs_cell(data_ready, players, pd):
             f"{_with_data} players with data"
         )
     return (game_logs,)
+
+
+@app.cell
+def observed_windows(data_ready, game_logs, pd, players):
+    """Attach observed YTD and last-14-day stat versions to each player.
+
+    Alongside the rest-of-season projection columns already on `players`
+    (PA, R, HR, ... / IP, W, ...), this adds observed-actual columns compiled
+    directly from MLB game logs for two windows:
+      - YTD (suffix _ytd): all 2026 games
+      - L14 (suffix _l14): games in the last 14 calendar days
+
+    Hitter columns: G/PA/R/HR/RBI/SB/OPS per window. Pitcher columns:
+    G/IP/W/SV/K/ERA/WHIP per window. Values are NA where a player has no
+    games. The RoS projection columns on `players` remain the forward-looking
+    expectation; these are the realized actuals to compare against.
+
+    Returns `players_obs` (a copy of `players` with the window columns added).
+    """
+    if not data_ready:
+        players_obs = players
+    else:
+
+        def _agg_hit(logs: list[dict]) -> dict:
+            pa = sum(g.get("plateAppearances", 0) for g in logs)
+            ab = sum(g.get("atBats", 0) for g in logs)
+            ops = (
+                sum(
+                    float(g.get("obp", 0)) * g.get("plateAppearances", 0) for g in logs
+                )
+                / pa
+                + sum(float(g.get("slg", 0)) * g.get("atBats", 0) for g in logs) / ab
+                if pa > 0 and ab > 0
+                else 0.0
+            )
+            return {
+                "G": len(logs),
+                "PA": pa,
+                "R": sum(g.get("runs", 0) for g in logs),
+                "HR": sum(g.get("homeRuns", 0) for g in logs),
+                "RBI": sum(g.get("rbi", 0) for g in logs),
+                "SB": sum(g.get("stolenBases", 0) for g in logs),
+                "OPS": ops,
+            }
+
+        def _agg_pit(logs: list[dict]) -> dict:
+            ip = sum(float(g.get("inningsPitched", 0)) for g in logs)
+            er = sum(g.get("earnedRuns", 0) for g in logs)
+            bb = sum(g.get("baseOnBalls", 0) for g in logs)
+            h = sum(g.get("hits", 0) for g in logs)
+            return {
+                "G": len(logs),
+                "IP": ip,
+                "W": sum(g.get("wins", 0) for g in logs),
+                "SV": sum(g.get("saves", 0) for g in logs),
+                "K": sum(g.get("strikeOuts", 0) for g in logs),
+                "ERA": (er * 9 / ip) if ip > 0 else 0.0,
+                "WHIP": ((bb + h) / ip) if ip > 0 else 0.0,
+            }
+
+        _cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=14)
+
+        def _recent(gs: list[dict]) -> list[dict]:
+            return [
+                g
+                for g in gs
+                if g.get("date") is not None and pd.Timestamp(g["date"]) >= _cutoff
+            ]
+
+        _window_cols = [
+            f"{c}_{w}"
+            for w in ("ytd", "l14")
+            for c in ["G", "PA", "R", "HR", "RBI", "SB", "OPS", "IP", "W", "SV", "K", "ERA", "WHIP"]
+        ]
+
+        _by_id: dict[int, dict] = {}
+        for _pid, _logs in game_logs.items():
+            _h = [g for g in _logs if g["group"] == "hitting"]
+            _p = [g for g in _logs if g["group"] == "pitching"]
+            _rec: dict = {}
+            if _h:
+                for _k, _v in _agg_hit(_h).items():
+                    _rec[f"{_k}_ytd"] = _v
+                for _k, _v in _agg_hit(_recent(_h)).items():
+                    _rec[f"{_k}_l14"] = _v
+            if _p:
+                for _k, _v in _agg_pit(_p).items():
+                    _rec[f"{_k}_ytd"] = _v
+                for _k, _v in _agg_pit(_recent(_p)).items():
+                    _rec[f"{_k}_l14"] = _v
+            if _rec:
+                _by_id[_pid] = _rec
+
+        _rows = []
+        for _, _r in players.iterrows():
+            _mid = int(_r["MLBAMID"]) if pd.notna(_r["MLBAMID"]) else None
+            _rows.append(_by_id.get(_mid, {}) if _mid is not None else {})
+        _obs_df = pd.DataFrame(_rows, index=players.index)
+        for _c in _window_cols:
+            if _c not in _obs_df.columns:
+                _obs_df[_c] = pd.NA
+        players_obs = pd.concat([players, _obs_df[_window_cols]], axis=1)
+        print(
+            f"Observed windows attached: {len(_by_id)} players with game-log data "
+            f"(YTD + last 14d through {_cutoff.date()})"
+        )
+    return (players_obs,)
+
+
+@app.cell
+def ytd_window_control(mo):
+    """Window selector for the actual-vs-projection table."""
+    ytd_window = mo.ui.radio(
+        options=["Year to date", "Last 14 days"],
+        value="Year to date",
+        label="Observed window",
+    )
+    return (ytd_window,)
+
+
+@app.cell
+def ytd_comparison(
+    data_ready,
+    mo,
+    my_roster_names,
+    pd,
+    players_obs,
+    strip_name_suffix,
+    ytd_window,
+):
+    """Observed actuals vs. rest-of-season projection rate for the user's roster.
+
+    Counting-stat cells show `actual / expected`, where expected applies the
+    RoS projection's per-PA (or per-IP) rate to the playing time the player has
+    actually accrued in the selected window. This makes the two directly
+    comparable and pace-independent. Color = rate over/under-performance vs the
+    projection (green over, red under). Rate stats (OPS/ERA/WHIP) compare
+    directly to the projected rate.
+    """
+    if not data_ready:
+        ytd_section = mo.md("")
+    else:
+        _w = "l14" if ytd_window.value == "Last 14 days" else "ytd"
+        _roster = players_obs[players_obs["Name"].isin(my_roster_names)]
+
+        def _wv(row: pd.Series, col: str) -> float:
+            v = row.get(col)
+            return float(v) if v is not None and not pd.isna(v) else 0.0
+
+        def _ratio_count(actual: float, expected: float) -> float | None:
+            # actual vs the projection-rate expectation over the same volume.
+            if expected <= 0:
+                return None
+            return actual / expected
+
+        def _ratio_higher(actual: float, ref: float) -> float | None:
+            # Rate stat, higher is better (OPS): actual rate vs projected rate.
+            if ref <= 0:
+                return None
+            return actual / ref
+
+        def _ratio_lower(actual: float, ref: float) -> float | None:
+            # Rate stat, lower is better (ERA, WHIP); invert so >1 = good.
+            if ref <= 0:
+                return None
+            if actual <= 0:
+                return 2.0  # zero ERA/WHIP is elite; clamp to full green
+            return ref / actual
+
+        def _residual_color(ratio: float | None) -> dict[str, str]:
+            # Map a performance ratio (1.0 == on projected rate) to a green
+            # (over) / red (under) background. Saturates at +/-20% deviation.
+            if ratio is None:
+                return {}
+            dev = ratio - 1.0
+            alpha = round(min(abs(dev) / 0.20, 1.0) * 0.55, 3)
+            if alpha == 0:
+                return {}
+            rgb = "34,160,34" if dev > 0 else "210,45,45"
+            return {"backgroundColor": f"rgba({rgb},{alpha})"}
+
+        def _avg_ratio(d: dict[str, float | None]) -> float:
+            vals = [v for v in d.values() if v is not None]
+            return sum(vals) / len(vals) if vals else float("-inf")
+
+        _h_rows: list[dict] = []
+        _p_rows: list[dict] = []
+        _h_ratios_by_player: dict[str, dict[str, float | None]] = {}
+        _p_ratios_by_player: dict[str, dict[str, float | None]] = {}
+        for _, _r in _roster.iterrows():
+            _name = strip_name_suffix(_r["Name"])
+
+            if _r["player_type"] == "hitter":
+                _vol = _wv(_r, f"PA_{_w}")
+                _has = _vol > 0
+                _proj_pa = float(_r["PA"])
+                _ratios: dict[str, float | None] = {}
+                _row: dict = {
+                    "Player": _name,
+                    "Pos": _r["Position"],
+                    "G": int(_wv(_r, f"G_{_w}")),
+                    "PA": f"{_vol:.0f}" if _has else "—",
+                }
+                for _stat, _dec in (("R", 0), ("HR", 0), ("RBI", 0), ("SB", 0)):
+                    _actual = _wv(_r, f"{_stat}_{_w}")
+                    _rate = float(_r[_stat]) / _proj_pa if _proj_pa > 0 else 0.0
+                    _exp = _rate * _vol
+                    _row[_stat] = f"{_actual:.0f} / {_exp:.1f}" if _has else "—"
+                    _ratios[_stat] = _ratio_count(_actual, _exp) if _has else None
+                _ops_actual = _wv(_r, f"OPS_{_w}")
+                _ops_ref = float(_r["OPS"])
+                _row["OPS"] = f"{_ops_actual:.3f} / {_ops_ref:.3f}" if _has else "—"
+                _ratios["OPS"] = _ratio_higher(_ops_actual, _ops_ref) if _has else None
+                _h_rows.append(_row)
+                _h_ratios_by_player[_name] = _ratios
+            else:
+                _vol = _wv(_r, f"IP_{_w}")
+                _has = _vol > 0
+                _proj_ip = float(_r["IP"])
+                _ratios = {}
+                _row = {
+                    "Player": _name,
+                    "Pos": _r["Position"],
+                    "G": int(_wv(_r, f"G_{_w}")),
+                    "IP": f"{_vol:.1f}" if _has else "—",
+                }
+                for _stat in ("W", "SV", "K"):
+                    _actual = _wv(_r, f"{_stat}_{_w}")
+                    _rate = float(_r[_stat]) / _proj_ip if _proj_ip > 0 else 0.0
+                    _exp = _rate * _vol
+                    _row[_stat] = f"{_actual:.0f} / {_exp:.1f}" if _has else "—"
+                    _ratios[_stat] = _ratio_count(_actual, _exp) if _has else None
+                for _stat in ("ERA", "WHIP"):
+                    _actual = _wv(_r, f"{_stat}_{_w}")
+                    _ref = float(_r[_stat])
+                    _row[_stat] = f"{_actual:.2f} / {_ref:.2f}" if _has else "—"
+                    _ratios[_stat] = _ratio_lower(_actual, _ref) if _has else None
+                _p_rows.append(_row)
+                _p_ratios_by_player[_name] = _ratios
+
+        _h_df = (
+            pd.DataFrame(_h_rows)
+            .sort_values(
+                "Player",
+                key=lambda s: s.map(
+                    lambda n: _avg_ratio(_h_ratios_by_player.get(n, {}))
+                ),
+                ascending=False,
+            )
+            .reset_index(drop=True)
+        )
+        _p_df = (
+            pd.DataFrame(_p_rows)
+            .sort_values(
+                "Player",
+                key=lambda s: s.map(
+                    lambda n: _avg_ratio(_p_ratios_by_player.get(n, {}))
+                ),
+                ascending=False,
+            )
+            .reset_index(drop=True)
+        )
+
+        _h_styles = {
+            str(_i): _h_ratios_by_player.get(_row["Player"], {})
+            for _i, _row in _h_df.iterrows()
+        }
+        _p_styles = {
+            str(_i): _p_ratios_by_player.get(_row["Player"], {})
+            for _i, _row in _p_df.iterrows()
+        }
+
+        def _h_style_cell(row_id: str, name: str, value: object) -> dict[str, str]:
+            return _residual_color(_h_styles.get(row_id, {}).get(name))
+
+        def _p_style_cell(row_id: str, name: str, value: object) -> dict[str, str]:
+            return _residual_color(_p_styles.get(row_id, {}).get(name))
+
+        _label = "year-to-date" if _w == "ytd" else "last 14 days"
+        ytd_section = mo.vstack(
+            [
+                ytd_window,
+                mo.md(
+                    f"*Window: **{_label}**. Counting cells: "
+                    "`actual / expected`, where expected = the rest-of-season "
+                    "projection's per-PA (or per-IP) rate applied to the "
+                    "playing time accrued in this window. Rate cells (OPS/ERA/"
+                    "WHIP): `actual / projected rate`. Color = performance vs. "
+                    "the projected rate: <span style='background-color:"
+                    "rgba(34,160,34,0.45);padding:0 4px'>green = over</span>, "
+                    "<span style='background-color:rgba(210,45,45,0.45);"
+                    "padding:0 4px'>red = under</span> (saturates at \u00b120%).*"
+                ),
+                mo.md("**Hitters**"),
+                mo.ui.table(_h_df, page_size=30, style_cell=_h_style_cell),
+                mo.md("**Pitchers**"),
+                mo.ui.table(_p_df, page_size=30, style_cell=_p_style_cell),
+            ]
+        )
+    return (ytd_section,)
 
 
 @app.cell
@@ -362,6 +669,7 @@ def dashboard_content(
     state,
     strip_name_suffix,
     team_perspective,
+    ytd_section,
 ):
     if data_ready:
         from optimizer.swap_evaluator import compute_ew_ceiling
@@ -649,6 +957,8 @@ def dashboard_content(
                 _regime_table,
                 mo.md(f"### {state['my_team_name']} Roster"),
                 _roster_table,
+                mo.md("### Actual YTD vs. Projection"),
+                ytd_section,
                 mo.md("### Roster Value Map"),
                 roster_map_section,
             ]
@@ -1930,7 +2240,7 @@ def explore_table(
                     | _df["Owner"].str.lower().str.contains(_t, na=False)
                 )
             _df = _df[_mask]
-        _df = _df.sort_values("FV", ascending=False).head(200).reset_index(drop=True)
+        _df = _df.sort_values("FV", ascending=False).reset_index(drop=True)
         player_browser = mo.ui.table(_df, selection="multi", page_size=50)
     else:
         player_browser = None

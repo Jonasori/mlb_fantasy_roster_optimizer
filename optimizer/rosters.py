@@ -29,9 +29,13 @@ def get_main_roster(players: pd.DataFrame, owner_name: str) -> set[str]:
     names = set(players[mask]["Name"])
 
     if owner_name == MY_TEAM_NAME:
-        assert len(names) == ROSTER_SIZE, (
+        # The active 28-man roster is active+reserve; players on Injured
+        # Reserve (IR) are held in addition to the 28, so the count can
+        # exceed ROSTER_SIZE. IL players are kept off the starting lineup
+        # by the injury-aware lineup solver, not by exclusion here.
+        assert len(names) >= ROSTER_SIZE, (
             f"get_main_roster: {owner_name} has {len(names)} active+reserve+IR players, "
-            f"expected {ROSTER_SIZE}. Fix data_prep roster assignments."
+            f"expected at least {ROSTER_SIZE}. Fix data_prep roster assignments."
         )
 
     assert len(names) >= 18, (

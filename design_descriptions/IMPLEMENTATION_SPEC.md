@@ -44,6 +44,8 @@ The input to the math pipeline is a pandas DataFrame called `players` with one r
 | fantrax_score | float or None | Fantrax platform score (for rostered players, may need imputation). |
 | pct_rostered | float or None | Percent rostered across Fantrax leagues. |
 | age | int or None | Player age. |
+| injury_status | str or None | Real-world injury state from Fantrax icons: "IL" (on the Injured List), "DTD" (day-to-day), or None. Players with "IL" are kept out of starting lineups by the lineup solver (`get_startable_slots`). |
+| injury_detail | str or None | Raw Fantrax injury tooltip (e.g., "Injured List - 10-day IL - Oblique"), for display. |
 
 ### Invariants the upstream pipeline must guarantee
 
