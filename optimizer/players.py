@@ -42,7 +42,9 @@ def get_eligible_slots(position_str: str) -> set[str]:
     }
 
 
-def get_startable_slots(position_str: str, injury_status: str | None = None) -> set[str]:
+def get_startable_slots(
+    position_str: str, injury_status: str | None = None
+) -> set[str]:
     """Slots a player can START in, honoring real-world injury state.
 
     A player on the Injured List ("IL") cannot fill a starting slot, so the

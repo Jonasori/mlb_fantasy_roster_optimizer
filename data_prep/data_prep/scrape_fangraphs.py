@@ -258,22 +258,71 @@ def _clean_id_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# Browsers to probe for a logged-in FanGraphs session, in priority order.
+# browser_cookie3 exposes one loader function per browser; whichever has the
+# wordpress_logged_in cookie wins. (Chromium-based browsers like Arc store
+# cookies under Chrome's path on macOS and are usually picked up by `chrome`.)
+_COOKIE_BROWSERS: tuple[str, ...] = (
+    "brave",
+    "chrome",
+    "edge",
+    "vivaldi",
+    "opera",
+    "firefox",
+    "safari",
+)
+
+
 def get_fangraphs_session() -> requests.Session:
-    """Create a requests session authenticated with Brave browser cookies.
+    """Create a requests session authenticated from a logged-in browser.
+
+    Auto-detects which installed browser holds a FanGraphs login, so it works
+    regardless of which browser you use (not hardcoded to Brave). Each browser
+    is probed for ``.fangraphs.com`` cookies; the first one carrying the
+    ``wordpress_logged_in`` cookie is used.
 
     Returns:
         Session with FanGraphs cookies and appropriate headers.
     """
-    print("Loading FanGraphs cookies from Brave browser...")
-    cj = browser_cookie3.brave(domain_name=".fangraphs.com")
-    cookie_names = [c.name for c in cj]
-    print(f"  Found {len(cookie_names)} cookies")
+    print("Loading FanGraphs cookies (auto-detecting browser)...")
+    cj = None
+    chosen = None
+    for name in _COOKIE_BROWSERS:
+        loader = getattr(browser_cookie3, name, None)
+        if loader is None:
+            continue
+        # Each browser may be absent or its cookie store locked; probe and skip.
+        try:
+            candidate = loader(domain_name=".fangraphs.com")
+        except Exception as exc:  # noqa: BLE001 - browser_cookie3 raises many types
+            print(f"  {name}: unavailable ({type(exc).__name__})")
+            continue
+        names = [c.name for c in candidate]
+        has_auth = any("wordpress_logged_in" in n for n in names)
+        print(
+            f"  {name}: {len(names)} fangraphs cookie(s)"
+            f"{' — logged in' if has_auth else ''}"
+        )
+        if has_auth:
+            cj = candidate
+            chosen = name
+            break
 
-    has_auth = any("wordpress_logged_in" in name for name in cookie_names)
-    assert has_auth, (
-        "No wordpress_logged_in cookie found in Brave. "
-        "Log into FanGraphs in Brave browser first, then retry."
+    assert cj is not None, (
+        "No FanGraphs login (wordpress_logged_in cookie) found in any supported "
+        "browser (Brave, Chrome, Edge, Vivaldi, Opera, Firefox, Safari).\n"
+        "  1. Log into fangraphs.com in one of those browsers.\n"
+        "  2. The rest-of-season feeds (steamerr / ratcdc) require a FanGraphs "
+        "MEMBERSHIP — a free account is not enough.\n"
+        "  3. macOS permissions (see the per-browser lines above):\n"
+        "     • 'chrome: BrowserCookieError' → Chrome cookies are keychain-"
+        "encrypted; run from a normal GUI Terminal and approve the keychain "
+        "prompt (a headless/SSH session can't decrypt them).\n"
+        "     • 'safari: PermissionError' → grant the app running this "
+        "(Terminal / your IDE) Full Disk Access in System Settings → Privacy & "
+        "Security, then retry."
     )
+    print(f"  Using {chosen} cookies")
 
     is_member = any(c.name == "fg_is_member" for c in cj)
     if is_member:

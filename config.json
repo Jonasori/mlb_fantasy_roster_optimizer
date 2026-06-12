@@ -58,7 +58,12 @@
     "fairness_threshold_percent": 0.10,
     "max_trade_size": 3,
     "min_meaningful_improvement": 0.1,
-    "lose_cost_scale": 2
+    "lose_cost_scale": 2,
+    "pv_max_loss_frac": 0.15
+  },
+  "perceived_value": {
+    "fame_war_threshold": 3.0,
+    "fame_war_slope": 3.0
   },
   "projections": {
     "data_dir": "data/",

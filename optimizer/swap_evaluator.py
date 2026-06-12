@@ -12,20 +12,25 @@ from tqdm.auto import tqdm
 
 from .config import (
     HITTING_SLOTS,
+    MAX_HITTERS,
+    MAX_PITCHERS,
+    MIN_HITTERS,
+    MIN_PITCHERS,
     MY_TEAM_NAME,
     N_STARTER_SLOTS,
     PITCHING_SLOTS,
     ROSTER_SIZE,
-    SLOT_ELIGIBILITY,
 )
 from .league_state import compute_league_state
 from .lineup_solver import (
     assign_optimal_slots,
     compute_totals_for_starters,
+    get_solver,
+    maybe_blend,
     solve_lineup,
 )
 from .player_scoring import add_mew
-from .players import get_eligible_slots, get_startable_slots
+from .players import get_startable_slots
 from .win_model import (
     compute_ew_gradient,
     compute_win_probability,
@@ -103,11 +108,15 @@ def validate_transaction(
             + ", ".join(strip_name_suffix(n) for n in sorted(already_rostered))
         )
 
-    # 3. Roster size
-    new_size = len(my_roster_names) - len(drop_names) + len(add_names)
-    if new_size != ROSTER_SIZE:
+    # 3. Roster size — a transaction changes the count only when the number of
+    # players dropped differs from the number added. (my_roster_names is the
+    # working roster, which includes IR players held beyond the active 28, so
+    # comparing against the ROSTER_SIZE constant would false-alarm here.)
+    cur_size = len(my_roster_names)
+    new_size = cur_size - len(drop_names) + len(add_names)
+    if len(drop_names) != len(add_names):
         warnings.append(
-            f"Roster size changes from {ROSTER_SIZE} to {new_size} "
+            f"Roster size changes from {cur_size} to {new_size} "
             f"(dropping {len(drop_names)}, adding {len(add_names)}). "
             f"Transaction will be padded or trimmed for evaluation."
         )
@@ -143,18 +152,42 @@ def validate_transaction(
             f"You're dropping too many pitchers."
         )
 
-    # Per-slot feasibility
+    # League roster-composition bounds (Fantrax enforces these at execution).
+    # IR players sit outside the active 28 and don't count toward the bounds.
+    if "roster_status" in new_roster_df.columns:
+        active_df = new_roster_df[new_roster_df["roster_status"] != "IR"]
+    else:
+        active_df = new_roster_df
+    n_active_hitters = int((active_df["player_type"] == "hitter").sum())
+    n_active_pitchers = int((active_df["player_type"] == "pitcher").sum())
+    if not (MIN_HITTERS <= n_active_hitters <= MAX_HITTERS):
+        errors.append(
+            f"New roster has {n_active_hitters} active hitters; league requires "
+            f"{MIN_HITTERS}-{MAX_HITTERS}."
+        )
+    if not (MIN_PITCHERS <= n_active_pitchers <= MAX_PITCHERS):
+        errors.append(
+            f"New roster has {n_active_pitchers} active pitchers; league requires "
+            f"{MIN_PITCHERS}-{MAX_PITCHERS}."
+        )
+
+    # Per-slot feasibility — injury-aware: IL players cannot fill a starting
+    # slot, so a roster whose only healthy catcher is dropped must fail here
+    # even if an IL catcher remains on paper.
+    has_inj = "injury_status" in new_roster_df.columns
     for slot, count in _ALL_SLOTS.items():
-        eligible_positions = SLOT_ELIGIBILITY.get(slot, set())
-        eligible_count = 0
+        startable_count = 0
         for _, row in new_roster_df.iterrows():
-            player_positions = set(p.strip() for p in str(row["Position"]).split(","))
-            if player_positions & eligible_positions:
-                eligible_count += 1
-        if eligible_count < count:
+            slots = get_startable_slots(
+                str(row["Position"]),
+                row["injury_status"] if has_inj else None,
+            )
+            if slot in slots:
+                startable_count += 1
+        if startable_count < count:
             errors.append(
-                f"Cannot fill {slot} slot: need {count} eligible player(s) "
-                f"but only {eligible_count} on new roster."
+                f"Cannot fill {slot} slot: need {count} startable player(s) "
+                f"but only {startable_count} healthy/eligible on new roster."
             )
 
     return {
@@ -176,6 +209,7 @@ def compare_starters(
     players: pd.DataFrame,
     opponent_totals: dict[int, dict[str, float]],
     category_sigmas: dict[str, float],
+    my_banked_totals: dict[str, float] | None = None,
 ) -> list[dict]:
     """Compare the impact of forcing each candidate into the starting lineup.
 
@@ -219,14 +253,15 @@ def compare_starters(
     for name in candidate_names:
         lineup = solve_lineup(my_roster_names, players, "MEW", force_start={name})
         starters = set(lineup.keys())
-        totals = compute_totals_for_starters(starters, players)
+        ros = compute_totals_for_starters(starters, players)
+        totals = maybe_blend(my_banked_totals, ros)
         ew, _ = compute_win_probability(totals, opponent_totals, category_sigmas)
 
         cat_ew: dict[str, float] = {}
         for cat in ALL_CATEGORIES:
             total = 0.0
             for opp in opponent_totals.values():
-                denom = category_sigmas.get(cat, 1.0)
+                denom = category_sigmas.get(cat, 1.0) * (2.0**0.5)
                 if denom < 1e-9:
                     denom = 1e-9
                 if cat in NEGATIVE_CATEGORIES:
@@ -262,6 +297,8 @@ def compute_exact_msv(
     opponent_totals: dict[int, dict[str, float]],
     category_sigmas: dict[str, float],
     current_ew: float,
+    my_banked_totals: dict[str, float] | None = None,
+    baseline_lineup: dict[str, str] | None = None,
 ) -> dict:
     """Compute exact Marginal Swap Value by re-solving the lineup.
 
@@ -270,20 +307,36 @@ def compute_exact_msv(
     This is the universal evaluator for any transaction: 1-for-1 FA swap,
     N-for-N trade, or a batch of moves. Same math regardless.
 
+    Hitter and pitcher lineups are INDEPENDENT subproblems (disjoint players
+    and slots). When ``baseline_lineup`` is given and the swap touches only one
+    player type, the untouched half is reused verbatim and only the affected
+    half is re-solved. This is both exact and essential: re-solving the whole
+    lineup lets MILP ties in the untouched half flip arbitrarily (e.g. a
+    hitter swap silently swapping which two relievers start), injecting
+    phantom category deltas the move never caused. Holding the untouched half
+    fixed guarantees those categories are unchanged by construction.
+
     Args:
         drop_names: Players to remove from my roster.
         add_names: Players to add to my roster.
         my_roster_names: Current roster names.
         players: Players DataFrame with MEW column.
-        opponent_totals: {opp_id: {cat: total}}.
+        opponent_totals: {opp_id: {cat: total}}. SEASON totals (banked + ros)
+            when banked modeling is active; ros-only otherwise.
         category_sigmas: σ_c per category.
         current_ew: EW of current roster.
+        my_banked_totals: My banked YTD totals (compute_totals_for_starters
+            shape), or None. When given, the post-swap ros totals are blended
+            with banked before computing EW, and 'new_totals' is the season
+            total so downstream gradient/MEW/BV stay season-consistent.
+        baseline_lineup: Current {name: slot} lineup. When given, the untouched
+            player-type half is held fixed for single-type swaps (see above).
 
     Returns:
         {
             'msv': float,
             'new_ew': float,
-            'new_totals': dict,
+            'new_totals': dict,    # SEASON totals when banked given, else ros
             'new_lineup': dict,
         }
     """
@@ -303,8 +356,11 @@ def compute_exact_msv(
         f"add={sorted(add_names)}"
     )
 
-    new_lineup = solve_lineup(new_roster, players, "MEW")
-    new_totals = compute_totals_for_starters(set(new_lineup.keys()), players)
+    new_lineup = _solve_lineup_holding_half(
+        new_roster, players, drop_names | add_names, baseline_lineup
+    )
+    new_ros = compute_totals_for_starters(set(new_lineup.keys()), players)
+    new_totals = maybe_blend(my_banked_totals, new_ros)
     new_ew, _ = compute_win_probability(new_totals, opponent_totals, category_sigmas)
     msv = new_ew - current_ew
 
@@ -314,6 +370,41 @@ def compute_exact_msv(
         "new_totals": new_totals,
         "new_lineup": new_lineup,
     }
+
+
+def _solve_lineup_holding_half(
+    new_roster: set[str],
+    players: pd.DataFrame,
+    changed_names: set[str],
+    baseline_lineup: dict[str, str] | None,
+) -> dict[str, str]:
+    """Solve the post-swap MEW lineup, holding the untouched player type fixed.
+
+    If the swap touches only hitters (or only pitchers) and a baseline lineup
+    is available, the other type's starters are carried over unchanged and only
+    the affected half is re-optimized. Otherwise the full lineup is re-solved.
+    """
+    if baseline_lineup is None:
+        return solve_lineup(new_roster, players, "MEW")
+
+    type_lookup = players.set_index("Name")["player_type"].to_dict()
+    changed_types = {type_lookup.get(n) for n in changed_names}
+
+    if changed_types == {"hitter"}:
+        affected_slots, kept_slots = HITTING_SLOTS, PITCHING_SLOTS
+    elif changed_types == {"pitcher"}:
+        affected_slots, kept_slots = PITCHING_SLOTS, HITTING_SLOTS
+    else:
+        # Mixed-type (or unknown) swap: both halves can change.
+        return solve_lineup(new_roster, players, "MEW")
+
+    kept = {
+        name: slot
+        for name, slot in baseline_lineup.items()
+        if slot in kept_slots and name in new_roster
+    }
+    affected = solve_lineup(new_roster, players, "MEW", slots=affected_slots)
+    return {**kept, **affected}
 
 
 # ============================================================================
@@ -358,19 +449,29 @@ def add_bench_value(
 
     my_starters = set(my_lineup.keys())
     my_bench_mask = players["Name"].isin(my_roster_names - my_starters)
-    fa_mask = players["owner"].isna()
+    # Exclude roster members from the FA pool: when evaluating a hypothetical
+    # swap, the owner column still shows the just-added player as a free
+    # agent, but they are on my_roster_names and no longer claimable.
+    fa_mask = players["owner"].isna() & ~players["Name"].isin(my_roster_names)
 
     bench_df = players[my_bench_mask]
     fa_df = players[fa_mask]
 
-    # Precompute eligible slots for bench players and FAs
+    # Precompute STARTABLE slots (injury-aware): an IL bench player provides
+    # no insurance, and an IL free agent is not a startable replacement.
+    has_inj = "injury_status" in players.columns
+
     bench_eligible: dict[str, set[str]] = {}
     for _, row in bench_df.iterrows():
-        bench_eligible[row["Name"]] = get_eligible_slots(str(row["Position"]))
+        bench_eligible[row["Name"]] = get_startable_slots(
+            str(row["Position"]), row["injury_status"] if has_inj else None
+        )
 
     fa_eligible: dict[str, set[str]] = {}
     for _, row in fa_df.iterrows():
-        fa_eligible[row["Name"]] = get_eligible_slots(str(row["Position"]))
+        fa_eligible[row["Name"]] = get_startable_slots(
+            str(row["Position"]), row["injury_status"] if has_inj else None
+        )
 
     bench_mew = bench_df.set_index("Name")["MEW"].to_dict()
     fa_mew = fa_df.set_index("Name")["MEW"].to_dict()
@@ -414,25 +515,58 @@ def add_bench_value(
 # ============================================================================
 
 
+def compute_critical_slots(
+    my_roster_names: set[str],
+    players: pd.DataFrame,
+) -> dict[str, set[str]]:
+    """For each roster player, the slots that would become unfillable without them.
+
+    Coverage is INJURY-AWARE: an IL player cannot start, so they neither
+    provide coverage nor need protection. A slot s with count k is "critical"
+    for player p when p is one of <= k startable covers — dropping p would
+    leave the slot short.
+
+    This is the basis for conditional drop protection: dropping p is only
+    sound if the incoming player covers all of p's critical slots (e.g. your
+    only startable catcher may be swapped for a better catcher, but not for
+    an outfielder).
+
+    Returns:
+        {player_name: set of critical slots}, only for players with at least
+        one critical slot.
+    """
+    roster_df = players[players["Name"].isin(my_roster_names)]
+    has_inj = "injury_status" in roster_df.columns
+
+    startable: dict[str, set[str]] = {}
+    for _, row in roster_df.iterrows():
+        startable[row["Name"]] = get_startable_slots(
+            str(row["Position"]),
+            row["injury_status"] if has_inj else None,
+        )
+
+    critical: dict[str, set[str]] = {}
+    for slot, count in _ALL_SLOTS.items():
+        covers = [name for name, slots in startable.items() if slot in slots]
+        if len(covers) <= count:
+            for name in covers:
+                critical.setdefault(name, set()).add(slot)
+
+    return critical
+
+
 def find_protected_players(
     my_roster_names: set[str],
     players: pd.DataFrame,
 ) -> set[str]:
-    """Identify roster players that cannot be dropped (sole eligible for a slot)."""
-    protected: set[str] = set()
-    roster_df = players[players["Name"].isin(my_roster_names)]
+    """Roster players that cannot be dropped for a non-covering replacement.
 
-    for slot, count in _ALL_SLOTS.items():
-        eligible_positions = SLOT_ELIGIBILITY.get(slot, set())
-        eligible_roster = []
-        for _, row in roster_df.iterrows():
-            player_positions = set(p.strip() for p in str(row["Position"]).split(","))
-            if player_positions & eligible_positions:
-                eligible_roster.append(row["Name"])
-        if len(eligible_roster) <= count:
-            protected.update(eligible_roster)
-
-    return protected
+    Injury-aware: a player is protected when they are one of the last
+    startable covers for some slot (see compute_critical_slots). They may
+    still be dropped for an incoming player who covers those slots — that
+    conditional check lives in screen_swaps.
+    """
+    return set(compute_critical_slots(my_roster_names, players))
 
 
 def screen_swaps(
@@ -476,12 +610,16 @@ def screen_swaps(
         "screen_swaps: players must have BV. Call add_bench_value() first."
     )
 
-    # 1. Identify droppable roster players
-    protected = find_protected_players(my_roster_names, players)
-    droppable = my_roster_names - protected
+    # 1. Slot-coverage criticality (injury-aware). A player who is one of the
+    # last startable covers for a slot may only be dropped for an FA who also
+    # covers that slot — "replace your only catcher with a better catcher".
+    critical = compute_critical_slots(my_roster_names, players)
+    droppable = set(my_roster_names)
 
-    if protected:
-        print(f"Protected (sole eligible): {len(protected)} players")
+    if critical:
+        print(
+            f"Conditionally protected (last startable cover): {len(critical)} players"
+        )
 
     # 2. Precompute lookups
     my_starters = set(my_lineup.keys())
@@ -492,6 +630,47 @@ def screen_swaps(
     mew_lookup = players.set_index("Name")["MEW"].to_dict()
     bv_lookup = players.set_index("Name")["BV"].to_dict()
     pos_lookup = players.set_index("Name")["Position"].to_dict()
+    type_lookup = players.set_index("Name")["player_type"].to_dict()
+    inj_lookup = (
+        players.set_index("Name")["injury_status"].to_dict()
+        if "injury_status" in players.columns
+        else {}
+    )
+    status_lookup = (
+        players.set_index("Name")["roster_status"].to_dict()
+        if "roster_status" in players.columns
+        else {}
+    )
+
+    def _startable(name: str) -> set[str]:
+        """Injury-aware startable slots for any player by name."""
+        return get_startable_slots(str(pos_lookup.get(name, "")), inj_lookup.get(name))
+
+    # Active-roster composition (IR players sit outside the bounds).
+    n_act_h = sum(
+        1
+        for n in my_roster_names
+        if status_lookup.get(n) != "IR" and type_lookup.get(n) == "hitter"
+    )
+    n_act_p = sum(
+        1
+        for n in my_roster_names
+        if status_lookup.get(n) != "IR" and type_lookup.get(n) == "pitcher"
+    )
+
+    def _composition_ok(fa_name: str, drop_name: str) -> bool:
+        """Would the swap keep the active roster inside league h/p bounds?"""
+        h, p = n_act_h, n_act_p
+        if status_lookup.get(drop_name) != "IR":
+            if type_lookup.get(drop_name) == "hitter":
+                h -= 1
+            else:
+                p -= 1
+        if type_lookup.get(fa_name) == "hitter":
+            h += 1
+        else:
+            p += 1
+        return MIN_HITTERS <= h <= MAX_HITTERS and MIN_PITCHERS <= p <= MAX_PITCHERS
 
     current_total_bv = sum(bv_lookup.get(n, 0.0) for n in my_bench)
 
@@ -510,14 +689,14 @@ def screen_swaps(
     for slot in set(my_lineup.values()):
         bench_eligible = []
         for name in my_bench:
-            if slot in get_eligible_slots(str(pos_lookup.get(name, ""))):
+            if slot in _startable(name):
                 bench_eligible.append((name, mew_lookup.get(name, 0.0)))
         bench_eligible.sort(key=lambda x: x[1], reverse=True)
         bench_slot_mew[slot] = bench_eligible
 
         fa_eligible = []
         for name in fa_names:
-            if slot in get_eligible_slots(str(pos_lookup.get(name, ""))):
+            if slot in _startable(name):
                 fa_eligible.append((name, mew_lookup.get(name, 0.0)))
         fa_eligible.sort(key=lambda x: x[1], reverse=True)
         fa_slot_mew[slot] = fa_eligible
@@ -580,54 +759,58 @@ def screen_swaps(
         return fill_cost + fa_disp
 
     def _approx_delta_bv(drop_name: str, fa_name: str) -> float:
-        """Approximate ΔBV for a 1-for-1 swap without lineup re-solve."""
+        """Approximate ΔBV for a 1-for-1 swap without lineup re-solve.
+
+        Affected slots are those where the incoming FA is eligible (bench
+        insurance may improve) OR where the dropped player is eligible
+        (insurance may be lost). Slots untouched by both players contribute
+        identically before and after, so they cancel in the delta.
+        """
         drop_is_bench = drop_name in my_bench
         if not drop_is_bench:
             return 0.0
 
         fa_mew_val = mew_lookup.get(fa_name, 0.0)
-        fa_pos = str(pos_lookup.get(fa_name, ""))
-        fa_eligible_slots = get_eligible_slots(fa_pos)
+        fa_eligible_slots = _startable(fa_name)
+        drop_eligible_slots = _startable(drop_name)
+        affected_slots = fa_eligible_slots | drop_eligible_slots
 
-        new_bv = 0.0
+        delta = 0.0
         for starter_name, slot in my_lineup.items():
-            if slot not in fa_eligible_slots:
+            if slot not in affected_slots:
                 continue
             p_absent = POSITION_ABSENCE_RATES.get(slot, 0.20)
-
             current_bench_list = bench_slot_mew.get(slot, [])
-            best_bench_mew_after = -float("inf")
+            current_fa_list = fa_slot_mew.get(slot, [])
+
+            # Before the swap
+            best_b_old = current_bench_list[0][1] if current_bench_list else None
+            best_f_old = current_fa_list[0][1] if current_fa_list else 0.0
+            if best_b_old is not None:
+                delta -= p_absent * max(0.0, best_b_old - best_f_old)
+
+            # After the swap: drop leaves the bench; FA joins it (if eligible)
+            best_b_new = None
             for bn, bm in current_bench_list:
                 if bn == drop_name:
                     continue
-                best_bench_mew_after = bm
+                best_b_new = bm
                 break
-            best_bench_mew_after = max(best_bench_mew_after, fa_mew_val)
+            if slot in fa_eligible_slots:
+                if best_b_new is None or fa_mew_val > best_b_new:
+                    best_b_new = fa_mew_val
 
-            current_fa_list = fa_slot_mew.get(slot, [])
-            best_fa_mew_after = 0.0
+            best_f_new = 0.0
             for fn, fm in current_fa_list:
                 if fn == fa_name:
                     continue
-                best_fa_mew_after = fm
+                best_f_new = fm
                 break
 
-            if best_bench_mew_after > -float("inf"):
-                new_bv += p_absent * max(0.0, best_bench_mew_after - best_fa_mew_after)
+            if best_b_new is not None:
+                delta += p_absent * max(0.0, best_b_new - best_f_new)
 
-        old_bv_affected = 0.0
-        for starter_name, slot in my_lineup.items():
-            if slot not in fa_eligible_slots:
-                continue
-            p_absent = POSITION_ABSENCE_RATES.get(slot, 0.20)
-            current_bench_list = bench_slot_mew.get(slot, [])
-            best_b = current_bench_list[0][1] if current_bench_list else -float("inf")
-            current_fa_list = fa_slot_mew.get(slot, [])
-            best_f = current_fa_list[0][1] if current_fa_list else 0.0
-            if best_b > -float("inf"):
-                old_bv_affected += p_absent * max(0.0, best_b - best_f)
-
-        return new_bv - old_bv_affected
+        return delta
 
     # 3. Screen: for each FA, find best droppable roster player
     rows = []
@@ -636,7 +819,7 @@ def screen_swaps(
     for _, fa_row in fa_df.iterrows():
         fa_name = fa_row["Name"]
         fa_mew = fa_row["MEW"]
-        fa_eligible_slots = get_eligible_slots(str(fa_row["Position"]))
+        fa_eligible_slots = _startable(fa_name)
 
         best_value = -float("inf")
         best_drop = None
@@ -644,6 +827,24 @@ def screen_swaps(
         best_dbv = 0.0
 
         for drop_name in sorted(droppable):
+            # Conditional protection: the FA must cover every slot for which
+            # the dropped player is the last startable cover.
+            critical_slots = critical.get(drop_name)
+            if critical_slots and not critical_slots <= fa_eligible_slots:
+                continue
+            # League roster-composition bounds (12-18 hitters, 10-14 pitchers).
+            if not _composition_ok(fa_name, drop_name):
+                continue
+            # IL stash protection: an IL player's ROS projection is their
+            # post-return value (the feed already discounts for missed time),
+            # but the lineup model scores them zero because they can't start
+            # TODAY. Never trade that future value for a lesser player —
+            # dropping an IL player requires an FA with higher MEW.
+            if inj_lookup.get(drop_name) == "IL" and fa_mew <= mew_lookup.get(
+                drop_name, 0.0
+            ):
+                continue
+
             drop_mew = mew_lookup.get(drop_name, 0.0)
             msv_approx = _lineup_aware_msv(
                 fa_name,
@@ -702,6 +903,8 @@ def evaluate_top_k(
     current_ew: float,
     current_total_bv: float,
     include_bv: bool = True,
+    my_banked_totals: dict[str, float] | None = None,
+    my_lineup: dict[str, str] | None = None,
 ) -> pd.DataFrame:
     """Compute exact Value = ΔEW + ΔBV for each screened swap candidate.
 
@@ -711,8 +914,15 @@ def evaluate_top_k(
            a. new_gradient from new_totals
            b. new_MEW for all players via add_mew
            c. new_total_bv via add_bench_value
-           d. delta_bv = new_total_bv − current_total_bv
+           d. delta_bv = new_total_bv − baseline_bv
         3. value = msv + delta_bv
+
+    ΔBV scale consistency: when ``my_lineup`` is given, the baseline bench
+    value is recomputed for the CURRENT roster under the candidate's
+    post-swap gradient, so delta_bv compares both rosters on one MEW scale.
+    Comparing new-gradient BV against the pre-computed old-gradient
+    ``current_total_bv`` lets global gradient rescaling masquerade as value —
+    the greedy loop then farms phantom ΔBV by churning players in and out.
 
     Returns: candidates with added columns msv_exact, delta_bv, value, new_ew.
     Sorted by value descending.
@@ -737,6 +947,8 @@ def evaluate_top_k(
             opponent_totals,
             category_sigmas,
             current_ew,
+            my_banked_totals=my_banked_totals,
+            baseline_lineup=my_lineup,
         )
 
         delta_bv = 0.0
@@ -746,10 +958,19 @@ def evaluate_top_k(
             )
             work = add_mew(players, msv_result["new_totals"], new_gradient)
             new_roster = (my_roster_names - {drop_name}) | {fa_name}
-            work = add_bench_value(work, msv_result["new_lineup"], new_roster)
+            scored = add_bench_value(work, msv_result["new_lineup"], new_roster)
             new_bench = new_roster - set(msv_result["new_lineup"].keys())
-            new_total_bv = float(work[work["Name"].isin(new_bench)]["BV"].sum())
-            delta_bv = new_total_bv - current_total_bv
+            new_total_bv = float(scored[scored["Name"].isin(new_bench)]["BV"].sum())
+
+            if my_lineup is not None:
+                # Same-scale baseline: current roster's BV under the SAME
+                # post-swap gradient (see docstring).
+                base = add_bench_value(work, my_lineup, my_roster_names)
+                old_bench = my_roster_names - set(my_lineup.keys())
+                baseline_bv = float(base[base["Name"].isin(old_bench)]["BV"].sum())
+            else:
+                baseline_bv = current_total_bv
+            delta_bv = new_total_bv - baseline_bv
 
         value = msv_result["msv"] + delta_bv
 
@@ -781,6 +1002,7 @@ def compute_ew_ceiling(
     my_roster_names: set[str],
     current_ew: float,
     my_team_name: str | None = None,
+    my_banked_totals: dict[str, float] | None = None,
 ) -> dict:
     """Compute best achievable EW from full candidate pool (diagnostic).
 
@@ -870,7 +1092,7 @@ def compute_ew_ceiling(
                 f"fill_{slot}",
             )
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    prob.solve(get_solver())
 
     assert prob.status == pulp.LpStatusOptimal, (
         f"Ceiling MILP failed: {pulp.LpStatus[prob.status]}"
@@ -885,7 +1107,8 @@ def compute_ew_ceiling(
             if (i, s) in a and pulp.value(a[i, s]) > 0.5:
                 ceiling_lineup[pool.iloc[i]["Name"]] = s
 
-    ceiling_totals = compute_totals_for_starters(set(ceiling_lineup.keys()), players)
+    ceiling_ros = compute_totals_for_starters(set(ceiling_lineup.keys()), players)
+    ceiling_totals = maybe_blend(my_banked_totals, ceiling_ros)
     ceiling_ew, _ = compute_win_probability(
         ceiling_totals, opponent_totals, category_sigmas
     )
@@ -914,6 +1137,8 @@ def run_greedy_optimization(
     top_k: int = DEFAULT_SCREEN_TOP_K,
     include_bv: bool = True,
     my_team_name: str | None = None,
+    banked_totals: dict[str, dict[str, float]] | None = None,
+    season_fraction_remaining: float | None = None,
 ) -> dict:
     """Find the best reachable roster via greedy FA swaps.
 
@@ -962,7 +1187,12 @@ def run_greedy_optimization(
         print(f"\n=== Greedy iteration {iteration + 1}/{max_moves} ===")
 
         # 1. Compute league state
-        state = compute_league_state(players, my_team_name=my_team_name)
+        state = compute_league_state(
+            players,
+            my_team_name=my_team_name,
+            banked_totals=banked_totals,
+            season_fraction_remaining=season_fraction_remaining,
+        )
 
         if starting_ew is None:
             starting_ew = state["current_ew"]
@@ -1005,7 +1235,20 @@ def run_greedy_optimization(
             current_ew,
             current_total_bv,
             include_bv=include_bv,
+            my_banked_totals=state["my_banked"],
+            my_lineup=state["my_lineup"],
         )
+
+        # Churn guard: never re-add a player dropped earlier in this run or
+        # re-drop one we just added. Greedy oscillation (A out, A back in)
+        # signals candidates whose "value" is approximation noise, not signal.
+        if len(evaluated) > 0:
+            churn = evaluated["fa_name"].isin(all_drops) | evaluated["drop_name"].isin(
+                all_adds
+            )
+            if churn.any():
+                print(f"Churn guard: skipping {int(churn.sum())} reversal candidates")
+                evaluated = evaluated[~churn].reset_index(drop=True)
 
         if len(evaluated) == 0 or evaluated.iloc[0]["value"] < value_threshold:
             print(

@@ -19,14 +19,15 @@ from itertools import combinations
 import pandas as pd
 from tqdm.auto import tqdm
 
-from .config import MY_TEAM_NAME
+from .config import MY_TEAM_NAME, PV_MAX_LOSS_FRAC
 from .lineup_solver import (
     compute_totals_for_starters,
+    maybe_blend,
     solve_lineup,
 )
 from .player_scoring import add_mew
 from .players import get_eligible_slots
-from .swap_evaluator import add_bench_value
+from .swap_evaluator import _solve_lineup_holding_half, add_bench_value
 from .win_model import (
     compute_ew_gradient,
     compute_win_probability,
@@ -36,9 +37,9 @@ from .win_model import (
 # CONSTANTS
 # ============================================================================
 
-# Maximum fraction of PV the opponent will accept losing.
-# 0.15 = opponent accepts trades where they lose up to 15% of their PV.
-DEFAULT_PV_MAX_LOSS_FRAC: float = 0.15
+# Maximum fraction of PV the opponent will accept losing (from config.json
+# trade_engine.pv_max_loss_frac; default 0.15 = up to a 15% PV loss).
+DEFAULT_PV_MAX_LOSS_FRAC: float = PV_MAX_LOSS_FRAC
 DEFAULT_TRADE_MAX_SIZE: int = 2
 
 # ============================================================================
@@ -59,6 +60,9 @@ def evaluate_trade(
     current_total_bv: float,
     pv_max_loss_frac: float = DEFAULT_PV_MAX_LOSS_FRAC,
     my_lineup: dict[str, str] | None = None,
+    send_to_opp_names: set[str] | None = None,
+    my_banked_totals: dict[str, float] | None = None,
+    trade_opponent_banked: dict[str, float] | None = None,
 ) -> dict:
     """Evaluate a specific trade, including opponent roster change and ΔBV.
 
@@ -88,6 +92,19 @@ def evaluate_trade(
             0.15 = opponent accepts up to 15% PV loss.
         my_lineup: Optional {name: slot} dict for current lineup.
             Needed for 1-for-2 trades to identify bench players to drop.
+        send_to_opp_names: Which of the (original) send_names are routed to
+            the opponent. Players auto-added for balancing are routed
+            automatically (auto FA fills come from FA; auto drops go to FA).
+            Default None routes ALL original send_names to the opponent —
+            correct for balanced trades and 2-for-1 + FA fill. For
+            1-for-2 + FA drop shapes where the caller pre-included the FA
+            drop in send_names, pass the opponent-routed subset explicitly
+            (MATHEMATICAL_FRAMEWORK §1: moves carry dest/src tags).
+        my_banked_totals: My banked YTD totals, or None. Blended with my
+            post-trade ros totals before computing EW (banked-YTD model).
+        trade_opponent_banked: The traded opponent's banked YTD totals, or
+            None. Blended with their post-trade ros totals so the updated
+            opponent standings reflect banked + ros, consistent with my side.
 
     Returns:
         {
@@ -109,6 +126,7 @@ def evaluate_trade(
     # Convert to mutable sets for potential modification
     send_names = set(send_names)
     receive_names = set(receive_names)
+    original_send_names = set(send_names)
     auto_fa_add = None
     auto_drop = None
 
@@ -182,29 +200,20 @@ def evaluate_trade(
     # 1. PV check: only on opponent-routed portion (MF §1)
     # recv_from_opp: players leaving opponent's roster and coming to me
     # send_to_opp: players leaving my roster and going to the opponent
-    #   (NOT including players I'm dropping to FA as part of an imbalanced trade)
+    #   (NOT including players I'm dropping to FA, nor auto-balancing drops)
     pv_lookup = players.set_index("Name")["PV"].to_dict()
     recv_from_opp = receive_names & opponent_roster_names
-    recv_from_fa = receive_names - recv_from_opp
 
-    # Infer send_to_opp: in an imbalanced trade like 1-for-2 + FA drop,
-    # some of send_names go to FA rather than the opponent. The opponent-routed
-    # sends are the highest-PV players from send_names (up to the trade size).
-    # For balanced trades (1-for-1, 2-for-2), all sends go to the opponent.
-    # For 2-for-1+FA fill, all sends go to the opponent.
-    # For 1-for-2+FA drop, only some sends go to the opponent.
-    send_from_roster = send_names & my_roster_names
-    n_fa_drops = len(recv_from_fa)
-    if n_fa_drops > 0 and len(send_from_roster) > len(recv_from_opp):
-        # Imbalanced: some of my sends are FA drops, not trades to opponent.
-        # The FA-dropped players are the lowest-PV ones (least trade-worthy).
-        sorted_sends = sorted(
-            send_from_roster, key=lambda n: pv_lookup.get(n, 0.0), reverse=True
-        )
-        n_to_opp = len(send_from_roster) - n_fa_drops
-        send_to_opp = set(sorted_sends[:n_to_opp])
+    if send_to_opp_names is None:
+        # Default routing: every player the caller explicitly sent goes to
+        # the opponent. Auto-balancing drops (added above) go to FA.
+        send_to_opp = original_send_names & my_roster_names
     else:
-        send_to_opp = send_from_roster
+        send_to_opp = set(send_to_opp_names)
+        assert send_to_opp <= send_names, (
+            f"evaluate_trade: send_to_opp_names must be a subset of send_names. "
+            f"Extra: {sorted(send_to_opp - send_names)}"
+        )
 
     pv_send_val = sum(pv_lookup.get(n, 0.0) for n in send_to_opp)
     pv_recv_val = sum(pv_lookup.get(n, 0.0) for n in recv_from_opp)
@@ -253,15 +262,21 @@ def evaluate_trade(
         f"original {len(my_roster_names)}"
     )
 
-    # 3. My new lineup (MEW objective)
-    my_new_lineup = solve_lineup(my_new_roster, players, "MEW")
-    my_new_totals = compute_totals_for_starters(set(my_new_lineup.keys()), players)
+    # 3. My new lineup (MEW objective) — hold the untouched player-type half
+    # fixed for single-type trades so unaffected categories don't drift from
+    # MILP tie-breaking (see compute_exact_msv / _solve_lineup_holding_half).
+    my_new_lineup = _solve_lineup_holding_half(
+        my_new_roster, players, send_names | receive_names, my_lineup
+    )
+    my_new_ros = compute_totals_for_starters(set(my_new_lineup.keys()), players)
+    my_new_totals = maybe_blend(my_banked_totals, my_new_ros)
 
     # 4. Opponent's new roster and lineup (FV objective)
     # Only send_to_opp goes to the opponent; FA drops don't.
     opp_new_roster = (opponent_roster_names - recv_from_opp) | send_to_opp
     opp_new_lineup = solve_lineup(opp_new_roster, players, "FV")
-    opp_new_totals = compute_totals_for_starters(set(opp_new_lineup.keys()), players)
+    opp_new_ros = compute_totals_for_starters(set(opp_new_lineup.keys()), players)
+    opp_new_totals = maybe_blend(trade_opponent_banked, opp_new_ros)
 
     # 5. Updated opponent totals
     updated_opponent_totals = {**opponent_totals}
@@ -273,16 +288,25 @@ def evaluate_trade(
     )
     msv = new_ew - current_ew
 
-    # 7. ΔBV
+    # 7. ΔBV — baseline recomputed under the post-trade gradient so both
+    # rosters are valued on one MEW scale (avoids phantom ΔBV from global
+    # gradient rescaling; see evaluate_top_k).
     new_gradient = compute_ew_gradient(
         my_new_totals, updated_opponent_totals, category_sigmas
     )
     work = add_mew(players, my_new_totals, new_gradient)
-    work = add_bench_value(work, my_new_lineup, my_new_roster)
+    scored = add_bench_value(work, my_new_lineup, my_new_roster)
 
     new_bench = my_new_roster - set(my_new_lineup.keys())
-    new_total_bv = float(work[work["Name"].isin(new_bench)]["BV"].sum())
-    delta_bv = new_total_bv - current_total_bv
+    new_total_bv = float(scored[scored["Name"].isin(new_bench)]["BV"].sum())
+
+    if my_lineup is not None:
+        base = add_bench_value(work, my_lineup, my_roster_names)
+        old_bench = my_roster_names - set(my_lineup.keys())
+        baseline_bv = float(base[base["Name"].isin(old_bench)]["BV"].sum())
+    else:
+        baseline_bv = current_total_bv
+    delta_bv = new_total_bv - baseline_bv
 
     value = msv + delta_bv
 
@@ -320,6 +344,8 @@ def search_trades(
     top_k: int = 100,
     min_value: float = 0.0,
     my_team_name: str | None = None,
+    my_banked_totals: dict[str, float] | None = None,
+    opponent_banked: dict[int, dict[str, float] | None] | None = None,
 ) -> list[dict]:
     """Enumerate and rank PV-feasible trades, including imbalanced.
 
@@ -379,7 +405,7 @@ def search_trades(
 
     # For 2-player combos, cap to avoid truly degenerate explosion.
     # C(20,2) = 190 combos per side → 190×190 = 36,100 per opponent.
-    # With ~9 opponents that's ~325K approximate evals — still sub-second.
+    # With 6 opponents that is ~217K approximate evals — still fast.
     COMBO_CAP = 20
 
     def _opp_would_reject(
@@ -424,6 +450,7 @@ def search_trades(
                 approximate_trades.append(
                     {
                         "send": [chip],
+                        "send_to_opp": [chip],
                         "receive": [target],
                         "opponent_id": opp_id,
                         "msv_approx": msv_approx,
@@ -455,6 +482,7 @@ def search_trades(
                 approximate_trades.append(
                     {
                         "send": [c1, c2],
+                        "send_to_opp": [c1, c2],
                         "receive": [t1, t2],
                         "opponent_id": opp_id,
                         "msv_approx": msv_approx,
@@ -479,6 +507,7 @@ def search_trades(
                     approximate_trades.append(
                         {
                             "send": [c1, c2],
+                            "send_to_opp": [c1, c2],
                             "receive": [target, best_fa],
                             "opponent_id": opp_id,
                             "msv_approx": msv_approx,
@@ -507,6 +536,7 @@ def search_trades(
                 approximate_trades.append(
                     {
                         "send": [chip, drop_name],
+                        "send_to_opp": [chip],  # drop_name goes to FA
                         "receive": [t1, t2],
                         "opponent_id": opp_id,
                         "msv_approx": msv_approx,
@@ -538,6 +568,7 @@ def search_trades(
         opp_id = trade["opponent_id"]
         send_set = set(trade["send"])
         recv_set = set(trade["receive"])
+        send_to_opp = set(trade.get("send_to_opp", trade["send"]))
 
         result = evaluate_trade(
             send_names=send_set,
@@ -552,6 +583,11 @@ def search_trades(
             current_total_bv=current_total_bv,
             pv_max_loss_frac=pv_max_loss_frac,
             my_lineup=my_lineup,
+            send_to_opp_names=send_to_opp,
+            my_banked_totals=my_banked_totals,
+            trade_opponent_banked=(
+                opponent_banked.get(opp_id) if opponent_banked else None
+            ),
         )
 
         if not result["pv_feasible"]:
@@ -568,6 +604,7 @@ def search_trades(
         results.append(
             {
                 "send": trade["send"],
+                "send_to_opp": sorted(send_to_opp),
                 "receive": trade["receive"],
                 "opponent": opp_name,
                 "msv_exact": result["msv"],
@@ -605,6 +642,8 @@ def search_trades_for_players(
     top_k: int = 50,
     min_value: float = -1.0,
     my_team_name: str | None = None,
+    my_banked_totals: dict[str, float] | None = None,
+    opponent_banked: dict[int, dict[str, float] | None] | None = None,
 ) -> list[dict]:
     """Search for trades involving specific players.
 
@@ -664,7 +703,7 @@ def search_trades_for_players(
         recv_owners = set()
         for name in must_receive:
             owner = players.loc[players["Name"] == name, "owner"].iloc[0]
-            if pd.notna(owner) and owner != MY_TEAM_NAME:
+            if pd.notna(owner) and owner != my_team_name:
                 for oid, roster in opponent_rosters.items():
                     if name in roster:
                         recv_owners.add(oid)
@@ -727,6 +766,7 @@ def search_trades_for_players(
                         approximate_trades.append(
                             {
                                 "send": [chip],
+                                "send_to_opp": [chip],
                                 "receive": [target],
                                 "opponent_id": opp_id,
                                 "msv_approx": msv_approx,
@@ -755,6 +795,7 @@ def search_trades_for_players(
                         approximate_trades.append(
                             {
                                 "send": list(must_send) + [drop_name],
+                                "send_to_opp": list(must_send),  # drop goes to FA
                                 "receive": [t1, t2],
                                 "opponent_id": opp_id,
                                 "msv_approx": msv_approx,
@@ -787,6 +828,7 @@ def search_trades_for_players(
                             approximate_trades.append(
                                 {
                                     "send": send_list,
+                                    "send_to_opp": list(send_list),
                                     "receive": [target, best_fa],
                                     "opponent_id": opp_id,
                                     "msv_approx": msv_approx,
@@ -807,6 +849,7 @@ def search_trades_for_players(
                     approximate_trades.append(
                         {
                             "send": [chip],
+                            "send_to_opp": [chip],
                             "receive": [target],
                             "opponent_id": opp_id,
                             "msv_approx": msv_approx,
@@ -836,6 +879,7 @@ def search_trades_for_players(
                         approximate_trades.append(
                             {
                                 "send": [c1, c2],
+                                "send_to_opp": [c1, c2],
                                 "receive": must_recv_list + [best_fa],
                                 "opponent_id": opp_id,
                                 "msv_approx": msv_approx,
@@ -866,6 +910,7 @@ def search_trades_for_players(
         opp_id = trade["opponent_id"]
         send_set = set(trade["send"])
         recv_set = set(trade["receive"])
+        send_to_opp = set(trade.get("send_to_opp", trade["send"]))
 
         result = evaluate_trade(
             send_names=send_set,
@@ -880,6 +925,11 @@ def search_trades_for_players(
             current_total_bv=current_total_bv,
             pv_max_loss_frac=pv_max_loss_frac,
             my_lineup=my_lineup,
+            send_to_opp_names=send_to_opp,
+            my_banked_totals=my_banked_totals,
+            trade_opponent_banked=(
+                opponent_banked.get(opp_id) if opponent_banked else None
+            ),
         )
 
         if not result["pv_feasible"]:
@@ -896,6 +946,7 @@ def search_trades_for_players(
         results.append(
             {
                 "send": trade["send"],
+                "send_to_opp": sorted(send_to_opp),
                 "receive": trade["receive"],
                 "opponent": opp_name,
                 "msv_exact": result["msv"],

@@ -150,34 +150,73 @@ def compute_ew_gradient(
 def estimate_projection_uncertainty(
     my_totals: dict[str, float],
     opponent_totals: dict[int, dict[str, float]],
+    season_fraction_remaining: float | None = None,
 ) -> dict[str, float]:
-    """Estimate σ_c: how much actual outcomes could deviate from projections.
+    """Estimate σ_c: how much actual SEASON outcomes could deviate from projection.
+
+    σ_c is the uncertainty in the standings gap for category c. It enters the
+    win model as z = (gap) / (σ_c √2). Only the UNKNOWN portion of a season
+    total is uncertain — banked YTD stats are already realized.
 
     Counting stats: σ_c = |league_mean_c| × CV_c (fixed CV per category).
     Ratio stats: σ_c = fixed absolute value per category.
+
+    The CV / absolute constants are calibrated to FULL-SEASON dispersion. When
+    ``season_fraction_remaining`` (f) is given, σ is rescaled to the remaining
+    horizon. The standard result (verified by Monte Carlo) is that the SD of a
+    season total — banked known plus ros projected — equals σ_full · √f for
+    BOTH counting and ratio stats:
+
+      • Counting σ is computed here from the ros league mean, which already
+        carries one factor of f (ros_mean ≈ f · full_mean), giving σ_full · f.
+        To reach σ_full · √f we divide by √f.
+      • Ratio σ is a bare full-season constant (σ_full). To reach σ_full · √f
+        we multiply by √f.
+
+    At f = 1 (preseason) both reduce to the original full-season values, so
+    behavior is unchanged when no fraction is supplied.
+
+    IMPORTANT: pass ROS (not season) totals here — the league mean must be the
+    rest-of-season magnitude for the counting-stat scaling to hold. Supply f
+    ONLY when the totals reflect a banked+ros season model (see
+    compute_league_state); leaving it None keeps the legacy ros-only behavior.
 
     CRITICAL: This is projection uncertainty, NOT observed cross-team
     variance. See W7 for why the distinction matters.
 
     Args:
-        my_totals: My team's category totals.
-        opponent_totals: Dict mapping opponent_id to their category totals.
+        my_totals: My team's ROS category totals.
+        opponent_totals: Dict mapping opponent_id to their ROS category totals.
+        season_fraction_remaining: Fraction of the season still to be played,
+            in (0, 1]. None disables horizon rescaling (legacy behavior).
 
     Returns:
         Dict mapping category to standard deviation.
     """
+    if season_fraction_remaining is not None:
+        assert 0.0 < season_fraction_remaining <= 1.0, (
+            f"estimate_projection_uncertainty: season_fraction_remaining must be "
+            f"in (0, 1], got {season_fraction_remaining}."
+        )
+        sqrt_f = season_fraction_remaining**0.5
+        counting_scale = 1.0 / sqrt_f
+        ratio_scale = sqrt_f
+    else:
+        counting_scale = 1.0
+        ratio_scale = 1.0
+
     category_sigmas: dict[str, float] = {}
 
     for category in ALL_CATEGORIES:
         if category in _TEAM_PROJECTION_SIGMA:
-            sigma = _TEAM_PROJECTION_SIGMA[category]
+            sigma = _TEAM_PROJECTION_SIGMA[category] * ratio_scale
         else:
             values = [my_totals[category]]
             for opp_id in sorted(opponent_totals.keys()):
                 values.append(opponent_totals[opp_id][category])
             league_mean = abs(float(np.mean(values)))
             cv = _TEAM_PROJECTION_CV.get(category, 0.10)
-            sigma = league_mean * cv
+            sigma = league_mean * cv * counting_scale
 
         category_sigmas[category] = max(sigma, MIN_STAT_STANDARD_DEVIATION)
 
@@ -262,6 +301,88 @@ def compute_category_regime(
 
     df = pd.DataFrame(rows).sort_values("convexity_ratio", ascending=False)
     return df.reset_index(drop=True)
+
+
+# ============================================================================
+# MONTE CARLO STANDINGS SIMULATION
+# ============================================================================
+
+
+def simulate_standings(
+    my_totals: dict[str, float],
+    opponent_totals: dict[int, dict[str, float]],
+    category_sigmas: dict[str, float],
+    n_sims: int = 20_000,
+    seed: int = 0,
+) -> dict:
+    """Simulate final roto standings; turn EW into win/placement probabilities.
+
+    EW (= expected standing points − 10) is risk-neutral: it says nothing about
+    P(win the league), which is what actually matters — especially late in the
+    season, when a trailing team should prefer variance and a leading team
+    should avoid it. This simulator samples each team's final category totals,
+    scores roto points, and reports the full placement distribution.
+
+    Model: team c-totals ~ Normal(total_c, σ_c), independent across teams —
+    EXACTLY the distributional assumptions of the analytical model (a pairwise
+    gap then has SD σ_c·√2). Consequently E[my standing points] from the
+    simulation converges to 10 + EW; this identity is the consistency test.
+
+    Args:
+        my_totals: My (season) category totals.
+        opponent_totals: {opp_id: totals} for each opponent.
+        category_sigmas: σ_c per category (per-team projection uncertainty).
+        n_sims: Number of simulated seasons.
+        seed: RNG seed (fixed for reproducible dashboards).
+
+    Returns:
+        {
+            'expected_points': {team_idx: float},   # 0 = me, then opp ids order
+            'p_win': {team_idx: float},             # P(strictly most points; ties split)
+            'p_top2': {team_idx: float},
+            'my_points_quantiles': {q: float},      # 5/25/50/75/95th percentiles
+            'team_labels': list[str],               # 'me', 'opp_1', ...
+        }
+    """
+    opp_ids = sorted(opponent_totals.keys())
+    team_labels = ["me"] + [f"opp_{i}" for i in opp_ids]
+    n_teams = len(team_labels)
+
+    rng = np.random.default_rng(seed)
+    total_points = np.zeros((n_sims, n_teams))
+
+    for cat in ALL_CATEGORIES:
+        sigma = max(category_sigmas[cat], MIN_STAT_STANDARD_DEVIATION)
+        means = np.array([my_totals[cat]] + [opponent_totals[i][cat] for i in opp_ids])
+        draws = rng.normal(loc=means, scale=sigma, size=(n_sims, n_teams))
+        if cat in NEGATIVE_CATEGORIES:
+            draws = -draws
+        # Standing points: 1 + number of teams strictly worse. Continuous
+        # draws make ties probability-zero, so a double-argsort rank is exact.
+        ranks = draws.argsort(axis=1).argsort(axis=1)  # 0 = worst
+        total_points += ranks + 1
+
+    row_max = total_points.max(axis=1, keepdims=True)
+    is_best = total_points == row_max
+    # Split ties in final points evenly among the tied teams.
+    win_credit = is_best / is_best.sum(axis=1, keepdims=True)
+
+    # Top-2: points >= second-highest of the row.
+    sorted_pts = np.sort(total_points, axis=1)
+    second_best = sorted_pts[:, -2:-1]
+    p_top2 = (total_points >= second_best).mean(axis=0)
+
+    expected_points = total_points.mean(axis=0)
+    p_win = win_credit.mean(axis=0)
+    my_q = {q: float(np.percentile(total_points[:, 0], q)) for q in (5, 25, 50, 75, 95)}
+
+    return {
+        "expected_points": {i: float(v) for i, v in enumerate(expected_points)},
+        "p_win": {i: float(v) for i, v in enumerate(p_win)},
+        "p_top2": {i: float(v) for i, v in enumerate(p_top2)},
+        "my_points_quantiles": my_q,
+        "team_labels": team_labels,
+    }
 
 
 # ============================================================================

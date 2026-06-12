@@ -282,61 +282,153 @@ def _empty_standings_df() -> pd.DataFrame:
     )
 
 
+# Fantrax standings header `shortName` → our standings column name. The
+# "Standings - Stat Totals" table carries the REAL season-to-date totals
+# (not the roto points), and each row's `cells` align by index to the table's
+# `header.cells`. AB and IP are captured as playing-time weights for ratio
+# blending downstream.
+_STANDINGS_SHORTNAME_TO_COL: dict[str, str] = {
+    "R": "r",
+    "HR": "hr",
+    "RBI": "rbi",
+    "SB": "sb",
+    "OPS": "ops",
+    "ERA": "era",
+    "WHIP": "whip",
+    "K": "k",
+    "W": "w",
+    "SV": "sv",
+    "AB": "ab",
+    "IP": "ip",
+}
+
+
+def _to_float(content) -> float | None:
+    """Parse a Fantrax cell value to float, tolerating thousands separators."""
+    try:
+        return float(str(content).replace(",", "").replace("%", ""))
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_ip(content) -> float | None:
+    """Convert baseball IP notation to decimal innings (418.2 → 418.667).
+
+    Fantrax reports IP with the fractional digit as thirds of an inning
+    (.1 = 1/3, .2 = 2/3), not as a true decimal. A plain float parse would be
+    off by up to ~0.27 IP — negligible as a blend weight, but converting is
+    cheap and correct.
+    """
+    raw = _to_float(content)
+    if raw is None:
+        return None
+    whole = int(raw)
+    frac_digit = round((raw - whole) * 10)
+    if frac_digit in (1, 2):
+        return whole + frac_digit / 3.0
+    return raw
+
+
+def _team_cell(row: dict) -> dict | None:
+    """Return the team identity cell for a standings row (in fixedCells)."""
+    for cell in row.get("fixedCells", []):
+        if isinstance(cell, dict) and "teamId" in cell:
+            return cell
+    # Fallback for table variants that inline the team in `cells`.
+    for cell in row.get("cells", []):
+        if isinstance(cell, dict) and "teamId" in cell:
+            return cell
+    return None
+
+
 def _parse_standings_data(data: dict) -> list[dict]:
     """
-    Parse standings from API response data.
+    Parse league standings into one row per team with real category totals.
 
-    Fantrax API returns data in various structures. The most reliable is:
-    - tableList contains category tables (Runs Scored, Home Runs, etc.)
-    - Each category table has rows with cells[3] containing team name + teamId
-    - cells[0] = rank, cells[1] = points for that category
+    The Fantrax getStandings response contains several tables; the
+    **"Standings - Stat Totals"** table holds the authoritative season-to-date
+    values (R, HR, …, OPS, ERA, WHIP, K, W, SV, plus AB/IP). We map the table's
+    `header.cells` shortNames to column indices and read each row's `cells`
+    accordingly, taking team identity from `row.fixedCells`. This is exact (no
+    heuristics) — the earlier title-based heuristic accidentally read the
+    *roto-points* table for ERA/WHIP, corrupting those rates.
+
+    If the Stat-Totals table is absent (unexpected response shape), returns
+    team rows without category columns; downstream
+    ``optimizer.banked.standings_to_banked_totals`` then safely falls back to
+    rest-of-season-only.
     """
     tables = data.get("tables") or data.get("tableList") or []
 
-    teams_by_id = {}
-
+    stat_table = None
     for table in tables:
-        if not isinstance(table, dict):
-            continue
+        if (
+            isinstance(table, dict)
+            and "stat totals" in str(table.get("caption", "")).lower()
+        ):
+            stat_table = table
+            break
 
-        table_type = table.get("tableType", "")
+    rows_out: list[dict] = []
 
-        if table_type == "SECTION_HEADING":
-            continue
-
-        for row in table.get("rows", []):
+    if stat_table is None:
+        # Best-effort team identity only (keeps the standings display working).
+        seen: set = set()
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            for row in table.get("rows", []):
+                if not isinstance(row, dict):
+                    continue
+                tc = _team_cell(row)
+                if tc is None or tc.get("teamId") in seen:
+                    continue
+                seen.add(tc.get("teamId"))
+                rows_out.append(
+                    {
+                        "team_id": tc.get("teamId"),
+                        "team_name": tc.get("content", "Unknown"),
+                        "overall_rank": 1,
+                        "total_points": 0,
+                    }
+                )
+    else:
+        header_cells = stat_table.get("header", {}).get("cells", [])
+        col_index = {
+            c.get("shortName"): i
+            for i, c in enumerate(header_cells)
+            if isinstance(c, dict) and c.get("shortName")
+        }
+        for row in stat_table.get("rows", []):
             if not isinstance(row, dict):
                 continue
-
-            cells = row.get("cells", [])
-
-            team_cell = None
-            for idx, cell in enumerate(cells):
-                if isinstance(cell, dict) and "teamId" in cell:
-                    team_cell = cell
-                    break
-
-            if team_cell is None:
+            tc = _team_cell(row)
+            if tc is None:
                 continue
+            cells = row.get("cells", [])
+            entry = {
+                "team_id": tc.get("teamId"),
+                "team_name": tc.get("content", "Unknown"),
+                "overall_rank": 1,
+                "total_points": 0,
+            }
+            for short_name, col in _STANDINGS_SHORTNAME_TO_COL.items():
+                i = col_index.get(short_name)
+                if i is None or i >= len(cells):
+                    continue
+                content = (
+                    cells[i].get("content") if isinstance(cells[i], dict) else cells[i]
+                )
+                value = _parse_ip(content) if col == "ip" else _to_float(content)
+                if value is not None:
+                    entry[col] = value
+            rows_out.append(entry)
 
-            team_id = team_cell.get("teamId")
-            team_name = team_cell.get("content", "Unknown")
-
-            if team_id not in teams_by_id:
-                teams_by_id[team_id] = {
-                    "team_id": team_id,
-                    "team_name": team_name,
-                    "overall_rank": 1,
-                    "total_points": 0,
-                }
-
-    rows = list(teams_by_id.values())
-    rows.sort(key=lambda x: x.get("team_name", ""))
-
-    for i, row in enumerate(rows):
+    rows_out.sort(key=lambda x: x.get("team_name", ""))
+    for i, row in enumerate(rows_out):
         row["overall_rank"] = i + 1
 
-    return rows
+    return rows_out
 
 
 def fetch_standings(session: requests.Session) -> pd.DataFrame:

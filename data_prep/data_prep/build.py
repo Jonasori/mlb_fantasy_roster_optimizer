@@ -6,6 +6,7 @@ No fantasy value (FV), lineup assignment, or gold-table enrichment.
 
 import pandas as pd
 
+from .config import DATA_DIR
 from .fantrax_api import (
     FANTRAX_NAME_CORRECTIONS,
     create_session,
@@ -242,6 +243,16 @@ def build_silver_table(
     )
     fantrax_data = fetch_all_fantrax_data(session)
     players = merge_fantrax(players, fantrax_data)
+
+    # Persist standings (banked YTD category totals) next to the silver table.
+    # The optimizer reads this to add the banked half of season totals — see
+    # optimizer/banked.py. Written even if category parsing is incomplete; the
+    # consumer validates and falls back to rest-of-season-only if so.
+    standings = fantrax_data.get("standings")
+    if standings is not None and len(standings) > 0:
+        standings_path = DATA_DIR / "standings.parquet"
+        standings.to_parquet(standings_path, index=False)
+        print(f"Wrote standings: {standings_path} ({len(standings)} teams)")
 
     if not skip_mlb_api:
         print("\n3. Fetching ages from MLB Stats API...")

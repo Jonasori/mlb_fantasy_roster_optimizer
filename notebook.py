@@ -53,6 +53,7 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
     from datetime import date
     from pathlib import Path
 
+    from optimizer.banked import standings_to_banked_totals
     from optimizer.config import season_fraction_remaining
     from optimizer.league_state import compute_league_state
     from optimizer.lineup_solver import assign_optimal_slots
@@ -92,7 +93,15 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
         _today = date.today().strftime("%Y%m%d")
         _today_dir = _data_dir / f"pulled_{_today}"
 
-        if not _today_dir.exists():
+        # Check for the actual files we need, not just the directory: a
+        # pulled_YYYYMMDD dir created by an older scraper (different file
+        # names) must not block scraping the rest-of-season feeds.
+        _h_name, _p_name = _file_map[_system]
+        _have_today = (_today_dir / _h_name).exists() and (
+            _today_dir / _p_name
+        ).exists()
+
+        if not _have_today:
             print(f"Projections are stale — scraping FanGraphs for {_today}...")
             _scrape = subprocess.run(
                 ["uv", "run", "scrape-fangraphs"],
@@ -107,7 +116,6 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
         else:
             print(f"Today's projections already pulled: {_today_dir.name}")
 
-        _h_name, _p_name = _file_map[_system]
         _hitter_csv = str(_today_dir / _h_name)
         _pitcher_csv = str(_today_dir / _p_name)
 
@@ -132,22 +140,29 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
         )
 
     # ── Find latest projections and load selected system ──
-    _pulled_dirs = sorted(_data_dir.glob("pulled_*"))
+    # Only consider pulled_* dirs that actually contain the rest-of-season
+    # files for the selected system (older dirs may hold legacy preseason
+    # pulls under different filenames).
+    _pulled_dirs = sorted(
+        d
+        for d in _data_dir.glob("pulled_*")
+        if (d / _file_map[_system][0]).exists() and (d / _file_map[_system][1]).exists()
+    )
     if not _pulled_dirs:
+        print(
+            "No rest-of-season projection pulls found — "
+            "click Rebuild to scrape FanGraphs."
+        )
         players = pd.DataFrame()
         players_fv = pd.DataFrame()
         state = {}
+        banked_totals = None
+        season_frac = season_fraction_remaining()
         data_ready = False
     else:
         _latest_dir = _pulled_dirs[-1]
         _h_csv = _latest_dir / _file_map[_system][0]
         _p_csv = _latest_dir / _file_map[_system][1]
-        assert _h_csv.exists(), (
-            f"Hitter projections not found: {_h_csv}. Click Rebuild to scrape."
-        )
-        assert _p_csv.exists(), (
-            f"Pitcher projections not found: {_p_csv}. Click Rebuild to scrape."
-        )
 
         # Load hitter projections
         _h = pd.read_csv(str(_h_csv))
@@ -232,11 +247,32 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
         else:
             print("No silver table found — run Rebuild to fetch Fantrax data")
 
+        # ── Load banked YTD totals (Fantrax standings) ──
+        # Adds the banked half of season totals so the win model compares
+        # full-season standings, not just rest-of-season. Degrades safely to
+        # rest-of-season-only when standings are absent or fail validation.
+        _standings_path = _data_dir / "standings.parquet"
+        banked_totals = None
+        season_frac = season_fraction_remaining()
+        if _standings_path.exists():
+            _standings = pd.read_parquet(_standings_path)
+            banked_totals = standings_to_banked_totals(_standings)
+        else:
+            print(
+                "No standings.parquet found — rest-of-season-only model. "
+                "Click Rebuild to fetch banked YTD totals from Fantrax."
+            )
+
         # ── Run math pipeline ──
         players = add_fantasy_value(players)
         players_fv = players.copy()
 
-        state = compute_league_state(players, my_team_name=_team)
+        state = compute_league_state(
+            players,
+            my_team_name=_team,
+            banked_totals=banked_totals,
+            season_fraction_remaining=season_frac,
+        )
         players = assign_optimal_slots(
             players,
             state["my_lineup"],
@@ -250,7 +286,7 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
         players = add_bench_value(players, state["my_lineup"], state["my_roster_names"])
         print(f"Pipeline complete: {len(players)} players enriched")
         data_ready = True
-    return data_ready, players, players_fv, state
+    return banked_totals, data_ready, players, players_fv, season_frac, state
 
 
 @app.cell
@@ -328,9 +364,7 @@ def observed_windows(data_ready, game_logs, pd, players):
             pa = sum(g.get("plateAppearances", 0) for g in logs)
             ab = sum(g.get("atBats", 0) for g in logs)
             ops = (
-                sum(
-                    float(g.get("obp", 0)) * g.get("plateAppearances", 0) for g in logs
-                )
+                sum(float(g.get("obp", 0)) * g.get("plateAppearances", 0) for g in logs)
                 / pa
                 + sum(float(g.get("slg", 0)) * g.get("atBats", 0) for g in logs) / ab
                 if pa > 0 and ab > 0
@@ -373,7 +407,21 @@ def observed_windows(data_ready, game_logs, pd, players):
         _window_cols = [
             f"{c}_{w}"
             for w in ("ytd", "l14")
-            for c in ["G", "PA", "R", "HR", "RBI", "SB", "OPS", "IP", "W", "SV", "K", "ERA", "WHIP"]
+            for c in [
+                "G",
+                "PA",
+                "R",
+                "HR",
+                "RBI",
+                "SB",
+                "OPS",
+                "IP",
+                "W",
+                "SV",
+                "K",
+                "ERA",
+                "WHIP",
+            ]
         ]
 
         _by_id: dict[int, dict] = {}
@@ -656,6 +704,56 @@ def resolve_name_cell(strip_name_suffix):
 
 
 @app.cell
+def title_odds(data_ready, mo, pd, state):
+    """Monte Carlo final-standings simulation: P(win), P(top-2), point spread.
+
+    EW is risk-neutral (expected points); this panel shows the placement
+    DISTRIBUTION — what actually matters for deciding how much variance to
+    seek as the season tightens.
+    """
+    if data_ready:
+        from optimizer.win_model import simulate_standings
+
+        _sim = simulate_standings(
+            state["my_totals"],
+            state["opponent_totals"],
+            state["category_sigmas"],
+        )
+        _names = [state["my_team_name"]] + [
+            state["opponent_teams"][i - 1]
+            for i in sorted(state["opponent_lineups"].keys())
+        ]
+        _rows = [
+            {
+                "Team": _names[i],
+                "Expected Pts": round(_sim["expected_points"][i], 1),
+                "P(win) %": round(100 * _sim["p_win"][i], 1),
+                "P(top 2) %": round(100 * _sim["p_top2"][i], 1),
+            }
+            for i in range(len(_names))
+        ]
+        _odds_df = (
+            pd.DataFrame(_rows)
+            .sort_values("Expected Pts", ascending=False)
+            .reset_index(drop=True)
+        )
+        _q = _sim["my_points_quantiles"]
+        title_odds_section = mo.vstack(
+            [
+                mo.md("### Title Odds (Monte Carlo, 20k seasons)"),
+                mo.md(
+                    f"*My final points: 5th pct **{_q[5]:.0f}**, median "
+                    f"**{_q[50]:.0f}**, 95th pct **{_q[95]:.0f}** (of 70).*"
+                ),
+                mo.ui.table(_odds_df, selection=None, page_size=10),
+            ]
+        )
+    else:
+        title_odds_section = mo.md("")
+    return (title_odds_section,)
+
+
+@app.cell
 def dashboard_content(
     data_ready,
     fig_to_png,
@@ -669,6 +767,7 @@ def dashboard_content(
     state,
     strip_name_suffix,
     team_perspective,
+    title_odds_section,
     ytd_section,
 ):
     if data_ready:
@@ -746,6 +845,8 @@ def dashboard_content(
                 state["current_ew"],
                 _current_total_bv,
                 include_bv=True,
+                my_banked_totals=state["my_banked"],
+                my_lineup=state["my_lineup"],
             )
             _positive = _evaluated[_evaluated["value"] > 0]
             _n_fa_upgrades = len(_positive)
@@ -896,6 +997,7 @@ def dashboard_content(
             my_roster_names,
             _ew,
             my_team_name=state["my_team_name"],
+            my_banked_totals=state["my_banked"],
         )
         _gap_fig = plot_gap_to_ceiling(_ew, _ceiling["ceiling_ew"])
 
@@ -947,6 +1049,7 @@ def dashboard_content(
                     f"Expected Wins: {_ew:.2f} / 60 "
                     f"| Projected Standing Points: {10 + _ew:.1f} / 70"
                 ),
+                title_odds_section,
                 mo.md("### Recommended Actions"),
                 fig_to_png(_gap_fig),
                 _actions,
@@ -1009,12 +1112,14 @@ def fa_ui(mo):
 
 @app.cell
 def fa_results(
+    banked_totals,
     data_ready,
     fa_value_threshold,
     mo,
     pd,
     players_fv,
     run_fa,
+    season_frac,
     state,
     strip_name_suffix,
 ):
@@ -1031,6 +1136,8 @@ def fa_results(
             players_fv,
             value_threshold=fa_value_threshold.value,
             my_team_name=state["my_team_name"],
+            banked_totals=banked_totals,
+            season_fraction_remaining=season_frac,
         )
         fa_moves = _res["moves"]
         if not fa_moves:
@@ -1089,6 +1196,8 @@ def fa_impact(
             opponent_totals=state["opponent_totals"],
             category_sigmas=state["category_sigmas"],
             current_ew=state["current_ew"],
+            my_banked_totals=state["my_banked"],
+            baseline_lineup=state["my_lineup"],
         )
         _fig = _pmi(
             state["my_totals"],
@@ -1247,6 +1356,8 @@ def trade_results(
                     current_total_bv=current_total_bv,
                     pv_max_loss_frac=trade_pv_loss_pct.value / 100,
                     my_lineup=state["my_lineup"],
+                    my_banked_totals=state["my_banked"],
+                    trade_opponent_banked=state["opponent_banked"].get(_oid),
                 )
 
                 if "error" in _res:
@@ -1357,6 +1468,8 @@ def trade_results(
                 opponent_filter=_opp_filter,
                 min_value=trade_min_value.value,
                 my_team_name=state["my_team_name"],
+                my_banked_totals=state["my_banked"],
+                opponent_banked=state["opponent_banked"],
             )
         else:
             # No player filters — use general search
@@ -1374,6 +1487,8 @@ def trade_results(
                 pv_max_loss_frac=trade_pv_loss_pct.value / 100,
                 min_value=trade_min_value.value,
                 my_team_name=state["my_team_name"],
+                my_banked_totals=state["my_banked"],
+                opponent_banked=state["opponent_banked"],
             )
 
         if not _bad_names:
@@ -1471,6 +1586,9 @@ def trade_impact(
             current_total_bv=current_total_bv,
             pv_max_loss_frac=trade_pv_loss_pct.value / 100,
             my_lineup=state["my_lineup"],
+            send_to_opp_names=set(_trade.get("send_to_opp", _trade["send"])),
+            my_banked_totals=state["my_banked"],
+            trade_opponent_banked=state["opponent_banked"].get(_oid),
         )
 
         _all_names = list(_trade["send"]) + list(_trade["receive"])
@@ -1778,6 +1896,8 @@ def sandbox_results(
                         state["opponent_totals"],
                         state["category_sigmas"],
                         state["current_ew"],
+                        my_banked_totals=state["my_banked"],
+                        baseline_lineup=state["my_lineup"],
                     )
 
                     # Compute ΔBV
@@ -1788,14 +1908,21 @@ def sandbox_results(
                     )
                     _work = _add_mew(players, _msv_result["new_totals"], _new_gradient)
                     _new_roster = (my_roster_names - _drop_set) | _add_set
-                    _work = _add_bench_value(
+                    _scored = _add_bench_value(
                         _work, _msv_result["new_lineup"], _new_roster
                     )
                     _new_bench = _new_roster - set(_msv_result["new_lineup"].keys())
                     _new_total_bv = float(
-                        _work[_work["Name"].isin(_new_bench)]["BV"].sum()
+                        _scored[_scored["Name"].isin(_new_bench)]["BV"].sum()
                     )
-                    _delta_bv = _new_total_bv - current_total_bv
+                    # Same-scale baseline: current roster's BV under the
+                    # post-swap gradient (consistent MEW scale).
+                    _base = _add_bench_value(_work, state["my_lineup"], my_roster_names)
+                    _old_bench = my_roster_names - set(state["my_lineup"].keys())
+                    _baseline_bv = float(
+                        _base[_base["Name"].isin(_old_bench)]["BV"].sum()
+                    )
+                    _delta_bv = _new_total_bv - _baseline_bv
                     _value = _msv_result["msv"] + _delta_bv
 
                     # Summary callout
@@ -1982,6 +2109,7 @@ def compare_results(
                 players,
                 state["opponent_totals"],
                 state["category_sigmas"],
+                my_banked_totals=state["my_banked"],
             )
 
             _parts: list = []

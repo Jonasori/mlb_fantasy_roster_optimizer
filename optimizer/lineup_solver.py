@@ -23,11 +23,22 @@ from .players import get_startable_slots
 _ALL_SLOTS: dict[str, int] = {**HITTING_SLOTS, **PITCHING_SLOTS}
 
 
+def get_solver() -> pulp.LpSolver:
+    """Return the MILP solver for lineup/roster problems.
+
+    Uses HiGHS (via highspy) per the framework spec — it is fast (<1ms for
+    these tiny assignment problems) and ships as a portable wheel, unlike
+    PuLP's bundled CBC binary (which is x86-only and fails on arm64 Macs).
+    """
+    return pulp.HiGHS(msg=False)
+
+
 def solve_lineup(
     roster_names: Iterable[str],
     players: pd.DataFrame,
     objective_column: str = "FV",
     force_start: set[str] | None = None,
+    slots: dict[str, int] | None = None,
 ) -> dict[str, str]:
     """Solve lineup assignment via MILP, maximizing Σ objective_column for starters.
 
@@ -49,10 +60,16 @@ def solve_lineup(
         objective_column: Column to maximize over starters.
         force_start: Optional set of player names that must be assigned
             to a starter slot. Used for "what-if" lineup comparisons.
+        slots: Optional slot subset to fill (e.g. HITTING_SLOTS to solve only
+            the hitter half). Defaults to all slots. The hitter and pitcher
+            halves are independent (disjoint players and slots), so solving one
+            half is exact — used to hold the untouched half of a roster fixed
+            during single-type swap evaluation.
 
     Returns:
         Dict mapping starter name → assigned slot. Bench players omitted.
     """
+    active_slots = slots if slots is not None else _ALL_SLOTS
     roster_names = set(roster_names)
     roster_df = players[players["Name"].isin(roster_names)].copy()
 
@@ -83,6 +100,7 @@ def solve_lineup(
             roster_df.iloc[i]["Position"],
             roster_df.iloc[i]["injury_status"] if has_injury_col else None,
         )
+        & set(active_slots)
         for i in range(n_players)
     }
 
@@ -99,15 +117,27 @@ def solve_lineup(
         for i in range(n_players)
     )
 
-    for slot, count in _ALL_SLOTS.items():
+    unfillable: list[str] = []
+    for slot, count in active_slots.items():
         eligible_for_slot = [i for i in range(n_players) if slot in eligibility[i]]
         slots_to_fill = min(len(eligible_for_slot), count)
+        if slots_to_fill < count:
+            unfillable.append(f"{slot} ({slots_to_fill}/{count})")
         if slots_to_fill > 0:
             prob += (
                 lpSum(a[i, slot] for i in eligible_for_slot if (i, slot) in a)
                 == slots_to_fill,
                 f"fill_{slot}",
             )
+
+    if unfillable:
+        # Leniency keeps opponent solves robust (e.g. all their catchers on
+        # IL), but an under-filled lineup forfeits starter stats — screening
+        # and validate_transaction should have prevented this for MY moves.
+        print(
+            f"WARNING: solve_lineup leaving slots under-filled: "
+            f"{', '.join(unfillable)}. Roster lacks startable coverage."
+        )
 
     for i in range(n_players):
         slots_for_player = [s for s in eligibility[i] if (i, s) in a]
@@ -126,7 +156,7 @@ def solve_lineup(
                 f"force_{i}",
             )
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=0))
+    prob.solve(get_solver())
 
     assert prob.status == pulp.LpStatusOptimal, (
         f"Lineup assignment failed: {pulp.LpStatus[prob.status]}. "
@@ -226,6 +256,94 @@ def compute_totals_for_starters(
     totals["IP"] = total_ip
 
     return totals
+
+
+# ============================================================================
+# BANKED-YTD / REST-OF-SEASON BLENDING
+# ============================================================================
+
+_COUNTING_TOTAL_KEYS: tuple[str, ...] = ("R", "HR", "RBI", "SB", "W", "SV", "K")
+
+
+def blend_season_totals(
+    banked: dict[str, float],
+    ros: dict[str, float],
+) -> dict[str, float]:
+    """Combine banked year-to-date totals with rest-of-season projected totals.
+
+    Roto standings are decided by FULL-SEASON totals = what a team has already
+    banked (YTD) plus what it will accrue the rest of the way (ROS). The
+    projection feeds are rest-of-season only, so the win model must add the
+    banked half before computing matchup z-scores. This is the single most
+    important correction once projections are RoS: without it, the model
+    treats every category race as starting from a tie.
+
+    Counting stats are summed. Ratio stats are re-weighted by the playing-time
+    denominator, matching the team-total convention in
+    ``compute_totals_for_starters`` (PA-weighted OPS, IP-weighted ERA/WHIP):
+
+        season_OPS  = (PA_b·OPS_b  + PA_r·OPS_r)  / (PA_b + PA_r)
+        season_ERA  = (IP_b·ERA_b  + IP_r·ERA_r)  / (IP_b + IP_r)
+        season_WHIP = (IP_b·WHIP_b + IP_r·WHIP_r) / (IP_b + IP_r)
+
+    Args:
+        banked: Banked YTD totals. Must contain the 10 category keys plus
+            'PA' and 'IP' (same shape as ``compute_totals_for_starters``).
+            PA/IP are the banked playing-time weights for ratio blending.
+        ros: Rest-of-season projected totals (same shape).
+
+    Returns:
+        Season totals dict with the same keys (10 categories + 'PA' + 'IP').
+    """
+    required = set(_COUNTING_TOTAL_KEYS) | {"OPS", "ERA", "WHIP", "PA", "IP"}
+    missing_b = required - set(banked)
+    missing_r = required - set(ros)
+    assert not missing_b, (
+        f"blend_season_totals: banked totals missing keys {sorted(missing_b)}. "
+        f"Banked dict must match compute_totals_for_starters shape."
+    )
+    assert not missing_r, (
+        f"blend_season_totals: ros totals missing keys {sorted(missing_r)}."
+    )
+
+    season: dict[str, float] = {}
+    for cat in _COUNTING_TOTAL_KEYS:
+        season[cat] = float(banked[cat]) + float(ros[cat])
+
+    pa_b, pa_r = float(banked["PA"]), float(ros["PA"])
+    ip_b, ip_r = float(banked["IP"]), float(ros["IP"])
+    season["PA"] = pa_b + pa_r
+    season["IP"] = ip_b + ip_r
+
+    season["OPS"] = (
+        (pa_b * float(banked["OPS"]) + pa_r * float(ros["OPS"])) / (pa_b + pa_r)
+        if (pa_b + pa_r) > 0
+        else float(ros["OPS"])
+    )
+    season["ERA"] = (
+        (ip_b * float(banked["ERA"]) + ip_r * float(ros["ERA"])) / (ip_b + ip_r)
+        if (ip_b + ip_r) > 0
+        else float(ros["ERA"])
+    )
+    season["WHIP"] = (
+        (ip_b * float(banked["WHIP"]) + ip_r * float(ros["WHIP"])) / (ip_b + ip_r)
+        if (ip_b + ip_r) > 0
+        else float(ros["WHIP"])
+    )
+    return season
+
+
+def maybe_blend(
+    banked: dict[str, float] | None,
+    ros: dict[str, float],
+) -> dict[str, float]:
+    """Blend banked + ros if banked is provided; otherwise return ros unchanged.
+
+    Lets every evaluator accept an optional ``banked`` baseline without
+    branching: ``maybe_blend(None, ros)`` is the pure rest-of-season path
+    (backward-compatible), ``maybe_blend(banked, ros)`` is the season path.
+    """
+    return blend_season_totals(banked, ros) if banked is not None else ros
 
 
 # ============================================================================

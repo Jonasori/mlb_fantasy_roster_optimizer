@@ -893,3 +893,572 @@ def test_mew_lineup_differs_from_fv_lineup():
         players.loc[players["Name"] == "HighSB-H", "MEW"].iloc[0]
         > players.loc[players["Name"] == "HighFV-H", "MEW"].iloc[0]
     ), "HighSB should have higher MEW when gradient heavily weights SB"
+
+
+# ============================================================================
+# Banked YTD integration (full-season standings = banked + rest-of-season)
+# ============================================================================
+
+
+def test_blend_season_totals_counting_and_ratio():
+    """Counting stats sum; ratio stats blend by PA/IP weight."""
+    from optimizer.lineup_solver import blend_season_totals
+
+    banked = {
+        "R": 400.0,
+        "HR": 100.0,
+        "RBI": 380.0,
+        "SB": 50.0,
+        "W": 40.0,
+        "SV": 20.0,
+        "K": 600.0,
+        "OPS": 0.720,
+        "ERA": 3.50,
+        "WHIP": 1.25,
+        "PA": 3000.0,
+        "IP": 600.0,
+    }
+    ros = {
+        "R": 300.0,
+        "HR": 80.0,
+        "RBI": 300.0,
+        "SB": 40.0,
+        "W": 35.0,
+        "SV": 18.0,
+        "K": 500.0,
+        "OPS": 0.780,
+        "ERA": 3.20,
+        "WHIP": 1.15,
+        "PA": 2000.0,
+        "IP": 500.0,
+    }
+    s = blend_season_totals(banked, ros)
+
+    assert s["R"] == 700.0, f"counting R should sum to 700, got {s['R']}"
+    assert s["HR"] == 180.0
+    assert s["PA"] == 5000.0
+    assert s["IP"] == 1100.0
+    exp_ops = (3000.0 * 0.720 + 2000.0 * 0.780) / 5000.0
+    assert abs(s["OPS"] - exp_ops) < 1e-9, f"OPS blend wrong: {s['OPS']} vs {exp_ops}"
+    exp_era = (600.0 * 3.50 + 500.0 * 3.20) / 1100.0
+    assert abs(s["ERA"] - exp_era) < 1e-9, f"ERA blend wrong: {s['ERA']} vs {exp_era}"
+
+
+def test_blend_zero_banked_is_identity():
+    """Zero banked totals (no games played) → season == rest-of-season."""
+    from optimizer.lineup_solver import blend_season_totals
+
+    zero = {
+        "R": 0.0,
+        "HR": 0.0,
+        "RBI": 0.0,
+        "SB": 0.0,
+        "W": 0.0,
+        "SV": 0.0,
+        "K": 0.0,
+        "OPS": 0.0,
+        "ERA": 0.0,
+        "WHIP": 0.0,
+        "PA": 0.0,
+        "IP": 0.0,
+    }
+    ros = {
+        "R": 300.0,
+        "HR": 80.0,
+        "RBI": 300.0,
+        "SB": 40.0,
+        "W": 35.0,
+        "SV": 18.0,
+        "K": 500.0,
+        "OPS": 0.780,
+        "ERA": 3.20,
+        "WHIP": 1.15,
+        "PA": 2000.0,
+        "IP": 500.0,
+    }
+    s = blend_season_totals(zero, ros)
+    for cat in ("R", "HR", "OPS", "ERA", "WHIP", "PA", "IP"):
+        assert abs(s[cat] - ros[cat]) < 1e-9, (
+            f"zero-banked blend changed {cat}: {s[cat]} vs {ros[cat]}"
+        )
+
+
+def test_sigma_sqrt_f_scaling_and_f1_regression():
+    """σ scales as √f: counting ÷√f, ratio ×√f; f=1 reproduces legacy."""
+    my_totals, opponent_totals = _synthetic_totals()
+
+    legacy = estimate_projection_uncertainty(my_totals, opponent_totals)
+    f1 = estimate_projection_uncertainty(my_totals, opponent_totals, 1.0)
+    quarter = estimate_projection_uncertainty(my_totals, opponent_totals, 0.25)
+
+    for cat in legacy:
+        assert abs(legacy[cat] - f1[cat]) < 1e-9, (
+            f"f=1 must reproduce legacy σ for {cat}: {f1[cat]} vs {legacy[cat]}"
+        )
+
+    # Counting (HR): 1/√0.25 = 2.0 → doubled.
+    assert abs(quarter["HR"] - legacy["HR"] * 2.0) < 1e-6, (
+        f"counting σ should scale by 1/√f: {quarter['HR']} vs {legacy['HR'] * 2}"
+    )
+    # Ratio (OPS): √0.25 = 0.5 → halved.
+    assert abs(quarter["OPS"] - legacy["OPS"] * 0.5) < 1e-9, (
+        f"ratio σ should scale by √f: {quarter['OPS']} vs {legacy['OPS'] * 0.5}"
+    )
+
+
+def test_banked_deficit_lowers_beat_probability():
+    """A banked category deficit must reduce the modeled beat probability."""
+    from optimizer.lineup_solver import blend_season_totals
+
+    sigmas = {
+        "R": 50.0,
+        "HR": 13.0,
+        "RBI": 50.0,
+        "SB": 15.0,
+        "OPS": 0.012,
+        "W": 10.0,
+        "SV": 9.0,
+        "K": 72.0,
+        "ERA": 0.30,
+        "WHIP": 0.05,
+    }
+    ros = {
+        "R": 300.0,
+        "HR": 140.0,
+        "RBI": 300.0,
+        "SB": 40.0,
+        "W": 35.0,
+        "SV": 18.0,
+        "K": 500.0,
+        "OPS": 0.770,
+        "ERA": 3.20,
+        "WHIP": 1.15,
+        "PA": 2400.0,
+        "IP": 500.0,
+    }
+    my_banked = {
+        "R": 350.0,
+        "HR": 100.0,
+        "RBI": 350.0,
+        "SB": 45.0,
+        "W": 38.0,
+        "SV": 20.0,
+        "K": 560.0,
+        "OPS": 0.760,
+        "ERA": 3.30,
+        "WHIP": 1.18,
+        "PA": 2800.0,
+        "IP": 560.0,
+    }
+    # Opponent identical except 20 more banked HR.
+    opp_banked = dict(my_banked)
+    opp_banked["HR"] = my_banked["HR"] + 20.0
+
+    my_season = blend_season_totals(my_banked, ros)
+    opp_season = blend_season_totals(opp_banked, ros)
+
+    _, diag = compute_win_probability(my_season, {1: opp_season}, sigmas)
+    hr_beat = diag["beat_probs"]["HR"][1]
+    assert hr_beat < 0.5, (
+        f"trailing by 20 banked HR (equal ros) must give beat prob < 0.5, "
+        f"got {hr_beat:.3f}"
+    )
+
+    # Without banked (ros-only, equal): beat prob is exactly 0.5.
+    _, diag0 = compute_win_probability(ros, {1: ros}, sigmas)
+    assert abs(diag0["beat_probs"]["HR"][1] - 0.5) < 1e-9
+
+
+def test_standings_to_banked_rejects_garbage():
+    """Out-of-range rate values (mis-parse) → None (safe fallback)."""
+    import pandas as pd
+
+    from optimizer.banked import standings_to_banked_totals
+
+    good = pd.DataFrame(
+        [
+            {
+                "team_name": "A",
+                "r": 400,
+                "hr": 100,
+                "rbi": 380,
+                "sb": 50,
+                "ops": 0.760,
+                "w": 40,
+                "sv": 20,
+                "k": 600,
+                "era": 3.5,
+                "whip": 1.2,
+            },
+            {
+                "team_name": "B",
+                "r": 420,
+                "hr": 110,
+                "rbi": 400,
+                "sb": 40,
+                "ops": 0.740,
+                "w": 42,
+                "sv": 18,
+                "k": 620,
+                "era": 3.7,
+                "whip": 1.25,
+            },
+        ]
+    )
+    out = standings_to_banked_totals(good)
+    assert out is not None and "A" in out and out["A"]["HR"] == 100.0
+
+    # OPS of 7.0 means the parser grabbed roto points, not OPS → reject.
+    bad = good.copy()
+    bad.loc[0, "ops"] = 7.0
+    assert standings_to_banked_totals(bad) is None
+
+
+# ============================================================================
+# Injury-aware protection (the "only healthy catcher" bug)
+# ============================================================================
+
+
+def test_critical_slots_injury_aware():
+    """Sole STARTABLE catcher is protected even if an IL catcher remains."""
+    from optimizer.swap_evaluator import compute_critical_slots, find_protected_players
+
+    rows = [
+        {
+            **_make_hitter(
+                "HealthyC-H",
+                pa=300,
+                r=30,
+                hr=8,
+                rbi=30,
+                sb=2,
+                ops=0.700,
+                owner="The Big Dumpers",
+                position="C",
+                roster_status="active",
+            ),
+            "injury_status": None,
+        },
+        {
+            **_make_hitter(
+                "InjuredC-H",
+                pa=350,
+                r=45,
+                hr=15,
+                rbi=45,
+                sb=1,
+                ops=0.800,
+                owner="The Big Dumpers",
+                position="C",
+                roster_status="IR",
+            ),
+            "injury_status": "IL",
+        },
+        {
+            **_make_hitter(
+                "OF1-H",
+                pa=500,
+                r=70,
+                hr=20,
+                rbi=70,
+                sb=10,
+                ops=0.780,
+                owner="The Big Dumpers",
+                position="OF",
+                roster_status="active",
+            ),
+            "injury_status": None,
+        },
+        {
+            **_make_hitter(
+                "OF2-H",
+                pa=500,
+                r=70,
+                hr=20,
+                rbi=70,
+                sb=10,
+                ops=0.780,
+                owner="The Big Dumpers",
+                position="OF",
+                roster_status="active",
+            ),
+            "injury_status": None,
+        },
+    ]
+    players = pd.DataFrame(rows)
+    roster = {"HealthyC-H", "InjuredC-H", "OF1-H", "OF2-H"}
+
+    critical = compute_critical_slots(roster, players)
+    assert "HealthyC-H" in critical and "C" in critical["HealthyC-H"], (
+        f"Sole startable catcher must be critical for C; got {critical}"
+    )
+    assert "InjuredC-H" not in critical, (
+        "An IL player can't start, so dropping them never breaks the lineup — "
+        f"they must not be protected. Got {critical}"
+    )
+    protected = find_protected_players(roster, players)
+    assert "HealthyC-H" in protected
+
+
+def test_validate_transaction_blocks_dropping_only_startable_catcher():
+    """Dropping the only healthy catcher must fail slot feasibility."""
+    from optimizer.swap_evaluator import validate_transaction
+
+    # Roster with exactly enough startable coverage everywhere; the only
+    # healthy catcher is HealthyC. A second catcher exists but is on IL.
+    rows = []
+    rows.append(
+        {
+            **_make_hitter(
+                "HealthyC-H",
+                pa=300,
+                r=30,
+                hr=8,
+                rbi=30,
+                sb=2,
+                ops=0.700,
+                owner="The Big Dumpers",
+                position="C",
+                roster_status="active",
+            ),
+            "injury_status": None,
+        }
+    )
+    rows.append(
+        {
+            **_make_hitter(
+                "InjuredC-H",
+                pa=350,
+                r=45,
+                hr=15,
+                rbi=45,
+                sb=1,
+                ops=0.800,
+                owner="The Big Dumpers",
+                position="C",
+                roster_status="IR",
+            ),
+            "injury_status": "IL",
+        }
+    )
+    for i, pos in enumerate(
+        [
+            "1B",
+            "2B",
+            "SS",
+            "3B",
+            "OF",
+            "OF",
+            "OF",
+            "OF",
+            "OF",
+            "1B",
+            "2B",
+            "SS",
+            "3B",
+            "OF",
+        ]
+    ):
+        rows.append(
+            {
+                **_make_hitter(
+                    f"H{i}-H",
+                    pa=450,
+                    r=60,
+                    hr=15,
+                    rbi=60,
+                    sb=8,
+                    ops=0.760,
+                    owner="The Big Dumpers",
+                    position=pos,
+                    roster_status="active",
+                ),
+                "injury_status": None,
+            }
+        )
+    for i in range(8):
+        rows.append(
+            {
+                **_make_pitcher(
+                    f"SP{i}-P",
+                    ip=120,
+                    w=8,
+                    sv=0,
+                    k=120,
+                    era=3.8,
+                    whip=1.2,
+                    owner="The Big Dumpers",
+                    position="SP",
+                    roster_status="active",
+                ),
+                "injury_status": None,
+            }
+        )
+    for i in range(4):
+        rows.append(
+            {
+                **_make_pitcher(
+                    f"RP{i}-P",
+                    ip=50,
+                    w=3,
+                    sv=10,
+                    k=55,
+                    era=3.2,
+                    whip=1.1,
+                    owner="The Big Dumpers",
+                    position="RP",
+                    roster_status="active",
+                ),
+                "injury_status": None,
+            }
+        )
+    rows.append(
+        {
+            **_make_hitter(
+                "FA_OF-H", pa=400, r=55, hr=18, rbi=55, sb=6, ops=0.790, position="OF"
+            ),
+            "injury_status": None,
+        }
+    )
+    rows.append(
+        {
+            **_make_hitter(
+                "FA_C-H", pa=380, r=40, hr=12, rbi=42, sb=3, ops=0.740, position="C"
+            ),
+            "injury_status": None,
+        }
+    )
+    players = pd.DataFrame(rows)
+    roster = set(players[players["owner"] == "The Big Dumpers"]["Name"])
+
+    # Drop the only startable catcher for an OF: must be invalid.
+    bad = validate_transaction({"HealthyC-H"}, {"FA_OF-H"}, roster, players)
+    assert not bad["valid"], (
+        "Dropping the only startable catcher for an OF must be rejected "
+        f"(IL catcher can't fill C). Errors: {bad['errors']}"
+    )
+    assert any("C slot" in e for e in bad["errors"]), bad["errors"]
+
+    # Drop the catcher FOR A BETTER CATCHER: must be valid.
+    good = validate_transaction({"HealthyC-H"}, {"FA_C-H"}, roster, players)
+    assert good["valid"], (
+        f"Catcher-for-catcher swap must be allowed. Errors: {good['errors']}"
+    )
+
+
+# ============================================================================
+# Monte Carlo standings simulation
+# ============================================================================
+
+
+def test_simulate_standings_consistent_with_ew():
+    """E[my standing points] from simulation must equal 10 + EW (2-opp league: 20·? no — scaled)."""
+    from optimizer.win_model import simulate_standings
+
+    my_totals, opponent_totals = _synthetic_totals()
+    sigmas = estimate_projection_uncertainty(my_totals, opponent_totals)
+    ew, _ = compute_win_probability(my_totals, opponent_totals, sigmas)
+
+    sim = simulate_standings(my_totals, opponent_totals, sigmas, n_sims=60_000, seed=1)
+
+    # With 2 opponents (3 teams) and 10 categories, expected points = 10 + EW
+    # (points per category = 1 + #beaten). Monte Carlo noise ~ 0.05.
+    expected = 10 + ew
+    got = sim["expected_points"][0]
+    assert abs(got - expected) < 0.15, (
+        f"Simulated expected points {got:.2f} should match analytic "
+        f"10 + EW = {expected:.2f}. The distributions are identical by "
+        f"construction; a gap means a points/ranking bug."
+    )
+    # Probabilities are well-formed and sum to 1 across teams.
+    assert abs(sum(sim["p_win"].values()) - 1.0) < 1e-9
+    assert all(0.0 <= v <= 1.0 for v in sim["p_top2"].values())
+
+
+# ============================================================================
+# Lineup stability: untouched player-type half held fixed in swaps
+# ============================================================================
+
+
+def _full_roster_players():
+    """A valid 28-man roster (16 H + 12 P) plus a couple of FAs, with MEW."""
+    rows = []
+    hpos = ["C", "1B", "2B", "SS", "3B", "OF", "OF", "OF", "OF", "OF",
+            "1B", "2B", "SS", "3B", "OF", "C"]
+    for i, pos in enumerate(hpos):
+        rows.append({**_make_hitter(f"H{i}-H", pa=400 + i, r=55 + i, hr=12 + (i % 7),
+                                    rbi=55 + i, sb=4 + (i % 9), ops=0.700 + 0.005 * (i % 6),
+                                    owner="The Big Dumpers", position=pos,
+                                    roster_status="active"), "injury_status": None})
+    for i in range(8):
+        rows.append({**_make_pitcher(f"SP{i}-P", ip=110 + 3 * i, w=7 + (i % 5), sv=0,
+                                     k=110 + 4 * i, era=3.5 + 0.1 * (i % 6),
+                                     whip=1.10 + 0.02 * (i % 5), owner="The Big Dumpers",
+                                     position="SP", roster_status="active"),
+                     "injury_status": None})
+    for i in range(4):
+        rows.append({**_make_pitcher(f"RP{i}-P", ip=45 + i, w=2 + i, sv=8 + 2 * i,
+                                     k=50 + i, era=3.0 + 0.1 * i, whip=1.05 + 0.02 * i,
+                                     owner="The Big Dumpers", position="RP",
+                                     roster_status="active"), "injury_status": None})
+    rows.append({**_make_hitter("FA_OF-H", pa=420, r=62, hr=20, rbi=60, sb=18, ops=0.760,
+                                position="OF"), "injury_status": None})
+    rows.append({**_make_pitcher("FA_SP-P", ip=140, w=11, sv=0, k=160, era=3.2,
+                                 whip=1.05, position="SP"), "injury_status": None})
+    players = pd.DataFrame(rows)
+    my_totals, opp = _synthetic_totals()
+    sig = estimate_projection_uncertainty(my_totals, opp)
+    grad = compute_ew_gradient(my_totals, opp, sig)
+    players = add_mew(players, my_totals, grad)
+    return players, opp, sig
+
+
+def test_hitter_swap_leaves_pitching_totals_unchanged():
+    """A hitter-for-hitter swap must not change any pitching total."""
+    from optimizer.lineup_solver import compute_totals_for_starters
+    from optimizer.swap_evaluator import compute_exact_msv
+    from optimizer.win_model import compute_win_probability
+
+    players, opp, sig = _full_roster_players()
+    roster = set(players[players["owner"] == "The Big Dumpers"]["Name"])
+    base_lineup = solve_lineup(roster, players, "MEW")
+    base_totals = compute_totals_for_starters(set(base_lineup.keys()), players)
+    cur_ew, _ = compute_win_probability(base_totals, opp, sig)
+
+    res = compute_exact_msv({"H5-H"}, {"FA_OF-H"}, roster, players, opp, sig,
+                            cur_ew, baseline_lineup=base_lineup)
+    for cat in ("W", "SV", "K", "ERA", "WHIP"):
+        assert abs(res["new_totals"][cat] - base_totals[cat]) < 1e-9, (
+            f"Hitter swap changed pitching {cat}: "
+            f"{base_totals[cat]} → {res['new_totals'][cat]}"
+        )
+
+
+def test_solve_lineup_half_is_separable():
+    """Solving only HITTING_SLOTS yields exactly the hitter half of a full solve."""
+    from optimizer.config import HITTING_SLOTS
+
+    players, _, _ = _full_roster_players()
+    roster = set(players[players["owner"] == "The Big Dumpers"]["Name"])
+    full = solve_lineup(roster, players, "MEW")
+    full_h = {n: s for n, s in full.items() if s in HITTING_SLOTS}
+    half = solve_lineup(roster, players, "MEW", slots=HITTING_SLOTS)
+    assert set(half.keys()) == set(full_h.keys()), (
+        f"Hitter-half solve differs from full solve's hitter half:\n"
+        f"  half:  {sorted(half.keys())}\n  full:  {sorted(full_h.keys())}"
+    )
+
+
+def test_validate_balanced_swap_no_size_warning():
+    """A 1-for-1 swap on a roster that includes an IR player must not warn on size."""
+    from optimizer.swap_evaluator import validate_transaction
+
+    players, _, _ = _full_roster_players()
+    # Put one player on IR so the working roster exceeds the active-28 constant.
+    players.loc[players["Name"] == "H15-H", "roster_status"] = "IR"
+    roster = set(players[players["owner"] == "The Big Dumpers"]["Name"])
+    res = validate_transaction({"H5-H"}, {"FA_OF-H"}, roster, players)
+    assert not any("size changes" in w for w in res["warnings"]), (
+        f"Balanced 1-for-1 swap should not trigger a roster-size warning; "
+        f"got {res['warnings']}"
+    )

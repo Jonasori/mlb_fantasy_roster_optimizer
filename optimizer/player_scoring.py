@@ -9,6 +9,8 @@ import numpy as np
 import pandas as pd
 
 from .config import (
+    FAME_WAR_SLOPE,
+    FAME_WAR_THRESHOLD,
     MIN_STAT_STANDARD_DEVIATION,
 )
 
@@ -78,16 +80,19 @@ def add_fantasy_value(players: pd.DataFrame) -> pd.DataFrame:
 # PERCEIVED VALUE (PV)
 # ============================================================================
 
-# WAR threshold above which a player gets a recognition premium.
-# 3.0 WAR ≈ "above-average starter" — the floor for name recognition in trades.
-_FAME_WAR_THRESHOLD: float = 3.0
-
-# PV points per WAR above the threshold.  Calibrated so that elite SPs
-# (5–6 WAR, FV ≈ 20) end up with PV above good hitters (4 WAR, FV ≈ 23).
-# Without this correction FV systematically undervalues SPs because the
-# z-score pools all pitchers (closers dominate the SV category, dragging
-# SP z-score totals below hitter totals for the same real quality).
-_FAME_WAR_SLOPE: float = 3.0
+# WAR threshold above which a player gets a recognition premium, and PV points
+# per WAR above it. Sourced from config.json["perceived_value"] so the trade
+# perception model can be tuned without code changes (defaults 3.0 / 3.0).
+#
+# The premium corrects FV's systematic undervaluation of starting pitchers:
+# FV is a context-free category z-score sum, and pooling all pitchers for the
+# SV category drags SP totals down (SP earn ~0 saves). This does NOT affect
+# lineup or MEW decisions (lineups fill disjoint SP/RP slots; value uses MEW),
+# but it does suppress how the trade market is modeled to perceive SPs — which
+# is exactly what this premium offsets. Tune fame_war_threshold/slope in
+# config.json to adjust the SP correction and overall name-recognition weight.
+_FAME_WAR_THRESHOLD: float = FAME_WAR_THRESHOLD
+_FAME_WAR_SLOPE: float = FAME_WAR_SLOPE
 
 
 def add_perceived_value(
