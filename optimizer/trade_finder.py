@@ -26,7 +26,6 @@ from .lineup_solver import (
     solve_lineup,
 )
 from .player_scoring import add_mew
-from .players import get_eligible_slots
 from .swap_evaluator import _solve_lineup_holding_half, add_bench_value
 from .win_model import (
     compute_ew_gradient,
@@ -148,6 +147,7 @@ def evaluate_trade(
                 "value": 0.0,
                 "pv_balance": 0.0,
                 "pv_feasible": False,
+                "opp_pv_loss_pct": 0.0,
                 "new_totals": {},
                 "new_lineup": {},
                 "auto_fa_add": None,
@@ -178,6 +178,7 @@ def evaluate_trade(
                 "value": 0.0,
                 "pv_balance": 0.0,
                 "pv_feasible": False,
+                "opp_pv_loss_pct": 0.0,
                 "new_totals": {},
                 "new_lineup": {},
                 "auto_fa_add": None,

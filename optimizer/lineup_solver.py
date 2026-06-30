@@ -227,6 +227,18 @@ def compute_totals_for_starters(
         f"{sorted(missing)}"
     )
 
+    # Fail fast on NaN: ratio stats are PA/IP-weighted averages computed with
+    # pandas .sum() (skipna=True), so a NaN OPS/ERA/WHIP would silently drop
+    # from the numerator while its PA/IP stayed in the denominator — biasing the
+    # team total with no error. Counting stats would silently undercount too.
+    _stat_cols = ["PA", "IP", "R", "HR", "RBI", "SB", "OPS", "W", "SV", "K", "ERA", "WHIP"]
+    _nan_mask = team_df[_stat_cols].isna().any(axis=1)
+    assert not _nan_mask.any(), (
+        f"compute_totals_for_starters: NaN in scoring stats for starter(s): "
+        f"{sorted(team_df.loc[_nan_mask, 'Name'])}. "
+        f"Silver table must fill all scoring stats (0 for the opposite type)."
+    )
+
     hitters = team_df[team_df["player_type"] == "hitter"]
     pitchers = team_df[team_df["player_type"] == "pitcher"]
 

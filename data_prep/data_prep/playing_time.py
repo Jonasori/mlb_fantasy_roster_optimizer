@@ -141,60 +141,6 @@ PITCHER_COUNTING_COLS = [
 # =============================================================================
 
 
-def _compute_historical_ratio(actual_current, actual_prior, projected):
-    """Ratio of actual playing time to projected, capped at HISTORICAL_RATIO_CAP.
-
-    Uses the player's own projected PA/IP as the denominator so that
-    part-time players aren't double-penalized (once by a low projection,
-    again by comparison to a full-season baseline).
-
-    Allows modest upward adjustments (up to HISTORICAL_RATIO_CAP) for
-    players whose recent playing time exceeds the projection.
-    """
-    if projected <= 0:
-        return 1.0
-
-    has_current = actual_current is not None and not pd.isna(actual_current)
-    has_prior = actual_prior is not None and not pd.isna(actual_prior)
-
-    if has_current and has_prior:
-        avg = (actual_current + actual_prior) / 2
-    elif has_current:
-        avg = actual_current
-    elif has_prior:
-        avg = actual_prior
-    else:
-        return 1.0  # Trust projection for rookies
-
-    return min(HISTORICAL_RATIO_CAP, avg / projected)
-
-
-def _compute_age_factor(age, is_pitcher):
-    """Age-based reduction, 5% per year over threshold."""
-    if age is None or pd.isna(age):
-        return 1.0
-
-    threshold = AGE_THRESHOLD_PITCHER if is_pitcher else AGE_THRESHOLD_HITTER
-    if age < threshold:
-        return 1.0
-
-    years_over = age - threshold + 1
-    return max(0.5, 1.0 - AGE_PENALTY_PER_YEAR * years_over)
-
-
-def _compute_talent_factor(war, war_25th):
-    """15% penalty for bottom quartile."""
-    if pd.isna(war) or pd.isna(war_25th):
-        return 1.0
-    return TALENT_PENALTY if war < war_25th else 1.0
-
-
-def _blend(projected, historical_ratio, age_factor, talent_factor):
-    """Apply factors and blend with original projection."""
-    adjusted = projected * historical_ratio * age_factor * talent_factor
-    return PROJECTION_WEIGHT * projected + ADJUSTMENT_WEIGHT * adjusted
-
-
 # =============================================================================
 # DATA LOADING
 # =============================================================================

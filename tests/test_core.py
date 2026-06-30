@@ -3,12 +3,10 @@ Minimal test suite per AGENTS.md: no classes, no fixtures, no mocking.
 Each test is self-contained with inline test data.
 """
 
-import numpy as np
 import pandas as pd
 
 from optimizer.lineup_solver import compute_totals_for_starters
 from optimizer.player_scoring import add_fantasy_value, add_mew
-from optimizer.players import get_eligible_slots
 from optimizer.swap_evaluator import add_bench_value, compute_exact_msv
 from optimizer.win_model import (
     compute_ew_gradient,
@@ -1415,7 +1413,7 @@ def _full_roster_players():
 
 def test_hitter_swap_leaves_pitching_totals_unchanged():
     """A hitter-for-hitter swap must not change any pitching total."""
-    from optimizer.lineup_solver import compute_totals_for_starters
+    from optimizer.lineup_solver import compute_totals_for_starters, solve_lineup
     from optimizer.swap_evaluator import compute_exact_msv
     from optimizer.win_model import compute_win_probability
 
@@ -1437,6 +1435,7 @@ def test_hitter_swap_leaves_pitching_totals_unchanged():
 def test_solve_lineup_half_is_separable():
     """Solving only HITTING_SLOTS yields exactly the hitter half of a full solve."""
     from optimizer.config import HITTING_SLOTS
+    from optimizer.lineup_solver import solve_lineup
 
     players, _, _ = _full_roster_players()
     roster = set(players[players["owner"] == "The Big Dumpers"]["Name"])

@@ -671,7 +671,7 @@ def fetch_all_fantrax_data(session: requests.Session) -> dict:
             f"{team} has names without suffix"
         )
 
-    print(f"\n=== Fantrax Data Summary ===")
+    print("\n=== Fantrax Data Summary ===")
     print(f"Rosters: {len(rosters)} teams, {total_players} total players")
     print(f"Player pool: {len(player_pool)} players")
     print(f"Standings: {len(standings)} teams")

@@ -34,7 +34,6 @@ from .players import get_startable_slots
 from .win_model import (
     compute_ew_gradient,
     compute_win_probability,
-    estimate_projection_uncertainty,
 )
 
 # ============================================================================
@@ -628,7 +627,6 @@ def screen_swaps(
     fa_names = set(players[fa_mask]["Name"])
 
     mew_lookup = players.set_index("Name")["MEW"].to_dict()
-    bv_lookup = players.set_index("Name")["BV"].to_dict()
     pos_lookup = players.set_index("Name")["Position"].to_dict()
     type_lookup = players.set_index("Name")["player_type"].to_dict()
     inj_lookup = (
@@ -671,8 +669,6 @@ def screen_swaps(
         else:
             p += 1
         return MIN_HITTERS <= h <= MAX_HITTERS and MIN_PITCHERS <= p <= MAX_PITCHERS
-
-    current_total_bv = sum(bv_lookup.get(n, 0.0) for n in my_bench)
 
     # 2a. Precompute per-slot starter info for lineup-aware MSV
     # For each slot, the weakest starter (lowest MEW) — the one an FA would displace

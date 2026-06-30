@@ -5,7 +5,6 @@ All functions are DataFrame enrichment: players in → players with new column(s
 Depends on config.
 """
 
-import numpy as np
 import pandas as pd
 
 from .config import (
@@ -229,6 +228,19 @@ def add_mew(
         f"my_totals must come from compute_totals_for_starters (includes IP)."
     )
 
+    # Fail fast on NaN stats: the unified MEW formula relies on the silver-table
+    # invariant that every scoring stat is a real number (0 for the opposite
+    # player type, never NaN). A NaN here silently poisons the player's MEW and
+    # would propagate into the lineup objective with no error otherwise.
+    _stat_cols = ["PA", "IP", "R", "HR", "RBI", "SB", "OPS", "W", "SV", "K", "ERA", "WHIP"]
+    _nan_mask = players[_stat_cols].isna().any(axis=1)
+    assert not _nan_mask.any(), (
+        f"add_mew: NaN found in scoring stats for {int(_nan_mask.sum())} player(s): "
+        f"{sorted(players.loc[_nan_mask, 'Name'])[:10]}. "
+        f"The silver table must fill all 12 scoring stats (0 for the opposite "
+        f"player type). Fix data_prep ingestion before scoring."
+    )
+
     mew = pd.Series(0.0, index=players.index)
 
     for cat in ("R", "HR", "RBI", "SB", "W", "SV", "K"):
@@ -239,9 +251,4 @@ def add_mew(
     mew += gradient["WHIP"] * players["IP"] * (players["WHIP"] - my_whip) / total_ip
 
     players["MEW"] = mew
-
-    # print(
-    #     f"MEW computed for {len(players)} players "
-    #     f"(range: {mew.min():.3f} to {mew.max():.3f})"
-    # )
     return players
