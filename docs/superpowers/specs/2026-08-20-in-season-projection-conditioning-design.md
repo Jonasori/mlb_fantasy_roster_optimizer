@@ -334,8 +334,33 @@ Per-player, keyed on `MLBAMID`, **decomposed to skills, never composites**:
 
 Source: MLB StatsAPI `people` endpoint, `hydrate=stats(group=[hitting,pitching],type=[season])`,
 batched 100 ids per request — the pattern already proven in `notebook.py::game_logs_cell`.
-**Measured cost: 7 seconds for two full seasons of 1,325 players.** Game logs (`type=[gameLog]`)
-use the same call shape and are needed for Part 0's date splits.
+**Measured cost: 7 seconds for two full seasons of 1,325 players.**
+
+**For Part 0's date splits, do not use game logs — use `byDateRange`.** It is a league-wide
+leaderboard, not a per-player lookup, so an arbitrary window costs **2 requests (one per group),
+under 5 seconds**, independent of player count:
+
+```
+GET https://statsapi.mlb.com/api/v1/stats
+  ?stats=byDateRange&group=hitting|pitching&season=YYYY&gameType=R
+  &sportId=1&playerPool=ALL&limit=3000
+  &startDate=YYYY-MM-DD&endDate=YYYY-MM-DD
+```
+
+Verified 2021–2025, both groups, both sides of a split. One row per player, aggregated across teams
+for mid-season trades. `stats=byDateRangeAdvanced` adds `iso`, `babip`,
+`strikeoutsPerPlateAppearance`, `swingAndMisses`, `qualityStarts` under the same params.
+
+An end-to-end split has already been proven at D=2023-06-15: 487 players with
+(preseason projection, stats-through-D, actual-after-D) assembled successfully.
+
+**Parsing traps — all verified, all silent failures:**
+
+- **`playerPool=ALL` is mandatory.** Omit it and you silently get 140 qualified players.
+- **`inningsPitched` is `"76.1"` meaning 76⅓, not 76.1.** Use the `outs` field and divide by 3.
+- **Rate stats return as strings** (`".319"`) with `".---"` as the missing sentinel.
+- Hitter counts drop from 2022 as the universal DH removed pitchers from the batting pool. This is
+  correct, not truncation.
 
 This part is independently useful: the dashboard's YTD table is currently display-only and
 disconnected from valuation.
@@ -416,8 +441,24 @@ BABIP — not from following WHIP itself.
 
 ### 3.5 Explicitly out of scope
 
-- **Changepoint detection, Statcast, bat tracking.** Right third move, not the first: unreplicated,
-  and never demonstrated to improve a RoS forecast (§2.7).
+- **Changepoint detection, Statcast, bat tracking.** Deferred on **evidence of value, not cost of
+  access** — the Glazer changepoint result is unreplicated and has never been shown to improve a RoS
+  forecast (§2.7). Access is in fact cheap and verified, so this is a small step later, not a new
+  project. Recorded so it need not be rediscovered:
+
+  - No auth, no rate limits observed, no `pybaseball` needed (it wraps plain CSV URLs; it does
+    install cleanly against our pins if wanted).
+  - Season leaderboards: `baseballsavant.mlb.com/leaderboard/custom?year=Y&type=batter&min=1&selections=...&csv=true`
+    covers barrel%, EV, LA, hard-hit%, K%, BB%, sprint speed, and for pitchers xERA, fastball
+    velocity, whiff%. Plus `/leaderboard/expected_statistics` (xwOBA), `/leaderboard/bat-tracking`,
+    `/leaderboard/pitch-arsenal-stats`. **All types × 12 years ≈ 50 requests, under a minute.**
+  - **TRAP: the leaderboard endpoints silently ignore `start_date`/`end_date`** and return
+    full-season numbers regardless. A date-filtered leaderboard call does not error — it lies.
+    Game-level work must go through `/statcast_search/csv` and roll up by `game_pk`.
+  - **TRAP: `/statcast_search/csv` has a hard 25,000-row cap** applied silently — a 7-day
+    league-wide pull returned exactly 25000 rows, truncated. Pull day by day.
+  - Batted-ball tracking begins **2015**; pitch data goes back to 2008 but there is no xwOBA before
+    2015. Full pitch-level history 2021–2026 ≈ 36 minutes / 3.0 GB.
 - **A greenfield projection system.** Considered and rejected on evidence: ATC is pool-wide
   unbiased with R²=0.60 explicable residual structure. We are correcting a good estimator, not
   replacing it.
