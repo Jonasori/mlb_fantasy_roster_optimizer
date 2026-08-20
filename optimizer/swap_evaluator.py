@@ -6,8 +6,6 @@ A "swap" is the universal operation: drop N players, add N players.
 """
 
 import pandas as pd
-import pulp
-from pulp import LpVariable, lpSum
 from tqdm.auto import tqdm
 
 from .config import (
@@ -17,15 +15,12 @@ from .config import (
     MIN_HITTERS,
     MIN_PITCHERS,
     MY_TEAM_NAME,
-    N_STARTER_SLOTS,
     PITCHING_SLOTS,
-    ROSTER_SIZE,
 )
 from .league_state import compute_league_state
 from .lineup_solver import (
     assign_optimal_slots,
     compute_totals_for_starters,
-    get_solver,
     maybe_blend,
     solve_lineup,
 )
@@ -571,49 +566,46 @@ def find_protected_players(
 def screen_swaps(
     players: pd.DataFrame,
     my_roster_names: set[str],
-    my_lineup: dict[str, str],
     top_k: int = DEFAULT_SCREEN_TOP_K,
 ) -> pd.DataFrame:
-    """Screen all possible 1-for-1 FA swaps, ranked by approximate Value.
+    """Screen 1-for-1 FA swaps: top-MEW free agents vs. your weakest legal drop.
 
-    For each (FA, roster_player) pair, compute a **lineup-aware** MSV_approx
-    plus ΔBV_approx. Approximate Value = MSV_approx + ΔBV_approx.
+    The screen is deliberately dumb. Its only job is to hand `evaluate_top_k` a
+    short list of plausible moves — exact ΔEW and ΔBV are computed there — so
+    free agents are simply ranked by raw MEW and each is paired with the
+    lowest-MEW roster player it is *legal* to drop for them.
 
-    Lineup-aware MSV_approx (MATHEMATICAL_FRAMEWORK §4):
-        The EW change from a swap depends on who enters and leaves the
-        *starting lineup*, not who enters and leaves the *roster*.
+    Legality is not an approximation and is enforced here:
 
-        - Bench drop, FA starts (displacing starter S):
-            MSV_approx = MEW(FA) − MEW(S)
-        - Bench drop, FA doesn't start:
-            MSV_approx = 0  (value comes from ΔBV only)
-        - Starter drop, FA eligible for vacated slot:
-            MSV_approx = MEW(FA) − MEW(dropped_starter)
-        - Starter drop, FA takes different slot (cascade):
-            Approximate conservatively; exact evaluation handles cascades.
+    - Conditional drop protection: the incoming FA must cover every slot for
+      which the dropped player is the last startable cover (see
+      `compute_critical_slots`) — your only catcher may be replaced by a better
+      catcher, but not by an outfielder.
+    - League active-roster composition bounds (hitters and pitchers).
+    - IL-stash protection: an IL player's ROS projection is already their
+      post-return value while the lineup model scores them zero for today, so
+      they may only be dropped for a *higher*-MEW free agent.
 
     Args:
-        my_lineup: state['my_lineup'] from compute_league_state.
-        top_k: Number of top candidates to return.
+        top_k: Maximum number of candidate swaps to return.
 
-    Requires columns: Name, owner, optimal_slot, MEW, Position, player_type.
+    Requires columns: Name, owner, MEW, Position, player_type.
 
     Returns:
         DataFrame with columns: fa_name, drop_name, msv_approx,
-        delta_bv_approx, value_approx. Sorted by value_approx descending.
+        delta_bv_approx, value_approx, sorted by value_approx descending.
+        msv_approx is MEW(FA) − MEW(drop), delta_bv_approx is always 0.0
+        (exact ΔBV comes from `evaluate_top_k`), and value_approx == msv_approx
+        remains the sort key downstream code reads.
     """
     assert "MEW" in players.columns, (
         "screen_swaps: players must have MEW. Call add_mew() first."
-    )
-    assert "BV" in players.columns, (
-        "screen_swaps: players must have BV. Call add_bench_value() first."
     )
 
     # 1. Slot-coverage criticality (injury-aware). A player who is one of the
     # last startable covers for a slot may only be dropped for an FA who also
     # covers that slot — "replace your only catcher with a better catcher".
     critical = compute_critical_slots(my_roster_names, players)
-    droppable = set(my_roster_names)
 
     if critical:
         print(
@@ -621,11 +613,6 @@ def screen_swaps(
         )
 
     # 2. Precompute lookups
-    my_starters = set(my_lineup.keys())
-    my_bench = my_roster_names - my_starters
-    fa_mask = players["owner"].isna()
-    fa_names = set(players[fa_mask]["Name"])
-
     mew_lookup = players.set_index("Name")["MEW"].to_dict()
     pos_lookup = players.set_index("Name")["Position"].to_dict()
     type_lookup = players.set_index("Name")["player_type"].to_dict()
@@ -670,159 +657,21 @@ def screen_swaps(
             p += 1
         return MIN_HITTERS <= h <= MAX_HITTERS and MIN_PITCHERS <= p <= MAX_PITCHERS
 
-    # 2a. Precompute per-slot starter info for lineup-aware MSV
-    # For each slot, the weakest starter (lowest MEW) — the one an FA would displace
-    slot_to_starters: dict[str, list[tuple[str, float]]] = {}
-    for name, slot in my_lineup.items():
-        slot_to_starters.setdefault(slot, []).append((name, mew_lookup[name]))
-    for slot in slot_to_starters:
-        slot_to_starters[slot].sort(key=lambda x: x[1])
+    # 3. Screen: walk free agents from highest MEW down, pairing each with the
+    # weakest roster player it is legal to drop, until top_k pairs are found.
+    # ponytail: raw-MEW ranking ignores lineup structure, so an FA who would
+    # only sit on the bench can crowd a real upgrade out of the top_k. The
+    # league is small enough that raising top_k is the fix if that ever bites.
+    droppable = sorted(my_roster_names, key=lambda n: mew_lookup.get(n, 0.0))
+    fa_df = players[players["owner"].isna()].sort_values("MEW", ascending=False)
 
-    # 2b. Precompute per-slot best bench/FA MEW for BV approximation
-    bench_slot_mew: dict[str, list[tuple[str, float]]] = {}
-    fa_slot_mew: dict[str, list[tuple[str, float]]] = {}
-
-    for slot in set(my_lineup.values()):
-        bench_eligible = []
-        for name in my_bench:
-            if slot in _startable(name):
-                bench_eligible.append((name, mew_lookup.get(name, 0.0)))
-        bench_eligible.sort(key=lambda x: x[1], reverse=True)
-        bench_slot_mew[slot] = bench_eligible
-
-        fa_eligible = []
-        for name in fa_names:
-            if slot in _startable(name):
-                fa_eligible.append((name, mew_lookup.get(name, 0.0)))
-        fa_eligible.sort(key=lambda x: x[1], reverse=True)
-        fa_slot_mew[slot] = fa_eligible
-
-    def _fa_displacement(fa_mew: float, fa_eligible_slots: set[str]) -> float:
-        """How much EW does the FA gain by displacing the weakest eligible starter?
-
-        Returns max(0, FA_MEW − weakest_starter_MEW) across eligible slots.
-        Zero if the FA wouldn't start.
-        """
-        best = 0.0
-        for slot in fa_eligible_slots:
-            starters = slot_to_starters.get(slot, [])
-            if starters:
-                weakest_mew = starters[0][1]
-                disp = fa_mew - weakest_mew
-                if disp > best:
-                    best = disp
-        return best
-
-    def _lineup_aware_msv(
-        fa_name: str,
-        fa_mew: float,
-        fa_eligible_slots: set[str],
-        drop_name: str,
-        drop_mew: float,
-    ) -> float:
-        """Compute lineup-aware MSV_approx for a 1-for-1 swap.
-
-        The key insight: EW changes come from who enters/leaves the starting
-        lineup, not who enters/leaves the roster. A bench player's MEW does
-        not represent their actual EW contribution (which is 0 from the
-        starting lineup; their value is captured by BV separately).
-        """
-        drop_is_starter = drop_name in my_lineup
-
-        if not drop_is_starter:
-            # Bench drop: lineup only changes if FA displaces a current starter
-            return _fa_displacement(fa_mew, fa_eligible_slots)
-
-        # Starter drop
-        drop_slot = my_lineup[drop_name]
-
-        if drop_slot in fa_eligible_slots:
-            # FA can directly replace the dropped starter
-            return fa_mew - drop_mew
-
-        # Cascade: FA can't fill the vacated slot. A bench player fills it,
-        # and the FA may displace a different starter. Approximate as:
-        # (best bench eligible for vacated slot − dropped starter) + FA displacement
-        best_fill_mew = -float("inf")
-        for bn, bm in bench_slot_mew.get(drop_slot, []):
-            best_fill_mew = bm
-            break
-        if best_fill_mew == -float("inf"):
-            return -float("inf")
-
-        fill_cost = best_fill_mew - drop_mew
-        fa_disp = _fa_displacement(fa_mew, fa_eligible_slots)
-        return fill_cost + fa_disp
-
-    def _approx_delta_bv(drop_name: str, fa_name: str) -> float:
-        """Approximate ΔBV for a 1-for-1 swap without lineup re-solve.
-
-        Affected slots are those where the incoming FA is eligible (bench
-        insurance may improve) OR where the dropped player is eligible
-        (insurance may be lost). Slots untouched by both players contribute
-        identically before and after, so they cancel in the delta.
-        """
-        drop_is_bench = drop_name in my_bench
-        if not drop_is_bench:
-            return 0.0
-
-        fa_mew_val = mew_lookup.get(fa_name, 0.0)
-        fa_eligible_slots = _startable(fa_name)
-        drop_eligible_slots = _startable(drop_name)
-        affected_slots = fa_eligible_slots | drop_eligible_slots
-
-        delta = 0.0
-        for starter_name, slot in my_lineup.items():
-            if slot not in affected_slots:
-                continue
-            p_absent = POSITION_ABSENCE_RATES.get(slot, 0.20)
-            current_bench_list = bench_slot_mew.get(slot, [])
-            current_fa_list = fa_slot_mew.get(slot, [])
-
-            # Before the swap
-            best_b_old = current_bench_list[0][1] if current_bench_list else None
-            best_f_old = current_fa_list[0][1] if current_fa_list else 0.0
-            if best_b_old is not None:
-                delta -= p_absent * max(0.0, best_b_old - best_f_old)
-
-            # After the swap: drop leaves the bench; FA joins it (if eligible)
-            best_b_new = None
-            for bn, bm in current_bench_list:
-                if bn == drop_name:
-                    continue
-                best_b_new = bm
-                break
-            if slot in fa_eligible_slots:
-                if best_b_new is None or fa_mew_val > best_b_new:
-                    best_b_new = fa_mew_val
-
-            best_f_new = 0.0
-            for fn, fm in current_fa_list:
-                if fn == fa_name:
-                    continue
-                best_f_new = fm
-                break
-
-            if best_b_new is not None:
-                delta += p_absent * max(0.0, best_b_new - best_f_new)
-
-        return delta
-
-    # 3. Screen: for each FA, find best droppable roster player
     rows = []
-    fa_df = players[fa_mask].copy()
-
-    for _, fa_row in fa_df.iterrows():
-        fa_name = fa_row["Name"]
-        fa_mew = fa_row["MEW"]
+    for fa_name, fa_mew in zip(fa_df["Name"], fa_df["MEW"], strict=True):
+        if len(rows) >= top_k:
+            break
         fa_eligible_slots = _startable(fa_name)
 
-        best_value = -float("inf")
-        best_drop = None
-        best_msv = 0.0
-        best_dbv = 0.0
-
-        for drop_name in sorted(droppable):
+        for drop_name in droppable:
             # Conditional protection: the FA must cover every slot for which
             # the dropped player is the last startable cover.
             critical_slots = critical.get(drop_name)
@@ -841,40 +690,33 @@ def screen_swaps(
             ):
                 continue
 
-            drop_mew = mew_lookup.get(drop_name, 0.0)
-            msv_approx = _lineup_aware_msv(
-                fa_name,
-                fa_mew,
-                fa_eligible_slots,
-                drop_name,
-                drop_mew,
-            )
-            delta_bv = _approx_delta_bv(drop_name, fa_name)
-            value_approx = msv_approx + delta_bv
-
-            if value_approx > best_value:
-                best_value = value_approx
-                best_drop = drop_name
-                best_msv = msv_approx
-                best_dbv = delta_bv
-
-        if best_drop is not None:
+            msv_approx = float(fa_mew) - mew_lookup.get(drop_name, 0.0)
             rows.append(
                 {
                     "fa_name": fa_name,
-                    "drop_name": best_drop,
-                    "msv_approx": best_msv,
-                    "delta_bv_approx": best_dbv,
-                    "value_approx": best_value,
+                    "drop_name": drop_name,
+                    "msv_approx": msv_approx,
+                    "delta_bv_approx": 0.0,
+                    "value_approx": msv_approx,
                 }
             )
+            break
 
-    result = pd.DataFrame(rows)
+    result = pd.DataFrame(
+        rows,
+        columns=[
+            "fa_name",
+            "drop_name",
+            "msv_approx",
+            "delta_bv_approx",
+            "value_approx",
+        ],
+    )
     if len(result) == 0:
         print("screen_swaps: no candidates found")
         return result
 
-    result = result.sort_values("value_approx", ascending=False).head(top_k)
+    result = result.sort_values("value_approx", ascending=False)
     result = result.reset_index(drop=True)
 
     n_positive = (result["value_approx"] > 0).sum()
@@ -987,141 +829,6 @@ def evaluate_top_k(
 
 
 # ============================================================================
-# 9e. compute_ew_ceiling — Diagnostic for gap-to-optimal
-# ============================================================================
-
-
-def compute_ew_ceiling(
-    players: pd.DataFrame,
-    opponent_totals: dict[int, dict[str, float]],
-    category_sigmas: dict[str, float],
-    my_roster_names: set[str],
-    current_ew: float,
-    my_team_name: str | None = None,
-    my_banked_totals: dict[str, float] | None = None,
-) -> dict:
-    """Compute best achievable EW from full candidate pool (diagnostic).
-
-    Solves a larger MILP: pick ROSTER_SIZE players from all available
-    (my roster + FA pool) and assign N_STARTER_SLOTS to starter slots,
-    maximizing Σ MEW(starters).
-
-    After solving, compute exact EW from the ceiling roster.
-
-    Args:
-        players: Players DataFrame with MEW column.
-        opponent_totals: {opp_id: {cat: total}}.
-        category_sigmas: σ_c per category.
-        my_roster_names: Canonical 28-player roster from compute_league_state.
-        current_ew: EW of current roster (from compute_league_state).
-        my_team_name: Team name for pool filtering. Defaults to MY_TEAM_NAME.
-
-    Returns:
-        {
-            'ceiling_ew': float,
-            'ceiling_roster': set[str],
-            'ceiling_lineup': dict,
-            'gap': float,
-        }
-    """
-    if my_team_name is None:
-        my_team_name = MY_TEAM_NAME
-
-    assert "MEW" in players.columns, "compute_ew_ceiling: players must have MEW column"
-
-    # Candidate pool: my roster + FA pool
-    pool_mask = (players["owner"] == my_team_name) | players["owner"].isna()
-    pool = players[pool_mask].reset_index(drop=True)
-    n = len(pool)
-
-    print(
-        f"Ceiling MILP: {n} candidates, {ROSTER_SIZE} roster spots, "
-        f"{N_STARTER_SLOTS} starter slots"
-    )
-
-    has_injury_col = "injury_status" in pool.columns
-    eligibility = {
-        i: get_startable_slots(
-            str(pool.iloc[i]["Position"]),
-            pool.iloc[i]["injury_status"] if has_injury_col else None,
-        )
-        for i in range(n)
-    }
-
-    prob = pulp.LpProblem("Ceiling", pulp.LpMaximize)
-
-    x = {i: LpVariable(f"x_{i}", cat="Binary") for i in range(n)}
-    a: dict[tuple[int, str], LpVariable] = {}
-    for i in range(n):
-        for s in eligibility[i]:
-            a[i, s] = LpVariable(f"a_{i}_{s}", cat="Binary")
-
-    # Objective: maximize Σ MEW(starters)
-    prob += lpSum(
-        pool.iloc[i]["MEW"] * lpSum(a[i, s] for s in eligibility[i] if (i, s) in a)
-        for i in range(n)
-    )
-
-    # Roster size constraint
-    prob += lpSum(x[i] for i in range(n)) <= ROSTER_SIZE, "roster_size"
-
-    # Assignment requires roster membership
-    for i in range(n):
-        for s in eligibility[i]:
-            if (i, s) in a:
-                prob += a[i, s] <= x[i], f"roster_{i}_{s}"
-
-    # Each player at most one slot
-    for i in range(n):
-        slots_for_player = [s for s in eligibility[i] if (i, s) in a]
-        if slots_for_player:
-            prob += lpSum(a[i, s] for s in slots_for_player) <= 1, f"one_slot_{i}"
-
-    # Slot constraints: fill all slots (IS §9e says "assign 18 to starter slots")
-    for slot, count in _ALL_SLOTS.items():
-        eligible_for_slot = [i for i in range(n) if slot in eligibility[i]]
-        slots_to_fill = min(len(eligible_for_slot), count)
-        if slots_to_fill > 0:
-            prob += (
-                lpSum(a[i, slot] for i in eligible_for_slot if (i, slot) in a)
-                == slots_to_fill,
-                f"fill_{slot}",
-            )
-
-    prob.solve(get_solver())
-
-    assert prob.status == pulp.LpStatusOptimal, (
-        f"Ceiling MILP failed: {pulp.LpStatus[prob.status]}"
-    )
-
-    ceiling_roster: set[str] = set()
-    ceiling_lineup: dict[str, str] = {}
-    for i in range(n):
-        if pulp.value(x[i]) > 0.5:
-            ceiling_roster.add(pool.iloc[i]["Name"])
-        for s in eligibility[i]:
-            if (i, s) in a and pulp.value(a[i, s]) > 0.5:
-                ceiling_lineup[pool.iloc[i]["Name"]] = s
-
-    ceiling_ros = compute_totals_for_starters(set(ceiling_lineup.keys()), players)
-    ceiling_totals = maybe_blend(my_banked_totals, ceiling_ros)
-    ceiling_ew, _ = compute_win_probability(
-        ceiling_totals, opponent_totals, category_sigmas
-    )
-
-    gap = ceiling_ew - current_ew
-
-    print(f"Ceiling EW: {ceiling_ew:.2f}, current EW: {current_ew:.2f}, gap: {gap:.2f}")
-
-    return {
-        "ceiling_ew": ceiling_ew,
-        "ceiling_roster": ceiling_roster,
-        "ceiling_lineup": ceiling_lineup,
-        "gap": gap,
-    }
-
-
-# ============================================================================
 # 9f. run_greedy_optimization — The optimizer
 # ============================================================================
 
@@ -1210,12 +917,7 @@ def run_greedy_optimization(
         current_total_bv = float(players[players["Name"].isin(my_bench)]["BV"].sum())
 
         # 3. Screen
-        candidates = screen_swaps(
-            players,
-            my_roster_names,
-            state["my_lineup"],
-            top_k=top_k,
-        )
+        candidates = screen_swaps(players, my_roster_names, top_k=top_k)
 
         if len(candidates) == 0:
             print("No candidates found. Stopping.")

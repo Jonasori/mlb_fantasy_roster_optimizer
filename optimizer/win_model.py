@@ -8,7 +8,6 @@ Depends only on config.
 """
 
 import numpy as np
-import pandas as pd
 from scipy import stats
 
 from .config import (
@@ -224,86 +223,6 @@ def estimate_projection_uncertainty(
 
 
 # ============================================================================
-# CONVEXITY DIAGNOSTICS
-# ============================================================================
-
-
-def compute_category_regime(
-    my_totals: dict[str, float],
-    opponent_totals: dict[int, dict[str, float]],
-    category_sigmas: dict[str, float],
-    gradient: dict[str, float],
-) -> pd.DataFrame:
-    """Diagnose which categories are in the convex (undervalued) regime.
-
-    The EW surface has curvature: when deeply losing a category (z < -0.5),
-    the linear gradient underestimates the true marginal value of improvement.
-    This is because Φ(z) is convex for z < 0 — the steepest gains come from
-    climbing out of a deep hole.
-
-    For each category, computes a "convexity ratio" — how much the actual EW
-    gain from a typical perturbation exceeds the linear prediction. Ratio > 1
-    means the gradient undervalues improvement; ratio < 1 means it overvalues.
-
-    Returns:
-        DataFrame with columns: category, avg_z, gradient, hessian_diag,
-        convexity_ratio, regime. Sorted by convexity_ratio descending.
-    """
-    rows = []
-    for cat in ALL_CATEGORIES:
-        sigma = max(category_sigmas[cat], MIN_STAT_STANDARD_DEVIATION)
-        denom = sigma * np.sqrt(2)
-
-        zs = []
-        for opp_totals in opponent_totals.values():
-            if cat in NEGATIVE_CATEGORIES:
-                z = (opp_totals[cat] - my_totals[cat]) / denom
-            else:
-                z = (my_totals[cat] - opp_totals[cat]) / denom
-            zs.append(z)
-
-        avg_z = float(np.mean(zs))
-        hessian_diag = float(sum(-z * stats.norm.pdf(z) / denom**2 for z in zs))
-
-        # Convexity ratio: ratio of actual ΔEW / linear ΔEW for a 0.5σ perturbation
-        # (representative of a single good roster move in that category)
-        delta_stat = 0.5 * sigma
-        linear_dew = gradient[cat] * delta_stat
-        if cat in NEGATIVE_CATEGORIES:
-            delta_stat_for_ew = -delta_stat
-        else:
-            delta_stat_for_ew = delta_stat
-
-        actual_dew = 0.0
-        for z in zs:
-            new_z = z + delta_stat_for_ew / denom
-            actual_dew += stats.norm.cdf(new_z) - stats.norm.cdf(z)
-
-        ratio = float(actual_dew / linear_dew) if abs(linear_dew) > 1e-10 else 1.0
-
-        if avg_z < -0.5:
-            regime = "convex (undervalued)"
-        elif avg_z > 0.5:
-            regime = "concave (overvalued)"
-        else:
-            regime = "near-linear"
-
-        rows.append(
-            {
-                "category": cat,
-                "avg_z": avg_z,
-                "gradient": gradient[cat],
-                "hessian_diag": hessian_diag,
-                "convexity_ratio": ratio,
-                "regime": regime,
-            }
-        )
-
-    df = pd.DataFrame(rows).sort_values("convexity_ratio", ascending=False)
-    return df.reset_index(drop=True)
-
-
-# ============================================================================
 # MONTE CARLO STANDINGS SIMULATION
 # ============================================================================
 
@@ -385,44 +304,3 @@ def simulate_standings(
     }
 
 
-# ============================================================================
-# STANDINGS
-# ============================================================================
-
-
-def compute_standings(
-    my_totals: dict[str, float],
-    opponent_totals: dict[int, dict[str, float]],
-) -> pd.DataFrame:
-    """Projected roto standings: rank and standing points per category.
-
-    Returns:
-        DataFrame with columns:
-            category, my_value, opp_1, ..., opp_6, my_rank, wins
-
-        my_rank: 1 = first place, 7 = last place.
-        wins: number of opponents I beat (0–6).
-        For negative categories (ERA, WHIP), lower value = better rank.
-    """
-    rows = []
-
-    for cat in ALL_CATEGORIES:
-        row: dict = {"category": cat, "my_value": my_totals[cat]}
-
-        all_values = [my_totals[cat]]
-        for opp_id in sorted(opponent_totals.keys()):
-            row[f"opp_{opp_id}"] = opponent_totals[opp_id][cat]
-            all_values.append(opponent_totals[opp_id][cat])
-
-        if cat in NEGATIVE_CATEGORIES:
-            sorted_vals = sorted(all_values)
-            row["my_rank"] = sorted_vals.index(my_totals[cat]) + 1
-            row["wins"] = sum(1 for v in all_values[1:] if my_totals[cat] < v)
-        else:
-            sorted_vals = sorted(all_values, reverse=True)
-            row["my_rank"] = sorted_vals.index(my_totals[cat]) + 1
-            row["wins"] = sum(1 for v in all_values[1:] if my_totals[cat] > v)
-
-        rows.append(row)
-
-    return pd.DataFrame(rows)

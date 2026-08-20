@@ -4,14 +4,23 @@ Trade evaluation: score specific trades and search for good trades.
 Trades are mathematically identical to FA swaps — same compute_exact_msv,
 same Value metric. The differences:
 1. The "adds" come from an opponent's roster, not the FA pool.
-2. Two PV constraints must hold (both aggregate and per-player max).
+2. Two trade-fairness constraints must hold (aggregate and per-player max).
 3. The affected opponent's totals change post-trade (1 extra MILP).
 
-PV feasibility uses two checks:
-  - Aggregate: opponent's total PV loss ≤ pv_max_loss_frac of what they give up.
-  - Per-player max: the highest-PV player received can't vastly exceed the
-    highest-PV player sent. This prevents "trade up by quantity" — aggregating
-    mid-tier players to acquire a superstar.
+**Trade value column.** Fairness is judged on one configurable per-player
+column, `value_column` (default `"FV"`): whatever number best approximates
+what the rest of the league thinks a player is worth. It is a column name,
+not a formula — point it at a real market price (e.g. Ottoneu auction
+salaries) once that column exists and every check below follows.
+
+Feasibility uses two checks on that column:
+  - Aggregate: opponent's total value loss ≤ max_value_loss_frac of what
+    they give up. Keeps the overall package roughly fair.
+  - Per-player max: the highest-value player received can't vastly exceed
+    the highest-value player sent. This prevents "trade up by quantity" —
+    aggregating mid-tier players to acquire a superstar. Opponents price
+    stars above the sum of their parts, so the aggregate check alone is
+    not enough.
 """
 
 from itertools import combinations
@@ -19,7 +28,7 @@ from itertools import combinations
 import pandas as pd
 from tqdm.auto import tqdm
 
-from .config import MY_TEAM_NAME, PV_MAX_LOSS_FRAC
+from .config import MAX_VALUE_LOSS_FRAC, MY_TEAM_NAME
 from .lineup_solver import (
     compute_totals_for_starters,
     maybe_blend,
@@ -36,10 +45,53 @@ from .win_model import (
 # CONSTANTS
 # ============================================================================
 
-# Maximum fraction of PV the opponent will accept losing (from config.json
-# trade_engine.pv_max_loss_frac; default 0.15 = up to a 15% PV loss).
-DEFAULT_PV_MAX_LOSS_FRAC: float = PV_MAX_LOSS_FRAC
+# Maximum fraction of trade value the opponent will accept losing (from
+# config.json trade_engine.max_value_loss_frac; default 0.15 = up to a 15% loss).
+DEFAULT_MAX_VALUE_LOSS_FRAC: float = MAX_VALUE_LOSS_FRAC
 DEFAULT_TRADE_MAX_SIZE: int = 2
+
+# Caps on how many players enter the 2-player combinatorics.
+# Broad search: C(20,2) = 190 combos per side → 190×190 = 36,100 per
+# opponent; with 6 opponents that is ~217K approximate evals — still fast.
+BROAD_COMBO_CAP: int = 20
+# Targeted search casts a smaller net: the must-send/must-receive player is
+# already fixed, so only the most plausible partners are worth enumerating.
+TARGETED_CHIP_CAP: int = 10
+TARGETED_TARGET_CAP: int = 15
+TARGETED_PAIR_CAP: int = 8
+
+
+def _opp_would_reject(
+    send_value: float,
+    recv_value: float,
+    max_value_loss_frac: float,
+    max_send_value: float | None = None,
+    max_recv_value: float | None = None,
+) -> bool:
+    """True if the opponent rejects (aggregate loss OR per-player max violation).
+
+    Args:
+        send_value: Total value of players I send to the opponent.
+        recv_value: Total value of players I receive from the opponent.
+        max_value_loss_frac: Max fraction of value the opponent will lose.
+        max_send_value: Largest single-player value I send. Defaults to
+            send_value, which is exact for 1-for-1 trades.
+        max_recv_value: Largest single-player value I receive. Defaults to
+            recv_value, exact for 1-for-1 trades.
+
+    Returns:
+        True if either fairness check fails.
+    """
+    if recv_value <= 0:
+        return False
+    if (recv_value - send_value) / recv_value > max_value_loss_frac:
+        return True
+    ms = max_send_value if max_send_value is not None else send_value
+    mr = max_recv_value if max_recv_value is not None else recv_value
+    if mr > 0 and ms < mr * (1 - max_value_loss_frac):
+        return True
+    return False
+
 
 # ============================================================================
 # 10a. evaluate_trade — Score a specific trade proposal
@@ -57,7 +109,8 @@ def evaluate_trade(
     category_sigmas: dict[str, float],
     current_ew: float,
     current_total_bv: float,
-    pv_max_loss_frac: float = DEFAULT_PV_MAX_LOSS_FRAC,
+    value_column: str = "FV",
+    max_value_loss_frac: float = DEFAULT_MAX_VALUE_LOSS_FRAC,
     my_lineup: dict[str, str] | None = None,
     send_to_opp_names: set[str] | None = None,
     my_banked_totals: dict[str, float] | None = None,
@@ -65,16 +118,17 @@ def evaluate_trade(
 ) -> dict:
     """Evaluate a specific trade, including opponent roster change and ΔBV.
 
-    Same math as any swap (Value = MSV + ΔBV), plus PV check and opponent
-    lineup re-solve. See MATHEMATICAL_FRAMEWORK §7.
+    Same math as any swap (Value = MSV + ΔBV), plus the fairness check and an
+    opponent lineup re-solve. See MATHEMATICAL_FRAMEWORK §7.
 
     Supports imbalanced trades:
     - 2-for-1: Auto-fills with best FA to maintain roster size.
     - 1-for-2: Auto-drops lowest-MEW bench player to maintain roster size.
 
-    PV feasibility uses a **relative** check: the opponent rejects if they
-    lose more than pv_max_loss_frac of their PV in the trade.  E.g. 0.15
-    means the opponent accepts up to a 15 % PV loss.
+    Feasibility is a **relative** check on `value_column`: the opponent
+    rejects if they lose more than max_value_loss_frac of the value they
+    give up, or if the best player they send out dwarfs the best player they
+    get back.
 
     Args:
         send_names: Players I send (leave my roster).
@@ -82,13 +136,15 @@ def evaluate_trade(
         my_roster_names: Current my roster.
         opponent_roster_names: Current opponent's roster.
         trade_opponent_id: 1-indexed opponent ID.
-        players: Players DataFrame with FV, MEW, PV.
+        players: Players DataFrame with FV, MEW and `value_column`.
         opponent_totals: All opponents' totals.
         category_sigmas: σ_c per category.
         current_ew: Current EW.
         current_total_bv: Current total BV of my bench.
-        pv_max_loss_frac: Max fraction of PV the opponent will accept losing.
-            0.15 = opponent accepts up to 15% PV loss.
+        value_column: Column holding each player's trade-market value —
+            what opponents think they are worth. Default "FV".
+        max_value_loss_frac: Max fraction of `value_column` the opponent will
+            accept losing. 0.15 = opponent accepts up to a 15% loss.
         my_lineup: Optional {name: slot} dict for current lineup.
             Needed for 1-for-2 trades to identify bench players to drop.
         send_to_opp_names: Which of the (original) send_names are routed to
@@ -111,16 +167,19 @@ def evaluate_trade(
             'new_ew': float,
             'delta_bv': float,
             'value': float,
-            'pv_balance': float,
-            'opp_pv_loss_pct': float,  # % PV the opponent loses (positive = bad for opp)
-            'pv_feasible': bool,
+            'value_balance': float,   # value sent − value received
+            'opp_value_loss_pct': float,  # % of value the opponent loses
+            'trade_feasible': bool,
             'new_totals': dict,
             'new_lineup': dict,
             'auto_fa_add': str | None,  # FA player auto-added (2-for-1)
             'auto_drop': str | None,     # Bench player auto-dropped (1-for-2)
         }
     """
-    assert "PV" in players.columns, "evaluate_trade: players must have PV column"
+    assert value_column in players.columns, (
+        f"evaluate_trade: players must have the value column '{value_column}'. "
+        f"Available columns: {sorted(players.columns)}"
+    )
 
     # Convert to mutable sets for potential modification
     send_names = set(send_names)
@@ -145,9 +204,9 @@ def evaluate_trade(
                 "new_ew": current_ew,
                 "delta_bv": 0.0,
                 "value": 0.0,
-                "pv_balance": 0.0,
-                "pv_feasible": False,
-                "opp_pv_loss_pct": 0.0,
+                "value_balance": 0.0,
+                "trade_feasible": False,
+                "opp_value_loss_pct": 0.0,
                 "new_totals": {},
                 "new_lineup": {},
                 "auto_fa_add": None,
@@ -176,9 +235,9 @@ def evaluate_trade(
                 "new_ew": current_ew,
                 "delta_bv": 0.0,
                 "value": 0.0,
-                "pv_balance": 0.0,
-                "pv_feasible": False,
-                "opp_pv_loss_pct": 0.0,
+                "value_balance": 0.0,
+                "trade_feasible": False,
+                "opp_value_loss_pct": 0.0,
                 "new_totals": {},
                 "new_lineup": {},
                 "auto_fa_add": None,
@@ -198,11 +257,11 @@ def evaluate_trade(
         f"|receive| = {len(receive_names)} after balancing. This is a bug."
     )
 
-    # 1. PV check: only on opponent-routed portion (MF §1)
+    # 1. Fairness check: only on opponent-routed portion (MF §1)
     # recv_from_opp: players leaving opponent's roster and coming to me
     # send_to_opp: players leaving my roster and going to the opponent
     #   (NOT including players I'm dropping to FA, nor auto-balancing drops)
-    pv_lookup = players.set_index("Name")["PV"].to_dict()
+    value_lookup = players.set_index("Name")[value_column].to_dict()
     recv_from_opp = receive_names & opponent_roster_names
 
     if send_to_opp_names is None:
@@ -216,40 +275,38 @@ def evaluate_trade(
             f"Extra: {sorted(send_to_opp - send_names)}"
         )
 
-    pv_send_val = sum(pv_lookup.get(n, 0.0) for n in send_to_opp)
-    pv_recv_val = sum(pv_lookup.get(n, 0.0) for n in recv_from_opp)
-    pv_balance = pv_send_val - pv_recv_val
+    send_value = sum(value_lookup.get(n, 0.0) for n in send_to_opp)
+    recv_value = sum(value_lookup.get(n, 0.0) for n in recv_from_opp)
+    value_balance = send_value - recv_value
 
-    # Two-part PV feasibility check:
-    #   1. Aggregate: opponent's total PV loss ≤ threshold
+    # Two-part feasibility check:
+    #   1. Aggregate: opponent's total value loss ≤ threshold
     #   2. Per-player max: can't get a star without sending one back
     #
-    # opp gives up: pv_recv_val (I receive from them)
-    # opp receives: pv_send_val (I send to them)
-    if pv_recv_val > 0:
-        opp_pv_loss_frac = (pv_recv_val - pv_send_val) / pv_recv_val
+    # opp gives up: recv_value (I receive from them)
+    # opp receives: send_value (I send to them)
+    if recv_value > 0:
+        opp_value_loss_frac = (recv_value - send_value) / recv_value
     else:
-        opp_pv_loss_frac = 0.0
-    opp_pv_loss_pct = round(opp_pv_loss_frac * 100, 1)
-    agg_ok = opp_pv_loss_frac <= pv_max_loss_frac
+        opp_value_loss_frac = 0.0
+    opp_value_loss_pct = round(opp_value_loss_frac * 100, 1)
+    agg_ok = opp_value_loss_frac <= max_value_loss_frac
 
-    max_pv_sent = max((pv_lookup.get(n, 0.0) for n in send_to_opp), default=0.0)
-    max_pv_recv = max((pv_lookup.get(n, 0.0) for n in recv_from_opp), default=0.0)
-    max_ok = (
-        max_pv_sent >= max_pv_recv * (1 - pv_max_loss_frac) if max_pv_recv > 0 else True
-    )
+    max_sent = max((value_lookup.get(n, 0.0) for n in send_to_opp), default=0.0)
+    max_recv = max((value_lookup.get(n, 0.0) for n in recv_from_opp), default=0.0)
+    max_ok = max_sent >= max_recv * (1 - max_value_loss_frac) if max_recv > 0 else True
 
-    pv_feasible = agg_ok and max_ok
+    trade_feasible = agg_ok and max_ok
 
-    if not pv_feasible:
+    if not trade_feasible:
         return {
             "msv": 0.0,
             "new_ew": current_ew,
             "delta_bv": 0.0,
             "value": 0.0,
-            "pv_balance": pv_balance,
-            "opp_pv_loss_pct": opp_pv_loss_pct,
-            "pv_feasible": False,
+            "value_balance": value_balance,
+            "opp_value_loss_pct": opp_value_loss_pct,
+            "trade_feasible": False,
             "new_totals": {},
             "new_lineup": {},
             "auto_fa_add": auto_fa_add,
@@ -316,9 +373,9 @@ def evaluate_trade(
         "new_ew": new_ew,
         "delta_bv": delta_bv,
         "value": value,
-        "pv_balance": pv_balance,
-        "opp_pv_loss_pct": opp_pv_loss_pct,
-        "pv_feasible": pv_feasible,
+        "value_balance": value_balance,
+        "opp_value_loss_pct": opp_value_loss_pct,
+        "trade_feasible": trade_feasible,
         "new_totals": my_new_totals,
         "new_lineup": my_new_lineup,
         "auto_fa_add": auto_fa_add,
@@ -327,113 +384,37 @@ def evaluate_trade(
 
 
 # ============================================================================
-# 10b. search_trades — Find good trades automatically
+# 10b. Candidate enumeration (approximate stage)
 # ============================================================================
 
 
-def search_trades(
+def _enumerate_broad(
     players: pd.DataFrame,
     my_roster_names: set[str],
-    my_lineup: dict[str, str],
-    opponent_rosters: dict[int, set[str]],
-    opponent_totals: dict[int, dict[str, float]],
-    category_sigmas: dict[str, float],
-    current_ew: float,
-    current_total_bv: float,
-    pv_max_loss_frac: float = DEFAULT_PV_MAX_LOSS_FRAC,
-    max_trade_size: int = DEFAULT_TRADE_MAX_SIZE,
-    top_k: int = 100,
-    min_value: float = 0.0,
-    my_team_name: str | None = None,
-    my_banked_totals: dict[str, float] | None = None,
-    opponent_banked: dict[int, dict[str, float] | None] | None = None,
+    my_starters: set[str],
+    search_rosters: dict[int, set[str]],
+    chips: list[str],
+    mew_lookup: dict[str, float],
+    value_lookup: dict[str, float],
+    best_fa: str | None,
+    max_value_loss_frac: float,
+    max_trade_size: int,
 ) -> list[dict]:
-    """Enumerate and rank PV-feasible trades, including imbalanced.
+    """Enumerate candidate trades across every searched opponent's roster.
 
-    For each opponent o:
-        1. TARGETS: their players with high MEW (I want them)
-        2. CHIPS: my players sorted by PV (tradeable value to opponents)
-        3. Enumerate trade shapes
-        4. Filter by relative PV constraint
-        5. Score by MEW-based approximation
-        6. Exact-evaluate top K
+    1-for-1 covers the full cross product (my roster × their roster);
+    multi-player shapes are capped at BROAD_COMBO_CAP players per side.
+    `chips` is my roster sorted by trade value descending, `search_rosters`
+    is {opp_id: roster}, `best_fa` is the highest-MEW free agent or None.
 
-    Args:
-        players: DataFrame with FV, MEW, PV.
-        my_roster_names: My current roster.
-        my_lineup: {name: slot} for my team.
-        opponent_rosters: {opp_id: set of names}.
-        opponent_totals: {opp_id: {cat: total}}.
-        category_sigmas: σ_c per category.
-        current_ew: Current EW.
-        current_total_bv: Current total BV.
-        pv_max_loss_frac: Max fraction of PV opponent will accept losing.
-        max_trade_size: Max players per side.
-        top_k: Top trades to exact-evaluate.
-        min_value: Minimum value to include in results.
-        my_team_name: Team name for filtering. Defaults to MY_TEAM_NAME.
-
-    Returns list of:
-        {
-            'send': list[str], 'receive': list[str], 'opponent': str,
-            'msv_exact': float, 'delta_bv': float, 'value': float,
-            'pv_balance': float, 'new_ew': float,
-        }
+    Returns:
+        List of {send, send_to_opp, receive, opponent_id, msv_approx} dicts.
     """
-    if my_team_name is None:
-        my_team_name = MY_TEAM_NAME
-    assert "MEW" in players.columns, "search_trades: need MEW column"
-    assert "PV" in players.columns, "search_trades: need PV column"
+    best_fa_mew = mew_lookup.get(best_fa, 0.0) if best_fa is not None else 0.0
+    candidates: list[dict] = []
 
-    mew_lookup = players.set_index("Name")["MEW"].to_dict()
-    pv_lookup = players.set_index("Name")["PV"].to_dict()
-
-    my_starters = set(my_lineup.keys())
-    fa_names = set(players[players["owner"].isna()]["Name"])
-
-    # Get best FA by MEW (precompute once)
-    best_fa = None
-    best_fa_mew = -float("inf")
-    for fa_name in fa_names:
-        fa_mew = mew_lookup.get(fa_name, 0.0)
-        if fa_mew > best_fa_mew:
-            best_fa_mew = fa_mew
-            best_fa = fa_name
-
-    # All my roster players sorted by PV — every player is a potential chip
-    my_players = players[players["Name"].isin(my_roster_names)].copy()
-    chips = my_players.sort_values("PV", ascending=False)["Name"].tolist()
-
-    # For 2-player combos, cap to avoid truly degenerate explosion.
-    # C(20,2) = 190 combos per side → 190×190 = 36,100 per opponent.
-    # With 6 opponents that is ~217K approximate evals — still fast.
-    COMBO_CAP = 20
-
-    def _opp_would_reject(
-        pv_send: float,
-        pv_recv: float,
-        max_pv_send: float | None = None,
-        max_pv_recv: float | None = None,
-    ) -> bool:
-        """True if opponent rejects (aggregate loss OR per-player max violation).
-
-        For 1-for-1 trades, max_pv defaults are the same as the aggregates.
-        For multi-player trades, pass the max individual PV on each side.
-        """
-        if pv_recv <= 0:
-            return False
-        if (pv_recv - pv_send) / pv_recv > pv_max_loss_frac:
-            return True
-        ms = max_pv_send if max_pv_send is not None else pv_send
-        mr = max_pv_recv if max_pv_recv is not None else pv_recv
-        if mr > 0 and ms < mr * (1 - pv_max_loss_frac):
-            return True
-        return False
-
-    approximate_trades: list[dict] = []
-
-    for opp_id, opp_roster in tqdm(opponent_rosters.items(), desc="Searching trades"):
-        opp_players = players[players["Name"].isin(opp_roster)].copy()
+    for opp_id, opp_roster in tqdm(search_rosters.items(), desc="Searching trades"):
+        opp_players = players[players["Name"].isin(opp_roster)]
         if len(opp_players) == 0:
             continue
 
@@ -442,13 +423,13 @@ def search_trades(
 
         # --- 1-for-1 trades (full roster × full roster) ---
         for target in targets:
-            pv_recv = pv_lookup.get(target, 0.0)
+            recv_value = value_lookup.get(target, 0.0)
             for chip in chips:
-                pv_send = pv_lookup.get(chip, 0.0)
-                if _opp_would_reject(pv_send, pv_recv):
+                send_value = value_lookup.get(chip, 0.0)
+                if _opp_would_reject(send_value, recv_value, max_value_loss_frac):
                     continue
                 msv_approx = mew_lookup.get(target, 0.0) - mew_lookup.get(chip, 0.0)
-                approximate_trades.append(
+                candidates.append(
                     {
                         "send": [chip],
                         "send_to_opp": [chip],
@@ -461,18 +442,24 @@ def search_trades(
         if max_trade_size < 2:
             continue
 
-        _targets_2 = targets[:COMBO_CAP]
-        _chips_2 = chips[:COMBO_CAP]
+        _targets_2 = targets[:BROAD_COMBO_CAP]
+        _chips_2 = chips[:BROAD_COMBO_CAP]
 
         # --- 2-for-2 trades ---
         for t1, t2 in combinations(_targets_2, 2):
-            pv_t1, pv_t2 = pv_lookup.get(t1, 0.0), pv_lookup.get(t2, 0.0)
-            pv_recv = pv_t1 + pv_t2
-            max_recv = max(pv_t1, pv_t2)
+            v_t1, v_t2 = value_lookup.get(t1, 0.0), value_lookup.get(t2, 0.0)
+            recv_value = v_t1 + v_t2
+            max_recv = max(v_t1, v_t2)
             for c1, c2 in combinations(_chips_2, 2):
-                pv_c1, pv_c2 = pv_lookup.get(c1, 0.0), pv_lookup.get(c2, 0.0)
-                pv_send = pv_c1 + pv_c2
-                if _opp_would_reject(pv_send, pv_recv, max(pv_c1, pv_c2), max_recv):
+                v_c1, v_c2 = value_lookup.get(c1, 0.0), value_lookup.get(c2, 0.0)
+                send_value = v_c1 + v_c2
+                if _opp_would_reject(
+                    send_value,
+                    recv_value,
+                    max_value_loss_frac,
+                    max(v_c1, v_c2),
+                    max_recv,
+                ):
                     continue
                 msv_approx = (
                     mew_lookup.get(t1, 0.0)
@@ -480,7 +467,7 @@ def search_trades(
                     - mew_lookup.get(c1, 0.0)
                     - mew_lookup.get(c2, 0.0)
                 )
-                approximate_trades.append(
+                candidates.append(
                     {
                         "send": [c1, c2],
                         "send_to_opp": [c1, c2],
@@ -493,11 +480,17 @@ def search_trades(
         # --- 2-for-1 + FA fill ---
         if best_fa is not None:
             for target in _targets_2:
-                pv_recv = pv_lookup.get(target, 0.0)
+                recv_value = value_lookup.get(target, 0.0)
                 for c1, c2 in combinations(_chips_2, 2):
-                    pv_c1, pv_c2 = pv_lookup.get(c1, 0.0), pv_lookup.get(c2, 0.0)
-                    pv_send = pv_c1 + pv_c2
-                    if _opp_would_reject(pv_send, pv_recv, max(pv_c1, pv_c2), pv_recv):
+                    v_c1, v_c2 = value_lookup.get(c1, 0.0), value_lookup.get(c2, 0.0)
+                    send_value = v_c1 + v_c2
+                    if _opp_would_reject(
+                        send_value,
+                        recv_value,
+                        max_value_loss_frac,
+                        max(v_c1, v_c2),
+                        recv_value,
+                    ):
                         continue
                     msv_approx = (
                         mew_lookup.get(target, 0.0)
@@ -505,7 +498,7 @@ def search_trades(
                         - mew_lookup.get(c1, 0.0)
                         - mew_lookup.get(c2, 0.0)
                     )
-                    approximate_trades.append(
+                    candidates.append(
                         {
                             "send": [c1, c2],
                             "send_to_opp": [c1, c2],
@@ -517,12 +510,14 @@ def search_trades(
 
         # --- 1-for-2 + FA drop ---
         for t1, t2 in combinations(_targets_2, 2):
-            pv_t1, pv_t2 = pv_lookup.get(t1, 0.0), pv_lookup.get(t2, 0.0)
-            pv_recv = pv_t1 + pv_t2
-            max_recv = max(pv_t1, pv_t2)
+            v_t1, v_t2 = value_lookup.get(t1, 0.0), value_lookup.get(t2, 0.0)
+            recv_value = v_t1 + v_t2
+            max_recv = max(v_t1, v_t2)
             for chip in _chips_2:
-                pv_send = pv_lookup.get(chip, 0.0)
-                if _opp_would_reject(pv_send, pv_recv, pv_send, max_recv):
+                send_value = value_lookup.get(chip, 0.0)
+                if _opp_would_reject(
+                    send_value, recv_value, max_value_loss_frac, send_value, max_recv
+                ):
                     continue
                 bench = my_roster_names - my_starters - {chip}
                 if not bench:
@@ -534,7 +529,7 @@ def search_trades(
                     - mew_lookup.get(chip, 0.0)
                     - mew_lookup.get(drop_name, 0.0)
                 )
-                approximate_trades.append(
+                candidates.append(
                     {
                         "send": [chip, drop_name],
                         "send_to_opp": [chip],  # drop_name goes to FA
@@ -544,8 +539,379 @@ def search_trades(
                     }
                 )
 
+    return candidates
+
+
+def _enumerate_targeted(
+    players: pd.DataFrame,
+    my_roster_names: set[str],
+    my_starters: set[str],
+    search_rosters: dict[int, set[str]],
+    mew_lookup: dict[str, float],
+    value_lookup: dict[str, float],
+    value_column: str,
+    best_fa: str | None,
+    max_value_loss_frac: float,
+    must_send: set[str],
+    must_receive: set[str],
+) -> list[dict]:
+    """Enumerate candidate trades that all include the required players.
+
+    Partner chips are picked by `chip_score` = value-rank − MEW-rank: the
+    players the market likes more than my team needs, i.e. the cheapest
+    real currency I have. Caps are tighter than the broad search because
+    one side of every trade is already pinned. At least one of must_send /
+    must_receive must be non-empty; `search_rosters` is {opp_id: roster}
+    and `best_fa` the highest-MEW free agent or None.
+
+    Returns:
+        List of {send, send_to_opp, receive, opponent_id, msv_approx} dicts.
+    """
+    # Additional trade chips (beyond must_send): market likes them more than
+    # my lineup needs them.
+    my_players = players[players["Name"].isin(my_roster_names - must_send)].copy()
+    if len(my_players) > 0:
+        my_players["chip_score"] = my_players[value_column].rank(pct=True) - my_players[
+            "MEW"
+        ].rank(pct=True)
+        extra_chips = my_players.nlargest(
+            min(TARGETED_CHIP_CAP, len(my_players)), "chip_score"
+        )["Name"].tolist()
+    else:
+        extra_chips = []
+
+    candidates: list[dict] = []
+
+    for opp_id, opp_roster in search_rosters.items():
+        opp_players = players[players["Name"].isin(opp_roster - must_receive)]
+        extra_targets = opp_players.nlargest(
+            min(TARGETED_TARGET_CAP, len(opp_players)), "MEW"
+        )["Name"].tolist()
+
+        n_must_send = len(must_send)
+        n_must_recv = len(must_receive)
+
+        # Case: both sides pinned — one explicit shape, nothing to enumerate.
+        if must_send and must_receive:
+            send_list = list(must_send)
+            recv_list = list(must_receive & opp_roster)
+            if not recv_list:
+                continue
+            send_values = [value_lookup.get(c, 0.0) for c in send_list]
+            recv_values = [value_lookup.get(t, 0.0) for t in recv_list]
+            if _opp_would_reject(
+                sum(send_values),
+                sum(recv_values),
+                max_value_loss_frac,
+                max(send_values),
+                max(recv_values),
+            ):
+                continue
+            candidates.append(
+                {
+                    "send": send_list,
+                    "send_to_opp": send_list,
+                    "receive": recv_list,
+                    "opponent_id": opp_id,
+                    "msv_approx": sum(mew_lookup.get(t, 0.0) for t in recv_list)
+                    - sum(mew_lookup.get(c, 0.0) for c in send_list),
+                }
+            )
+
+        # Case: must_send specified, find what we can get
+        elif must_send:
+            # 1-for-1: send must_send, get target
+            for target in extra_targets:
+                recv_value = value_lookup.get(target, 0.0)
+                for chip in must_send:
+                    send_value = value_lookup.get(chip, 0.0)
+                    if _opp_would_reject(send_value, recv_value, max_value_loss_frac):
+                        continue
+                    msv_approx = mew_lookup.get(target, 0.0) - mew_lookup.get(chip, 0.0)
+                    candidates.append(
+                        {
+                            "send": [chip],
+                            "send_to_opp": [chip],
+                            "receive": [target],
+                            "opponent_id": opp_id,
+                            "msv_approx": msv_approx,
+                        }
+                    )
+
+            # 1-for-2: send must_send + drop bench, get 2 targets
+            bench = my_roster_names - my_starters - must_send
+            if bench and n_must_send == 1:
+                drop_name = min(bench, key=lambda n: mew_lookup.get(n, 0.0))
+                send_value = sum(value_lookup.get(c, 0.0) for c in must_send)
+                for i, t1 in enumerate(extra_targets[:TARGETED_PAIR_CAP]):
+                    for t2 in extra_targets[i + 1 : TARGETED_PAIR_CAP]:
+                        v_t1, v_t2 = (
+                            value_lookup.get(t1, 0.0),
+                            value_lookup.get(t2, 0.0),
+                        )
+                        if _opp_would_reject(
+                            send_value,
+                            v_t1 + v_t2,
+                            max_value_loss_frac,
+                            send_value,
+                            max(v_t1, v_t2),
+                        ):
+                            continue
+                        msv_approx = (
+                            mew_lookup.get(t1, 0.0)
+                            + mew_lookup.get(t2, 0.0)
+                            - sum(mew_lookup.get(c, 0.0) for c in must_send)
+                            - mew_lookup.get(drop_name, 0.0)
+                        )
+                        candidates.append(
+                            {
+                                "send": list(must_send) + [drop_name],
+                                "send_to_opp": list(must_send),  # drop goes to FA
+                                "receive": [t1, t2],
+                                "opponent_id": opp_id,
+                                "msv_approx": msv_approx,
+                            }
+                        )
+
+            # 2-for-1: send must_send + extra chip, get 1 target + FA fill
+            if best_fa is not None:
+                for target in extra_targets[:TARGETED_CHIP_CAP]:
+                    recv_value = value_lookup.get(target, 0.0)
+                    for extra_chip in extra_chips[:TARGETED_CHIP_CAP]:
+                        send_list = list(must_send) + [extra_chip]
+                        send_values = [value_lookup.get(c, 0.0) for c in send_list]
+                        if _opp_would_reject(
+                            sum(send_values),
+                            recv_value,
+                            max_value_loss_frac,
+                            max(send_values),
+                            recv_value,
+                        ):
+                            continue
+                        msv_approx = (
+                            mew_lookup.get(target, 0.0)
+                            + mew_lookup.get(best_fa, 0.0)
+                            - sum(mew_lookup.get(c, 0.0) for c in send_list)
+                        )
+                        candidates.append(
+                            {
+                                "send": send_list,
+                                "send_to_opp": list(send_list),
+                                "receive": [target, best_fa],
+                                "opponent_id": opp_id,
+                                "msv_approx": msv_approx,
+                            }
+                        )
+
+        # Case: must_receive specified, find what we need to give up
+        else:
+            must_recv_list = list(must_receive)
+            # 1-for-1: give chip, get must_receive
+            for chip in extra_chips:
+                send_value = value_lookup.get(chip, 0.0)
+                for target in must_recv_list:
+                    recv_value = value_lookup.get(target, 0.0)
+                    if _opp_would_reject(send_value, recv_value, max_value_loss_frac):
+                        continue
+                    msv_approx = mew_lookup.get(target, 0.0) - mew_lookup.get(chip, 0.0)
+                    candidates.append(
+                        {
+                            "send": [chip],
+                            "send_to_opp": [chip],
+                            "receive": [target],
+                            "opponent_id": opp_id,
+                            "msv_approx": msv_approx,
+                        }
+                    )
+
+            # 2-for-1: give 2 chips, get must_receive + FA
+            if n_must_recv == 1 and best_fa is not None:
+                recv_values = [value_lookup.get(t, 0.0) for t in must_recv_list]
+                recv_value = sum(recv_values)
+                max_recv = max(recv_values)
+                for i, c1 in enumerate(extra_chips[:TARGETED_PAIR_CAP]):
+                    for c2 in extra_chips[i + 1 : TARGETED_PAIR_CAP]:
+                        v_c1, v_c2 = (
+                            value_lookup.get(c1, 0.0),
+                            value_lookup.get(c2, 0.0),
+                        )
+                        if _opp_would_reject(
+                            v_c1 + v_c2,
+                            recv_value,
+                            max_value_loss_frac,
+                            max(v_c1, v_c2),
+                            max_recv,
+                        ):
+                            continue
+                        msv_approx = (
+                            sum(mew_lookup.get(t, 0.0) for t in must_recv_list)
+                            + mew_lookup.get(best_fa, 0.0)
+                            - mew_lookup.get(c1, 0.0)
+                            - mew_lookup.get(c2, 0.0)
+                        )
+                        candidates.append(
+                            {
+                                "send": [c1, c2],
+                                "send_to_opp": [c1, c2],
+                                "receive": must_recv_list + [best_fa],
+                                "opponent_id": opp_id,
+                                "msv_approx": msv_approx,
+                            }
+                        )
+
+    return candidates
+
+
+# ============================================================================
+# 10c. search_trades — Find good trades automatically
+# ============================================================================
+
+
+def search_trades(
+    players: pd.DataFrame,
+    my_roster_names: set[str],
+    my_lineup: dict[str, str],
+    opponent_rosters: dict[int, set[str]],
+    opponent_totals: dict[int, dict[str, float]],
+    category_sigmas: dict[str, float],
+    current_ew: float,
+    current_total_bv: float,
+    value_column: str = "FV",
+    max_value_loss_frac: float = DEFAULT_MAX_VALUE_LOSS_FRAC,
+    max_trade_size: int = DEFAULT_TRADE_MAX_SIZE,
+    must_send: set[str] | None = None,
+    must_receive: set[str] | None = None,
+    opponent_filter: set[int] | None = None,
+    top_k: int | None = None,
+    min_value: float | None = None,
+    my_team_name: str | None = None,
+    my_banked_totals: dict[str, float] | None = None,
+    opponent_banked: dict[int, dict[str, float] | None] | None = None,
+) -> list[dict]:
+    """Enumerate and rank feasible trades, including imbalanced ones.
+
+    Two enumeration modes, chosen by whether any player is pinned:
+
+    - **Broad** (must_send and must_receive both None): for each searched
+      opponent, cross every one of my players (chips, sorted by trade value)
+      against every one of theirs (targets, sorted by MEW) 1-for-1, then
+      2-for-2 / 2-for-1+FA / 1-for-2+FA shapes over the top
+      BROAD_COMBO_CAP of each side. Defaults: top_k=100, min_value=0.0.
+    - **Targeted** (must_send and/or must_receive set): every candidate
+      contains the pinned players; partners come from a `chip_score`
+      shortlist (market value rank − MEW rank). Answers "what can I get for
+      X?" (must_send), "what do I have to give up for Y?" (must_receive),
+      or scores one explicit shape (both). Defaults: top_k=50,
+      min_value=-1.0.
+
+    Both modes then approximate-score every candidate by ΔMEW, exact-evaluate
+    the top_k via evaluate_trade, and return the survivors sorted by value.
+
+    Args:
+        players: DataFrame with FV, MEW and `value_column`.
+        my_roster_names: My current roster.
+        my_lineup: {name: slot} for my team.
+        opponent_rosters: {opp_id: set of names}.
+        opponent_totals: {opp_id: {cat: total}}.
+        category_sigmas: σ_c per category.
+        current_ew: Current EW.
+        current_total_bv: Current total BV.
+        value_column: Column holding each player's trade-market value.
+            Default "FV". Drives fairness checks and chip ranking.
+        max_value_loss_frac: Max fraction of value the opponent will lose.
+        max_trade_size: Max players per side (broad mode only).
+        must_send: Players that must be on the send side (my players).
+            Switches to targeted mode.
+        must_receive: Players that must be on the receive side (opponent
+            players). Switches to targeted mode, and restricts the search
+            to the opponents who own them.
+        opponent_filter: If set, only search these opponent IDs. Works in
+            either mode; on its own it does NOT switch modes.
+        top_k: Trades to exact-evaluate. None → 100 broad / 50 targeted.
+        min_value: Minimum value to keep. None → 0.0 broad / -1.0 targeted.
+        my_team_name: Team name for filtering. Defaults to MY_TEAM_NAME.
+        my_banked_totals: My banked YTD totals, blended into post-trade totals.
+        opponent_banked: {opp_id: banked totals} for the same blending on
+            the opponent's side.
+
+    Returns list of:
+        {
+            'send': list[str], 'send_to_opp': list[str],
+            'receive': list[str], 'opponent': str,
+            'msv_exact': float, 'delta_bv': float, 'value': float,
+            'opp_value_loss_pct': float, 'new_ew': float,
+        }
+    """
+    if my_team_name is None:
+        my_team_name = MY_TEAM_NAME
+    assert "MEW" in players.columns, "search_trades: need MEW column"
+    assert value_column in players.columns, (
+        f"search_trades: need the value column '{value_column}'. "
+        f"Available columns: {sorted(players.columns)}"
+    )
+
+    must_send = set(must_send) if must_send else set()
+    must_receive = set(must_receive) if must_receive else set()
+    targeted = bool(must_send or must_receive)
+    if top_k is None:
+        top_k = 50 if targeted else 100
+    if min_value is None:
+        min_value = -1.0 if targeted else 0.0
+
+    mew_lookup = players.set_index("Name")["MEW"].to_dict()
+    value_lookup = players.set_index("Name")[value_column].to_dict()
+
+    my_starters = set(my_lineup.keys())
+    fa_names = set(players[players["owner"].isna()]["Name"])
+    best_fa = max(fa_names, key=lambda n: mew_lookup.get(n, 0.0)) if fa_names else None
+
+    # Which opponents to search: those owning must_receive players, narrowed
+    # by opponent_filter if given.
+    if must_receive:
+        search_opps = {
+            oid for oid, roster in opponent_rosters.items() if roster & must_receive
+        }
+        if opponent_filter:
+            search_opps &= opponent_filter
+    elif opponent_filter:
+        search_opps = set(opponent_filter) & set(opponent_rosters)
+    else:
+        search_opps = set(opponent_rosters)
+    search_rosters = {oid: opponent_rosters[oid] for oid in sorted(search_opps)}
+
+    if targeted:
+        approximate_trades = _enumerate_targeted(
+            players=players,
+            my_roster_names=my_roster_names,
+            my_starters=my_starters,
+            search_rosters=search_rosters,
+            mew_lookup=mew_lookup,
+            value_lookup=value_lookup,
+            value_column=value_column,
+            best_fa=best_fa,
+            max_value_loss_frac=max_value_loss_frac,
+            must_send=must_send,
+            must_receive=must_receive,
+        )
+    else:
+        # Every player on my roster is a potential chip, most valuable first.
+        my_players = players[players["Name"].isin(my_roster_names)]
+        chips = my_players.sort_values(value_column, ascending=False)["Name"].tolist()
+        approximate_trades = _enumerate_broad(
+            players=players,
+            my_roster_names=my_roster_names,
+            my_starters=my_starters,
+            search_rosters=search_rosters,
+            chips=chips,
+            mew_lookup=mew_lookup,
+            value_lookup=value_lookup,
+            best_fa=best_fa,
+            max_value_loss_frac=max_value_loss_frac,
+            max_trade_size=max_trade_size,
+        )
+
     if not approximate_trades:
-        print("search_trades: no PV-feasible candidates found")
+        print("search_trades: no feasible candidates found")
         return []
 
     # Rank by approximate MSV, take top K for exact evaluation
@@ -553,7 +919,7 @@ def search_trades(
     top_candidates = approximate_trades[:top_k]
 
     print(
-        f"search_trades: {len(approximate_trades)} PV-feasible candidates, "
+        f"search_trades: {len(approximate_trades)} feasible candidates, "
         f"exact-evaluating top {len(top_candidates)}"
     )
 
@@ -582,7 +948,8 @@ def search_trades(
             category_sigmas=category_sigmas,
             current_ew=current_ew,
             current_total_bv=current_total_bv,
-            pv_max_loss_frac=pv_max_loss_frac,
+            value_column=value_column,
+            max_value_loss_frac=max_value_loss_frac,
             my_lineup=my_lineup,
             send_to_opp_names=send_to_opp,
             my_banked_totals=my_banked_totals,
@@ -591,7 +958,7 @@ def search_trades(
             ),
         )
 
-        if not result["pv_feasible"]:
+        if not result["trade_feasible"]:
             continue
 
         if result["value"] < min_value:
@@ -611,7 +978,7 @@ def search_trades(
                 "msv_exact": result["msv"],
                 "delta_bv": result["delta_bv"],
                 "value": result["value"],
-                "opp_pv_loss_pct": result["opp_pv_loss_pct"],
+                "opp_value_loss_pct": result["opp_value_loss_pct"],
                 "new_ew": result["new_ew"],
             }
         )
@@ -622,344 +989,10 @@ def search_trades(
     return results
 
 
-# ============================================================================
-# 10c. search_trades_for_players — Find trades involving specific players
-# ============================================================================
+def search_trades_for_players(**kwargs) -> list[dict]:
+    """Thin wrapper: search_trades in targeted mode. Kept for existing callers.
 
-
-def search_trades_for_players(
-    players: pd.DataFrame,
-    my_roster_names: set[str],
-    my_lineup: dict[str, str],
-    opponent_rosters: dict[int, set[str]],
-    opponent_totals: dict[int, dict[str, float]],
-    category_sigmas: dict[str, float],
-    current_ew: float,
-    current_total_bv: float,
-    pv_max_loss_frac: float = DEFAULT_PV_MAX_LOSS_FRAC,
-    must_send: set[str] | None = None,
-    must_receive: set[str] | None = None,
-    opponent_filter: set[int] | None = None,
-    top_k: int = 50,
-    min_value: float = -1.0,
-    my_team_name: str | None = None,
-    my_banked_totals: dict[str, float] | None = None,
-    opponent_banked: dict[int, dict[str, float] | None] | None = None,
-) -> list[dict]:
-    """Search for trades involving specific players.
-
-    Use cases:
-    - must_send only: "What can I get for Cody Bellinger?"
-    - must_receive only: "Who do I need to give up for Juan Soto?"
-    - Both: Evaluate specific trade shapes
-
-    Args:
-        players: DataFrame with FV, MEW, PV.
-        my_roster_names: My current roster.
-        my_lineup: {name: slot} for my team.
-        opponent_rosters: {opp_id: set of names}.
-        opponent_totals: {opp_id: {cat: total}}.
-        category_sigmas: σ_c per category.
-        current_ew: Current EW.
-        current_total_bv: Current total BV.
-        pv_max_loss_frac: Max fraction of PV opponent will accept losing.
-        must_send: Players that must be in the send side (my players).
-        must_receive: Players that must be in the receive side (opponent players).
-        opponent_filter: If set, only search these opponent IDs.
-        top_k: Max trades to exact-evaluate.
-        min_value: Minimum value to include in results.
-        my_team_name: Team name for filtering. Defaults to MY_TEAM_NAME.
-
-    Returns list of trade dicts with same structure as search_trades.
+    Takes the same keyword arguments as search_trades; must_send and/or
+    must_receive are what make the search targeted.
     """
-    if my_team_name is None:
-        my_team_name = MY_TEAM_NAME
-    assert "MEW" in players.columns, "search_trades_for_players: need MEW column"
-    assert "PV" in players.columns, "search_trades_for_players: need PV column"
-
-    must_send = must_send or set()
-    must_receive = must_receive or set()
-
-    mew_lookup = players.set_index("Name")["MEW"].to_dict()
-    pv_lookup = players.set_index("Name")["PV"].to_dict()
-
-    my_starters = set(my_lineup.keys())
-    fa_names = set(players[players["owner"].isna()]["Name"])
-
-    # Identify additional trade chips (beyond must_send)
-    my_players = players[players["Name"].isin(my_roster_names - must_send)].copy()
-    if len(my_players) > 0:
-        my_players["chip_score"] = my_players["PV"].rank(pct=True) - my_players[
-            "MEW"
-        ].rank(pct=True)
-        extra_chips = my_players.nlargest(min(10, len(my_players)), "chip_score")[
-            "Name"
-        ].tolist()
-    else:
-        extra_chips = []
-
-    # Determine which opponents to search
-    if must_receive:
-        # Find which opponent owns the must_receive players
-        recv_owners = set()
-        for name in must_receive:
-            owner = players.loc[players["Name"] == name, "owner"].iloc[0]
-            if pd.notna(owner) and owner != my_team_name:
-                for oid, roster in opponent_rosters.items():
-                    if name in roster:
-                        recv_owners.add(oid)
-                        break
-        if opponent_filter:
-            search_opps = recv_owners & opponent_filter
-        else:
-            search_opps = recv_owners
-    elif opponent_filter:
-        search_opps = opponent_filter
-    else:
-        search_opps = set(opponent_rosters.keys())
-
-    def _opp_would_reject(
-        pv_send: float,
-        pv_recv: float,
-        max_pv_send: float | None = None,
-        max_pv_recv: float | None = None,
-    ) -> bool:
-        """True if opponent rejects (aggregate loss OR per-player max violation)."""
-        if pv_recv <= 0:
-            return False
-        if (pv_recv - pv_send) / pv_recv > pv_max_loss_frac:
-            return True
-        ms = max_pv_send if max_pv_send is not None else pv_send
-        mr = max_pv_recv if max_pv_recv is not None else pv_recv
-        if mr > 0 and ms < mr * (1 - pv_max_loss_frac):
-            return True
-        return False
-
-    approximate_trades: list[dict] = []
-
-    for opp_id in search_opps:
-        opp_roster = opponent_rosters[opp_id]
-        opp_players = players[players["Name"].isin(opp_roster - must_receive)].copy()
-
-        if len(opp_players) > 0:
-            extra_targets = opp_players.nlargest(min(15, len(opp_players)), "MEW")[
-                "Name"
-            ].tolist()
-        else:
-            extra_targets = []
-
-        n_must_send = len(must_send)
-        n_must_recv = len(must_receive)
-
-        # Case: must_send specified, find what we can get
-        if must_send and not must_receive:
-            # 1-for-1: send must_send, get target
-            for target in extra_targets:
-                if target in opp_roster:
-                    for chip in must_send:
-                        pv_send = pv_lookup.get(chip, 0.0)
-                        pv_recv = pv_lookup.get(target, 0.0)
-                        if _opp_would_reject(pv_send, pv_recv):
-                            continue
-                        msv_approx = mew_lookup.get(target, 0.0) - mew_lookup.get(
-                            chip, 0.0
-                        )
-                        approximate_trades.append(
-                            {
-                                "send": [chip],
-                                "send_to_opp": [chip],
-                                "receive": [target],
-                                "opponent_id": opp_id,
-                                "msv_approx": msv_approx,
-                            }
-                        )
-
-            # 1-for-2: send must_send + drop bench, get 2 targets
-            bench = my_roster_names - my_starters - must_send
-            if bench and n_must_send == 1:
-                drop_name = min(bench, key=lambda n: mew_lookup.get(n, 0.0))
-                for i, t1 in enumerate(extra_targets[:8]):
-                    for t2 in extra_targets[i + 1 : 8]:
-                        pv_send_total = sum(pv_lookup.get(c, 0.0) for c in must_send)
-                        pv_t1, pv_t2 = pv_lookup.get(t1, 0.0), pv_lookup.get(t2, 0.0)
-                        pv_recv = pv_t1 + pv_t2
-                        if _opp_would_reject(
-                            pv_send_total, pv_recv, pv_send_total, max(pv_t1, pv_t2)
-                        ):
-                            continue
-                        msv_approx = (
-                            mew_lookup.get(t1, 0.0)
-                            + mew_lookup.get(t2, 0.0)
-                            - sum(mew_lookup.get(c, 0.0) for c in must_send)
-                            - mew_lookup.get(drop_name, 0.0)
-                        )
-                        approximate_trades.append(
-                            {
-                                "send": list(must_send) + [drop_name],
-                                "send_to_opp": list(must_send),  # drop goes to FA
-                                "receive": [t1, t2],
-                                "opponent_id": opp_id,
-                                "msv_approx": msv_approx,
-                            }
-                        )
-
-            # 2-for-1: send must_send + extra chip, get 1 target + FA fill
-            if n_must_send >= 1:
-                best_fa = (
-                    max(fa_names, key=lambda n: mew_lookup.get(n, 0.0))
-                    if fa_names
-                    else None
-                )
-                if best_fa:
-                    for target in extra_targets[:10]:
-                        pv_recv = pv_lookup.get(target, 0.0)
-                        for extra_chip in extra_chips[:10]:
-                            send_list = list(must_send) + [extra_chip]
-                            send_pvs = [pv_lookup.get(c, 0.0) for c in send_list]
-                            pv_send = sum(send_pvs)
-                            if _opp_would_reject(
-                                pv_send, pv_recv, max(send_pvs), pv_recv
-                            ):
-                                continue
-                            msv_approx = (
-                                mew_lookup.get(target, 0.0)
-                                + mew_lookup.get(best_fa, 0.0)
-                                - sum(mew_lookup.get(c, 0.0) for c in send_list)
-                            )
-                            approximate_trades.append(
-                                {
-                                    "send": send_list,
-                                    "send_to_opp": list(send_list),
-                                    "receive": [target, best_fa],
-                                    "opponent_id": opp_id,
-                                    "msv_approx": msv_approx,
-                                }
-                            )
-
-        # Case: must_receive specified, find what we need to give up
-        elif must_receive and not must_send:
-            must_recv_list = list(must_receive)
-            # 1-for-1: give chip, get must_receive
-            for chip in extra_chips:
-                for target in must_recv_list:
-                    pv_send = pv_lookup.get(chip, 0.0)
-                    pv_recv = pv_lookup.get(target, 0.0)
-                    if _opp_would_reject(pv_send, pv_recv):
-                        continue
-                    msv_approx = mew_lookup.get(target, 0.0) - mew_lookup.get(chip, 0.0)
-                    approximate_trades.append(
-                        {
-                            "send": [chip],
-                            "send_to_opp": [chip],
-                            "receive": [target],
-                            "opponent_id": opp_id,
-                            "msv_approx": msv_approx,
-                        }
-                    )
-
-            # 2-for-1: give 2 chips, get must_receive + FA
-            if n_must_recv == 1 and fa_names:
-                best_fa = max(fa_names, key=lambda n: mew_lookup.get(n, 0.0))
-                recv_pvs = [pv_lookup.get(t, 0.0) for t in must_recv_list]
-                pv_recv = sum(recv_pvs)
-                max_recv = max(recv_pvs)
-                for i, c1 in enumerate(extra_chips[:8]):
-                    for c2 in extra_chips[i + 1 : 8]:
-                        pv_c1, pv_c2 = pv_lookup.get(c1, 0.0), pv_lookup.get(c2, 0.0)
-                        pv_send = pv_c1 + pv_c2
-                        if _opp_would_reject(
-                            pv_send, pv_recv, max(pv_c1, pv_c2), max_recv
-                        ):
-                            continue
-                        msv_approx = (
-                            sum(mew_lookup.get(t, 0.0) for t in must_recv_list)
-                            + mew_lookup.get(best_fa, 0.0)
-                            - mew_lookup.get(c1, 0.0)
-                            - mew_lookup.get(c2, 0.0)
-                        )
-                        approximate_trades.append(
-                            {
-                                "send": [c1, c2],
-                                "send_to_opp": [c1, c2],
-                                "receive": must_recv_list + [best_fa],
-                                "opponent_id": opp_id,
-                                "msv_approx": msv_approx,
-                            }
-                        )
-
-    if not approximate_trades:
-        print("search_trades_for_players: no PV-feasible candidates found")
-        return []
-
-    # Rank and exact-evaluate
-    approximate_trades.sort(key=lambda t: t["msv_approx"], reverse=True)
-    top_candidates = approximate_trades[:top_k]
-
-    print(
-        f"search_trades_for_players: {len(approximate_trades)} candidates, "
-        f"exact-evaluating top {len(top_candidates)}"
-    )
-
-    results: list[dict] = []
-    opponent_teams = sorted(
-        t
-        for t in players[players["owner"].notna()]["owner"].unique()
-        if t != my_team_name
-    )
-
-    for trade in tqdm(top_candidates, desc="Evaluating trades"):
-        opp_id = trade["opponent_id"]
-        send_set = set(trade["send"])
-        recv_set = set(trade["receive"])
-        send_to_opp = set(trade.get("send_to_opp", trade["send"]))
-
-        result = evaluate_trade(
-            send_names=send_set,
-            receive_names=recv_set,
-            my_roster_names=my_roster_names,
-            opponent_roster_names=opponent_rosters[opp_id],
-            trade_opponent_id=opp_id,
-            players=players,
-            opponent_totals=opponent_totals,
-            category_sigmas=category_sigmas,
-            current_ew=current_ew,
-            current_total_bv=current_total_bv,
-            pv_max_loss_frac=pv_max_loss_frac,
-            my_lineup=my_lineup,
-            send_to_opp_names=send_to_opp,
-            my_banked_totals=my_banked_totals,
-            trade_opponent_banked=(
-                opponent_banked.get(opp_id) if opponent_banked else None
-            ),
-        )
-
-        if not result["pv_feasible"]:
-            continue
-
-        if result["value"] < min_value:
-            continue
-
-        opp_name = (
-            opponent_teams[opp_id - 1]
-            if opp_id - 1 < len(opponent_teams)
-            else f"Opponent {opp_id}"
-        )
-        results.append(
-            {
-                "send": trade["send"],
-                "send_to_opp": sorted(send_to_opp),
-                "receive": trade["receive"],
-                "opponent": opp_name,
-                "msv_exact": result["msv"],
-                "delta_bv": result["delta_bv"],
-                "value": result["value"],
-                "opp_pv_loss_pct": result["opp_pv_loss_pct"],
-                "new_ew": result["new_ew"],
-            }
-        )
-
-    results.sort(key=lambda r: r["value"], reverse=True)
-    print(
-        f"search_trades_for_players: {len(results)} trades above min_value {min_value}"
-    )
-    return results
+    return search_trades(**kwargs)

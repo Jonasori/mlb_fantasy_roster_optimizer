@@ -35,29 +35,30 @@ send_o = {p ∈ out : dest(p) = o}    (players I send to opponent o)
 recv_o = {p ∈ in  : src(p) = o}     (players I receive from opponent o)
 ```
 
-If send_o ∪ recv_o ≠ ∅, a **Perceived Value (PV) constraint** must hold:
+If send_o ∪ recv_o ≠ ∅, a **trade-fairness constraint** must hold. Write V(X) = Σ_{p ∈ X} V(p) for the total **trade value** of a player set, where V is a per-player market-value function (Section 7). Two conditions, both relative to a tolerance δ ∈ [0, 1):
 
 ```
-PV(send_o) − PV(recv_o) ≥ −ε
+Aggregate:       [V(recv_o) − V(send_o)] / V(recv_o)  ≤  δ
+Per-player max:  max_{p ∈ send_o} V(p)  ≥  (1 − δ) × max_{p ∈ recv_o} V(p)
 ```
 
-where PV(X) = Σ_{p ∈ X} PV(p) and ε ≥ 0 is a small tolerance. The opponent accepts if they perceive the value received as roughly equal to or better than what they give up. See Section 7 for details.
+The aggregate condition says the opponent accepts if they lose at most a fraction δ of the value they give up. The per-player condition says the best player they receive must be comparable to the best player they surrender — **you need to send a star to get a star**. See Section 7 for why both are needed.
 
 Players with src/dest = FA have **no constraint** — free agent transactions are unilateral.
 
 **Examples.** Every roster transaction is a special case:
 
-| Move type | out (dest) | in (src) | PV constraint |
+| Move type | out (dest) | in (src) | Fairness constraint |
 |---|---|---|---|
 | FA swap | {A→FA} | {F←FA} | none |
-| 1-for-1 trade | {A→opp_j} | {B←opp_j} | PV(A) − PV(B) ≥ −ε |
-| 2-for-1 + FA fill | {A→opp_j, B→opp_j} | {C←opp_j, D←FA} | PV(A)+PV(B) − PV(C) ≥ −ε |
-| 1-for-2 + FA drop | {A→opp_j, C→FA} | {B₁←opp_j, B₂←opp_j} | PV(A) − PV(B₁)−PV(B₂) ≥ −ε |
-| 2-for-2 trade | {A→opp_j, B→opp_j} | {C←opp_j, D←opp_j} | PV(A)+PV(B) − PV(C)−PV(D) ≥ −ε |
+| 1-for-1 trade | {A→opp_j} | {B←opp_j} | on V(A) vs. V(B) |
+| 2-for-1 + FA fill | {A→opp_j, B→opp_j} | {C←opp_j, D←FA} | on V(A)+V(B) vs. V(C); max(V(A),V(B)) vs. V(C) |
+| 1-for-2 + FA drop | {A→opp_j, C→FA} | {B₁←opp_j, B₂←opp_j} | on V(A) vs. V(B₁)+V(B₂); V(A) vs. max(V(B₁),V(B₂)) |
+| 2-for-2 trade | {A→opp_j, B→opp_j} | {C←opp_j, D←opp_j} | on V(A)+V(B) vs. V(C)+V(D); max sent vs. max received |
 
-The PV constraint applies only to the opponent-routed portion. FA-routed players are unconstrained. Imbalanced trades (2-for-1, 1-for-2) emerge naturally: the FA-routed components fill or vacate roster spots to preserve |out| = |in|.
+The fairness constraint applies only to the opponent-routed portion. FA-routed players are unconstrained — note that in the 1-for-2 row, C is routed to FA and so does not count toward V(send_o). Imbalanced trades (2-for-1, 1-for-2) emerge naturally: the FA-routed components fill or vacate roster spots to preserve |out| = |in|.
 
-Multi-opponent moves (three-way trades) are handled identically — one PV constraint per opponent involved.
+Multi-opponent moves (three-way trades) are handled identically — one fairness constraint per opponent involved.
 
 ### Goal
 
@@ -238,22 +239,21 @@ The decomposition does NOT help with the probabilistic model directly. The Rosen
 
 1. **Lineup cascades**: the incoming player displaces a different starter than the one being dropped, triggering a chain of lineup changes. The gradient doesn't see cascading effects.
 2. **Large swaps**: if the swap shifts team totals enough to materially change the gradient (z-scores move significantly), the linear approximation is inaccurate. See Section 5 for quantitative bounds on gradient stability.
-3. **Bench players**: a bench player's MEW reflects what they would contribute *as a starter*, but their actual EW contribution from the bench is zero — their value comes entirely from insurance (Section 6). Naive screening formulas like `MSV_approx = MEW(FA) − MEW(drop)` are catastrophically wrong when the dropped player is on the bench, because they attribute starter-level EW contribution to a non-starter. The screening must be **lineup-aware** (see below).
+3. **Bench players**: a bench player's MEW reflects what they would contribute *as a starter*, but their actual EW contribution from the bench is zero — their value comes entirely from insurance (Section 6). So `MSV_approx = MEW(in) − MEW(out)` is badly wrong as an *estimate* of ΔEW when the outgoing player is on the bench: it attributes starter-level EW contribution to a non-starter. This is why the screening stage is used only to generate candidates, never to value them (see below).
 4. **Multi-position interactions**: a 2B/SS player's value depends on the depth at both positions, which the per-player score doesn't capture.
 5. **EW surface convexity in deeply-losing categories**: see Section 4a.
 
 ### The Screening + Exact Evaluation Architecture
 
-1. **Screen** (O(N), fast): compute MEW for all available players. For each candidate, compute a **lineup-aware** MSV_approx that asks "who enters and leaves the starting lineup?" rather than "who enters and leaves the roster?":
+The division of labour is deliberate and asymmetric: **screening owns recall and feasibility; evaluation owns value.**
 
-   - **Bench drop, FA displaces a current starter S**: `MSV_approx = MEW(FA) − MEW(S)`, where S is the weakest starter at the FA's best eligible slot.
-   - **Bench drop, FA doesn't displace any starter**: `MSV_approx = 0`. The FA's value (if any) comes only from ΔBV.
-   - **Starter drop, FA eligible for the vacated slot**: `MSV_approx = MEW(FA) − MEW(dropped_starter)`. Direct replacement.
-   - **Starter drop, FA takes a different slot (cascade)**: best bench player fills the vacated slot; FA may displace a different starter. Approximate as `(MEW(bench_fill) − MEW(drop)) + max(0, MEW(FA) − MEW(weakest_at_FA_slot))`. The exact evaluation handles cascades precisely.
+1. **Screen** (O(N), fast): compute MEW for all available players and rank candidates by `MSV_approx = Σ_{p ∈ in} MEW(p) − Σ_{p ∈ out} MEW(p)`. Keep top K.
 
-   Enforce protected-player constraints (sole eligible for a required slot cannot be dropped). Rank by `MSV_approx + ΔBV_approx`. Keep top K candidates.
+   No attempt is made to model the lineup at this stage. Given the case analysis above, a lineup-aware MSV_approx is achievable — but it buys nothing, because the exact evaluation recomputes ΔEW from a real MILP solve anyway. Every candidate that survives screening is re-valued from scratch, so screening error costs only **recall** (a good move ranked below the top K), never a wrong recommendation. The dominant recall failure is the bench case: a free agent who would merely sit can outrank a genuine upgrade. The league is small enough that raising K is the remedy.
 
-2. **Evaluate** (O(K × lineup_solve), slower): for each of the top K candidates, compute exact MSV by re-solving the lineup and recomputing EW. Recompute ΔBV from updated MEW (Section 6). The exact MSV catches lineup cascades, multi-position interactions, and nonlinear effects that screening cannot see.
+   What screening *does* own is **feasibility**, and there the checks are exact, not approximate: protected players (the last startable cover for a required slot may only be swapped for someone who also covers it), roster-composition bounds, and injury-stash protection. These are hard constraints, so they are enforced before any MILP solve rather than discovered by a failed one.
+
+2. **Evaluate** (O(K × lineup_solve), slower): for each of the top K candidates, compute exact MSV by re-solving the lineup and recomputing EW. Recompute ΔBV from updated MEW (Section 6). The exact MSV catches lineup cascades, multi-position interactions, and nonlinear effects that screening cannot see. **All reported numbers come from this stage.**
 
 ### 4a. EW Surface Convexity and Screening Bias
 
@@ -310,15 +310,17 @@ Opponent lineups are solved using **Fantasy Value (FV)** — a context-free z-sc
 
 FV is appropriate for opponents because we model them as optimizing context-free quality, not optimizing against specific category needs. FV does not depend on any team's gradient, so it introduces no circularity and can be computed once for all opponents.
 
-FV is NOT used for my team's lineup assignment (MEW is). FV serves two roles: (1) opponent lineup modeling, and (2) a context-free diagnostic for general player quality.
+FV is NOT used for my team's lineup assignment (MEW is). FV serves three roles: (1) opponent lineup modeling, (2) a context-free diagnostic for general player quality, and (3) the **default** trade value column (Section 7) — a placeholder standing in for a real market price until one is available.
 
 ### Scale and Performance
 
 With 28 binary decision variables and ~18 slot constraints, the lineup MILP solves in under 1 millisecond with HiGHS. This is negligible cost. Even 500 candidate evaluations complete in under a second.
 
-### MILP for Ceiling Analysis
+### MILP for Ceiling Analysis (not implemented)
 
-A separate, larger MILP can answer: "What is the best possible roster from the full candidate pool?" This is useful as a **diagnostic**, not as the move-planning tool. If the gap between current EW and the unconstrained ceiling is small, focus on bench depth and marginal trades. If the gap is large, there are major structural upgrades available and aggressive moves are warranted.
+A separate, larger MILP could answer: "What is the best possible roster from the full candidate pool?" — a **diagnostic**, never the move-planning tool. A small gap between current EW and the unconstrained ceiling means focus on bench depth and marginal trades; a large gap means major structural upgrades are available.
+
+This is a design note only. No ceiling diagnostic exists in the code, and the greedy optimizer's complementary-move blind spot (Section 8) is currently unmeasured.
 
 ---
 
@@ -407,19 +409,26 @@ This is a pure function of MEW scores and absence probabilities — no MILP solv
 
 The move abstraction (Section 1) unifies FA swaps and trades at the evaluation layer — `MSV(M)` is computed identically regardless of player sources. This section covers the additional concerns specific to moves involving opponent rosters.
 
-### The PV Constraint Model
+### The Trade-Fairness Constraint Model
 
-**Perceived Value (PV)** is a pre-computed model of how opponents subjectively value players. It captures the non-analytical factors that drive real trade acceptance: name recognition, age, recent stats, positional prestige, gut feel.
+**Trade value V(p)** is an exogenous per-player number standing in for what the rest of the league thinks a player is worth. It is deliberately **not a model** — no hand-tuned formula over projections, no fame premium. It is a single column, resolved at the call site (`value_column`, default the context-free FV), so it can be repointed at a real market price — auction salaries, an auction-value column, a consensus dynasty ranking — without touching any of the math below.
 
-The PV constraint defines the set of opponent-acceptable trades:
+This is a firm design boundary. Any function of our own projections is by construction correlated with our own MEW, which defeats the purpose: the constraint exists to encode *someone else's* valuation. A real market price is the only thing that does that honestly.
+
+The constraint defines the set of opponent-acceptable trades. For each opponent o involved, with tolerance δ:
 
 ```
-For each opponent o involved:  PV(send_o) − PV(recv_o) ≥ −ε
+Aggregate:       [V(recv_o) − V(send_o)] / V(recv_o)  ≤  δ
+Per-player max:  max_{p ∈ send_o} V(p)  ≥  (1 − δ) × max_{p ∈ recv_o} V(p)
 ```
 
-**The goal is PV balance ≈ 0** (opponent sees it as fair) **while MSV >> 0** (I gain significant EW). The information asymmetry — you're optimizing analytically, they're evaluating by feel — is the source of exploitable surplus.
+Both are **relative**, not absolute: δ is a fraction of the value at stake, so the same tolerance behaves sensibly for a swap of two waiver-wire arms and for a blockbuster.
 
-**Why not model mutual EW benefit instead?** It requires computing opponent EW accurately, assumes opponents are rational optimizers, and creates circularity (cost depends on trade terms, which depend on cost). PV resolves all three: it is a fixed function, defines a bounded search space, and within that space pure EW maximization applies.
+**Why the aggregate check alone is not enough.** Value is superadditive at the top of the market. Real owners will not trade one star for three useful regulars of equal summed value, because the star is scarce and the regulars are replaceable. An aggregate-only constraint happily proposes exactly that trade, and every such proposal is wasted. The per-player max condition encodes the missing structure: **to get a star you must send a star.** Together the two checks bound both the total and the shape of the package.
+
+**The goal is value balance ≈ 0** (opponent sees it as fair) **while MSV >> 0** (I gain significant EW). The information asymmetry — I optimize EW against my own category needs, they price by market consensus — is the source of exploitable surplus. A player can be simultaneously fairly priced and worth far more to my roster than to theirs.
+
+**Why not model mutual EW benefit instead?** It requires computing opponent EW accurately, assumes opponents are rational optimizers, and creates circularity (cost depends on trade terms, which depend on cost). An exogenous value column resolves all three: it is a fixed input, defines a bounded search space, and within that space pure EW maximization applies.
 
 ### Opponent Totals Update
 
@@ -439,17 +448,17 @@ For FA swaps, opponent totals are unchanged and no extra solve is needed.
 
 For each opponent o:
 1. **Identify targets**: players on o's roster with high MEW for my team
-2. **Identify trade chips**: my players with high PV but low MEW (valuable to opponents, expendable to me)
+2. **Identify trade chips**: my players with high trade value but low MEW (valuable to the market, expendable to me)
 3. **Enumerate candidate moves**: 1-for-1, 2-for-2, and imbalanced (2-for-1+FA, 1-for-2+drop) from chips × targets
-4. **Filter**: PV constraint on the opponent-routed portion
+4. **Filter**: fairness constraints (aggregate + per-player max) on the opponent-routed portion
 5. **Score**: MSV_approx via MEW
 6. **Exact evaluation**: compute exact MSV + ΔBV for top candidates via lineup re-solve (+ opponent re-solve for trades)
 
-Trade recommendations are presented alongside FA optimization results. The evaluation math is identical — the PV constraint and opponent totals update are the only trade-specific additions.
+Trade recommendations are presented alongside FA optimization results. The evaluation math is identical — the fairness constraint and opponent totals update are the only trade-specific additions.
 
 ### Trade Non-Convexity
 
-Multiple trades with the same opponent interact: trade A and trade B may each satisfy the PV constraint, but doing both changes both teams' rosters, potentially making the combined package infeasible or suboptimal. When considering multiple trades with one opponent, evaluate the **combined** move, not individual trades independently.
+Multiple trades with the same opponent interact: trade A and trade B may each satisfy the fairness constraint, but doing both changes both teams' rosters, potentially making the combined package infeasible or suboptimal. When considering multiple trades with one opponent, evaluate the **combined** move, not individual trades independently.
 
 ---
 
@@ -466,11 +475,11 @@ COMPUTE STATE
     Compute BV for all bench players
 
 SCREEN (O(N), fast)
-    Input: candidate pool (FA pool, opponent rosters, or both), constraints (PV for trades)
-    For each candidate add, pair with best drop(s) to maximize MSV_approx
-    Enforce: protected players (sole eligible for required slot) cannot be dropped
-    Enforce: PV constraint on opponent-routed portion (for trade candidates)
-    Rank by MSV_approx + ΔBV
+    Input: candidate pool (FA pool, opponent rosters, or both), constraints (fairness for trades)
+    For each candidate add, pair with best legal drop(s) to maximize MSV_approx
+    Enforce: slot coverage, roster composition, injury stash (Section 9c)
+    Enforce: fairness constraints on opponent-routed portion (for trade candidates)
+    Rank by MSV_approx (ΔBV is exact-only — see Section 4)
     Keep top K candidates
 
 EVALUATE (O(K × MILP), exact)
@@ -487,7 +496,7 @@ PRESENT
         Moves involving opponents → "trade" recommendations (require acceptance)
 ```
 
-The **evaluation math is identical** for all move types. The only branching is at the presentation layer (can I execute this unilaterally?) and in the constraint filtering during screening (PV applies to trade components only). This is inherent in the problem — FA moves are free, trades require consent — not an artifact of the algorithm.
+The **evaluation math is identical** for all move types. The only branching is at the presentation layer (can I execute this unilaterally?) and in the constraint filtering during screening (fairness applies to trade components only). This is inherent in the problem — FA moves are free, trades require consent — not an artifact of the algorithm.
 
 ### Greedy Optimizer (FA Moves)
 
@@ -505,16 +514,14 @@ Output: batch recommendation (all drops and adds)
 
 Each iteration recomputes the full gradient and MEW from scratch. This is essential: after each move, the team totals change, which changes the gradient, which changes which subsequent move is optimal. The greedy approach converges because EW exhibits approximate diminishing returns — improving in a category reduces |g_c| via the concavity of Φ.
 
-**Limitation:** greedy can miss **complementary moves** — two swaps that are each negative individually but positive together. For strategic awareness:
-- Periodically compute the **EW ceiling** via unconstrained MILP to gauge how far from optimal you are
-- If the ceiling gap is large, consider evaluating multi-player move combinations
+**Limitation:** greedy can miss **complementary moves** — two swaps that are each negative individually but positive together. This blind spot is currently unmeasured: there is no EW-ceiling diagnostic (Section 5). When a complementary pair is suspected, evaluate it directly as a single 2-for-2 move — exact MSV is indifferent to how many players a move touches.
 
 ### Trade Search (On-Demand)
 
 Trade search uses the same pipeline with different inputs:
 
 ```
-Run the unified pipeline with candidate_pool = opponent_rosters, constraints = [PV]
+Run the unified pipeline with candidate_pool = opponent_rosters, constraints = [fairness]
 ```
 
 Trade recommendations can include imbalanced trades (2-for-1, 1-for-2) with FA fills/drops, because the move abstraction and screening naturally enumerate these.
@@ -559,9 +566,13 @@ Since g_ERA < 0, the MSV contribution from ERA is **negative** — the model cor
 
 ### 9c. Roster Composition Constraints
 
-Every candidate move should be guarded against making the roster infeasible:
-- The screening step identifies "sole eligible" players (the only roster player who can fill a required slot) and protects them from being dropped. This filter runs before MILP evaluation, saving needless solves and keeping the top-K list clean.
-- The exact evaluation (MILP re-solve) enforces all position-slot constraints as a second guard: if the new roster can't fill all slots, the MILP fails, and the move is discarded.
+Every candidate move must be guarded against making the roster infeasible. Screening enforces three hard constraints before any MILP runs, so infeasible pairs never reach the top-K list:
+
+- **Slot coverage (conditional).** A player who is one of the last startable covers for a required slot may only be dropped for someone who *also* covers that slot — your only startable catcher can be swapped for a better catcher, not for an outfielder. Coverage is injury-aware: a player who cannot start provides no coverage and needs no protection.
+- **Roster composition.** The post-move active roster must stay within the league's hitter and pitcher bounds. Players on the IR sit outside those bounds and are not counted.
+- **Injury-stash protection.** A rest-of-season projection for an injured player is already their post-return value, while the lineup model scores them zero because they cannot start today. Dropping such a player therefore requires a strictly better replacement, so that future value is never traded for a lesser player.
+
+The exact evaluation (MILP re-solve) enforces all position-slot constraints as a second guard: if the new roster cannot fill every slot, the MILP fails and the move is discarded.
 
 ### 9d. Multi-Position Player Value
 
@@ -599,7 +610,7 @@ My lineup maximizes Σ MEW(starters) — context-aware, reflecting current categ
 | Expected return | E[portfolio return] | Expected wins (EW, range 0–60) |
 | Risk | Variance of return | σ_c (category-level projection uncertainty) |
 | Rebalancing | Selling X, buying Y | A move: out set, in set, tagged by source/dest |
-| Transaction cost | Bid-ask spread | Trade PV constraint (must appear fair to opponent) |
+| Transaction cost | Bid-ask spread | Trade-fairness constraint (must appear fair to opponent) |
 | Options / insurance | Call option on asset price | Bench player as insurance against starter injury |
 | Gradient / MCTR | Marginal contribution to risk | g_c = ∂EW/∂(my_c), the category gradient |
 | Screening alpha | Factor model score | MEW score (fast per-player ranking) |
@@ -609,22 +620,22 @@ My lineup maximizes Σ MEW(starters) — context-aware, reflecting current categ
 **One pipeline for all roster decisions:**
 
 1. **State**: compute my totals (MEW-optimal lineup), opponent totals (FV-optimal lineups), gradient, MEW for all players
-2. **Screen**: score all candidates from any pool (FA, opponent, mixed), enforce constraints (PV for trades, protected players), rank by approximate Value
+2. **Screen**: rank all candidates from any pool (FA, opponent, mixed) by MSV_approx, enforce constraints exactly (fairness for trades, protected players, roster composition). Screening owns recall and feasibility only — never reported value.
 3. **Evaluate**: exact MSV + ΔBV for top K via lineup MILP re-solve (+ opponent re-solve for trades)
 4. **Present**: partition by actionability — FA moves (execute) vs. trades (recommend)
 
 **Greedy loop** applies this pipeline iteratively for FA moves, executing the best move and recomputing state each round.
 
-**Trade search** applies the same pipeline on-demand with opponent rosters as the candidate pool and PV as the constraint.
+**Trade search** applies the same pipeline on-demand with opponent rosters as the candidate pool and trade fairness as the constraint.
 
 ### Key Decisions Made in This Framework
 
 - **One optimization target**: EW_season = E_a[EW(L*(R,a))], a single expected value across absence scenarios. BV is a derived first-order perturbation term, not a separate objective.
-- **One player-evaluation metric**: MEW is used for my lineup assignment, move screening, and BV computation. FV is reserved for opponent lineup modeling and diagnostics.
+- **One player-evaluation metric**: MEW is used for my lineup assignment, move screening, and BV computation. FV is reserved for opponent lineup modeling, diagnostics, and as the default stand-in for trade value.
 - **One BV formula**: gradient-based analytical BV, a pure function of MEW scores and absence probabilities. Used for both screening and evaluation. No MILP-based BV — the inherent roughness of absence estimation doesn't justify a more expensive computation.
-- **One pipeline for all move types**: FA swaps, trades, and mixed moves flow through the same state → screen → evaluate → present pipeline. The only branching is in constraint enforcement (PV for trades) and presentation (executable vs. recommendation).
+- **One pipeline for all move types**: FA swaps, trades, and mixed moves flow through the same state → screen → evaluate → present pipeline. The only branching is in constraint enforcement (fairness for trades) and presentation (executable vs. recommendation).
 - **The move abstraction unifies all transactions**: every roster change is (out, in) with tagged sources/destinations. Imbalanced trades emerge naturally as mixed opponent/FA components.
 - **Gradient as central object**: the category-level gradient g_c drives all player evaluation. Computed once per iteration, used to score every player.
 - **Screening + exact evaluation**: fast first-order pass identifies candidates; expensive exact computation verifies them.
-- **PV constraint for trades**: models real opponent behavior (subjective valuation), avoids game-theoretic circularity, defines a clean bounded search space.
+- **Trade-fairness constraint from an exogenous value column**: models real opponent behavior (market consensus, not our own projections), avoids game-theoretic circularity, defines a clean bounded search space. Two conditions — aggregate loss and per-player max — because value is superadditive at the top of the market.
 - **Opponent totals updated for trades**: one extra MILP solve per trade evaluation captures the effect of weakening/strengthening the trade partner.

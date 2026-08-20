@@ -57,17 +57,12 @@ ALL_TEAM_NAMES: list[str] = sorted(LEAGUE["fantrax_team_ids"].keys())
 # Numeric safety
 MIN_STAT_STANDARD_DEVIATION: float = LEAGUE["min_stat_standard_deviation"]  # 0.001
 
-# Perceived Value (trade-market perception) tuning. See player_scoring.add_perceived_value.
-_PV_CONFIG: dict = _CONFIG.get("perceived_value", {})
-FAME_WAR_THRESHOLD: float = _PV_CONFIG.get("fame_war_threshold", 3.0)
-FAME_WAR_SLOPE: float = _PV_CONFIG.get("fame_war_slope", 3.0)
-
-# Trade fairness: max fraction of PV an opponent will accept losing.
+# Trade fairness: max fraction of trade value an opponent will accept losing.
 _TRADE_CONFIG: dict = _CONFIG.get("trade_engine", {})
-PV_MAX_LOSS_FRAC: float = _TRADE_CONFIG.get("pv_max_loss_frac", 0.15)
+MAX_VALUE_LOSS_FRAC: float = _TRADE_CONFIG.get("max_value_loss_frac", 0.15)
 
 # Regular-season window (used to compute the fraction of season remaining,
-# e.g. for scaling rest-of-season WAR back to a full-season fame premium).
+# which rescales projection uncertainty σ to the remaining horizon).
 SEASON_START: datetime.date = datetime.date.fromisoformat(LEAGUE["season_start"])
 SEASON_END: datetime.date = datetime.date.fromisoformat(LEAGUE["season_end"])
 

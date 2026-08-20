@@ -98,37 +98,24 @@ for player in tqdm(candidates, desc="Computing sensitivities"):
 
 ## Package Management
 
-Use `uv` for dependency management. Create `pyproject.toml` at the project root:
-
-```toml
-[project]
-name = "roster-optimizer"
-version = "0.1.0"
-requires-python = ">=3.11"
-dependencies = [
-    "pandas>=2.0",
-    "numpy>=1.24",
-    "pulp>=2.8",
-    "highspy>=1.5",
-    "matplotlib>=3.7",
-    "seaborn>=0.12",
-    "scipy>=1.10",
-    "tqdm>=4.65",
-    "marimo>=0.8",
-]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
-
-[tool.hatch.build.targets.wheel]
-packages = ["optimizer"]
-```
+`uv`, ONE project at the repo root, two packages: `optimizer` (the math) and
+`data_prep` (fetch + join). `pyproject.toml` declares
+`packages = ["optimizer", "data_prep"]`. There is no nested sub-project — an
+earlier layout had `data_prep/` as its own uv project invoked by subprocess;
+that boundary bought nothing and is gone. Import across packages directly.
 
 **Installation:** `uv sync`
 
+**Fetch data:** `uv run fetch status` (staleness), then `uv run fetch <source>`
+and `uv run fetch build`. Each source refreshes independently — see
+`data_prep/README.md`.
+
 **Run notebook:** `uv run marimo edit notebook.py`
 **Run notebook as dashboard:** `uv run marimo run notebook.py`
+
+Note for marimo: two cells may never define the same name (marimo raises
+`MultipleDefinitionError`). Take shared objects like `pd` and `mo` as cell
+parameters from the `imports` cell rather than re-importing them.
 
 ---
 
@@ -158,7 +145,6 @@ The **column-level contract** for v2 is **`design_descriptions/IMPLEMENTATION_SP
 # `players` already satisfies design_descriptions/IMPLEMENTATION_SPEC.md §1 (silver).
 players = add_fantasy_value(players, ...)
 players = assign_optimal_slots(players, ...)
-players = add_perceived_value(players, ...)
 players = add_mew(players, ...)
 players = add_bench_value(players, ...)
 # Exact stage names, order, and side outputs are defined in IMPLEMENTATION_SPEC.
@@ -266,7 +252,7 @@ def compute_team_totals(
 
 For **v2 optimizer code**, the authoritative definition of the input `players` DataFrame—**required and optional columns**, **`-H` / `-P` `Name` values**, and **invariants**—is **`design_descriptions/IMPLEMENTATION_SPEC.md` §1**.
 
-Building that silver table (FanGraphs CSVs, Fantrax/roster data, name corrections, position merge, etc.) is **outside** the v2 math spec. Those steps must run **before** `players` enters the pipeline so the contract holds.
+Building that table (fetching each source into `data/raw/`, then reconciling identity across them in `data_prep.build.build_players`) is **outside** the v2 math spec. It must run **before** `players` enters the pipeline so the contract holds. ALL cross-source name/id reconciliation belongs in `build_players` — never in the optimizer.
 
 ### Display names
 

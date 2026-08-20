@@ -178,33 +178,6 @@ def solve_lineup(
 # ============================================================================
 
 
-def compute_team_totals(
-    roster_names: Iterable[str],
-    players: pd.DataFrame,
-    objective_column: str = "FV",
-) -> dict[str, float]:
-    """Solve lineup MILP then aggregate starters into team totals.
-
-    This is the workhorse function: MILP + aggregation in one call.
-    Passes objective_column through to solve_lineup.
-
-    CRITICAL: ratio stats are PA/IP-weighted averages, NOT sums.
-        OPS = Σ(PA × OPS) / Σ(PA)
-        ERA = Σ(IP × ERA) / Σ(IP)
-        WHIP = Σ(IP × WHIP) / Σ(IP)
-
-    Args:
-        roster_names: Player names on the roster (with -H/-P suffix).
-        players: Players DataFrame.
-        objective_column: Passed to solve_lineup.
-
-    Returns:
-        Dict mapping category to team total, plus 'PA' and 'IP'.
-    """
-    lineup = solve_lineup(roster_names, players, objective_column)
-    return compute_totals_for_starters(set(lineup.keys()), players)
-
-
 def compute_totals_for_starters(
     starters: set[str],
     players: pd.DataFrame,

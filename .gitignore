@@ -28,15 +28,16 @@ Thumbs.db
 # Contains sensitive Fantrax cookies — NOTE: git does not support inline
 # comments in .gitignore, so this must be on its own line above the pattern.
 config.json
-# Derived data artifacts (regenerable by data_prep) — anchored to both the
-# top-level data/ and the data_prep/data/ working directories.
-data/*.db
-data/*.json
-data/*.csv
-data/*.parquet
-data_prep/data/*.db
-data_prep/data/*.parquet
-data_prep/data/*.csv
+# Derived data artifacts (regenerable by data_prep). Patterns must be
+# recursive: an earlier `data_prep/data/*.csv` matched only the top level, so
+# every pulled_YYYYMMDD/ projection CSV stayed tracked (~110 MB).
+data/**/*.db
+data/**/*.json
+data/**/*.csv
+data/**/*.parquet
+data_prep/data/**/*.db
+data_prep/data/**/*.parquet
+data_prep/data/**/*.csv
 !data/.gitkeep
 !data_prep/data/.gitkeep
 

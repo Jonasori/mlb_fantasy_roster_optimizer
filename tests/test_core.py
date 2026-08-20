@@ -637,8 +637,8 @@ def test_msv_identity_swap():
     )
 
 
-def test_pv_constraint_filters_correctly():
-    """Trades where PV(send) − PV(receive) < −ε must be excluded."""
+def test_value_constraint_filters_correctly():
+    """Trades where value(send) − value(receive) < −ε must be excluded."""
     from optimizer.trade_finder import evaluate_trade
 
     rows = [
@@ -655,7 +655,6 @@ def test_pv_constraint_filters_correctly():
                 roster_status="active",
                 position="1B",
             ),
-            "PV": 1.0,
             "FV": 2.0,
             "MEW": 1.5,
         },
@@ -672,7 +671,6 @@ def test_pv_constraint_filters_correctly():
                 roster_status="active",
                 position="1B",
             ),
-            "PV": 5.0,
             "FV": 4.0,
             "MEW": 3.0,
         },
@@ -682,7 +680,8 @@ def test_pv_constraint_filters_correctly():
     my_roster = {"MyGuy-H"}
     opp_roster = {"TheirStar-H"}
 
-    # PV(send=MyGuy, 1.0) - PV(recv=TheirStar, 5.0) = -4.0 < -0.10
+    # Default value_column='FV': send 2.0 vs receive 4.0 → the opponent gives
+    # up 50% of the value they receive, far past the 10% they'd accept.
     result = evaluate_trade(
         send_names={"MyGuy-H"},
         receive_names={"TheirStar-H"},
@@ -718,12 +717,13 @@ def test_pv_constraint_filters_correctly():
         },
         current_ew=30.0,
         current_total_bv=0.0,
-        pv_max_loss_frac=0.10,
+        max_value_loss_frac=0.10,
     )
 
-    assert not result["pv_feasible"], (
-        f"Trade should be PV-infeasible (balance={result['pv_balance']:.2f}), "
-        f"but pv_feasible={result['pv_feasible']}"
+    assert not result["trade_feasible"], (
+        f"Trade should be value-infeasible "
+        f"(balance={result['value_balance']:.2f}), "
+        f"but trade_feasible={result['trade_feasible']}"
     )
 
 
@@ -1461,3 +1461,32 @@ def test_validate_balanced_swap_no_size_warning():
         f"Balanced 1-for-1 swap should not trigger a roster-size warning; "
         f"got {res['warnings']}"
     )
+
+
+def test_fv_ignores_undefined_rates_for_zero_volume_players():
+    """A rate over zero playing time is undefined and must not score.
+
+    ERA is z-scored NEGATED, so a stored 0.00 against a ~4.00 population mean
+    would be a large POSITIVE contribution — scoring a player with no innings as
+    the best pitcher in the league and letting the lineup MILP start him.
+    """
+    from optimizer.player_scoring import add_fantasy_value
+
+    rows = [
+        _make_pitcher("Good-P", ip=180, w=15, sv=1, k=200, era=2.80, whip=1.00),
+        _make_pitcher("Mid-P", ip=150, w=9, sv=4, k=140, era=4.10, whip=1.30),
+        _make_pitcher("Bad-P", ip=120, w=5, sv=9, k=90, era=5.40, whip=1.50),
+        # No innings: every stat stored as 0.0, including ERA/WHIP.
+        _make_pitcher("Prospect-P", ip=0, w=0, sv=0, k=0, era=0.0, whip=0.0),
+        _make_hitter("H1-H", pa=600, r=90, hr=30, rbi=90, sb=10, ops=0.850),
+        _make_hitter("H2-H", pa=400, r=50, hr=12, rbi=50, sb=4, ops=0.700),
+    ]
+    scored = add_fantasy_value(pd.DataFrame(rows))
+    fv = scored.set_index("Name")["FV"].to_dict()
+
+    assert fv["Prospect-P"] < fv["Bad-P"], (
+        f"A pitcher with zero innings must not outrank a real bad pitcher. "
+        f"Prospect FV={fv['Prospect-P']:.2f} vs Bad FV={fv['Bad-P']:.2f}. "
+        f"A stored ERA of 0.00 is being read as an elite rate."
+    )
+    assert fv["Prospect-P"] < fv["Good-P"], "Zero-innings pitcher must not lead"

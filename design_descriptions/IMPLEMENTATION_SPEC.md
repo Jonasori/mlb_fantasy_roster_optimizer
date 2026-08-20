@@ -18,6 +18,7 @@ The input to the math pipeline is a pandas DataFrame called `players` with one r
 | Column | Type | Description |
 |--------|------|-------------|
 | Name | str | Player name with -H (hitter) or -P (pitcher) suffix. Globally unique. |
+| PlayerId | str or None | FanGraphs player id, carried through `load_projections.py` → `build.py`. The join key for market-value data (e.g. Ottoneu auction salaries). None when the projection feed omits it. |
 | Team | str | MLB team abbreviation (e.g., "NYY", "LAD"). "FA" for free agents without a team. |
 | Position | str | Comma-separated eligible positions (e.g., "SS,2B", "SP", "OF"). |
 | player_type | str | "hitter" or "pitcher". |
@@ -33,11 +34,11 @@ The input to the math pipeline is a pandas DataFrame called `players` with one r
 | K | float | Projected strikeouts (renamed from FanGraphs "SO"). 0 for hitters. |
 | ERA | float | Projected ERA. 0 for hitters. |
 | WHIP | float | Projected WHIP. 0 for hitters. |
-| WAR | float | Projected WAR (for PV calculation). |
+| WAR | float | Projected WAR. Carried through for display and diagnostics; the math pipeline does not read it. |
 | owner | str or None | Fantasy team name (e.g., "The Big Dumpers") or None/NaN for free agents. |
 | roster_status | str or None | "active", "reserve", "IR", "minors", "taxi", or None for free agents. |
 
-### Optional columns (for PV calculation)
+### Optional columns
 
 | Column | Type | Description |
 |--------|------|-------------|
@@ -64,7 +65,6 @@ After the math pipeline runs, the players DataFrame gains these columns:
 |--------|------|--------|-------------|
 | FV | float | add_fantasy_value | Fantasy Value: context-free z-score sum across 5 categories per type. |
 | optimal_slot | str or None | assign_optimal_slots | Starting lineup slot (e.g., "SS", "SP") or None (bench/FA). |
-| PV | float | add_perceived_value | Perceived Value: how opponents subjectively value this player. |
 | MEW | float | add_mew | Marginal Expected Wins: gradient-based, context-aware per-player score. |
 | BV | float | add_bench_value | Bench Value: option premium for bench insurance (my bench only; 0 for others). |
 
@@ -146,10 +146,10 @@ optimizer/
 ├── players.py             # Name/position utilities
 ├── win_model.py           # EW computation, gradient, σ estimation
 ├── lineup_solver.py       # Lineup MILP, team totals
-├── player_scoring.py      # FV, PV, MEW (per-player scoring)
+├── player_scoring.py      # FV, MEW (per-player scoring)
 ├── league_state.py        # Fixed-point iteration, league-level state
 ├── swap_evaluator.py      # MSV, screening, exact evaluation, BV, greedy optimizer
-└── trade_finder.py        # Trade evaluation (same math + PV constraint + opponent re-solve)
+└── trade_finder.py        # Trade evaluation (same math + fairness constraint + opponent re-solve)
 ```
 
 ### Dependency DAG
@@ -235,11 +235,21 @@ def estimate_projection_uncertainty(
     variance. See W7 for why the distinction matters.
     """
 
-def compute_standings(
+def simulate_standings(
     my_totals: dict[str, float],
     opponent_totals: dict[int, dict[str, float]],
-) -> pd.DataFrame:
-    """Projected roto standings: rank and standing points per category."""
+    category_sigmas: dict[str, float],
+    n_sims: int = 20_000,
+    seed: int = 0,
+) -> dict:
+    """Monte Carlo final standings → P(win), P(top-2), point quantiles.
+
+    EW is risk-neutral: it says nothing about P(win the league), which is what
+    decides how much variance to seek late in a season. Samples each team's
+    totals ~ Normal(total_c, σ_c) — the SAME distributional assumptions as the
+    analytical model — so E[my standing points] converges to 10 + EW. That
+    identity is the consistency test (tests/test_core.py).
+    """
 ```
 
 ---
@@ -277,34 +287,26 @@ def solve_lineup(
     Returns dict mapping starter name → assigned slot. Bench players omitted.
     """
 
-def compute_team_totals(
-    roster_names: Iterable[str],
-    players: pd.DataFrame,
-    objective_column: str = "FV",
-) -> dict[str, float]:
-    """Solve lineup MILP then aggregate starters into team totals.
-
-    This is the workhorse function: MILP + aggregation in one call.
-    Passes objective_column through to solve_lineup.
-
-    CRITICAL: ratio stats are PA/IP-weighted averages, NOT sums.
-        OPS = Σ(PA × OPS) / Σ(PA)
-        ERA = Σ(IP × ERA) / Σ(IP)
-        WHIP = Σ(IP × WHIP) / Σ(IP)
-    """
-
 def compute_totals_for_starters(
     starters: set[str],
     players: pd.DataFrame,
 ) -> dict[str, float]:
-    """Team totals for a known set of starters (no MILP). Fast path.
+    """Team totals for a known set of starters (no MILP).
+
+    This is the workhorse aggregator. Callers that start from a roster
+    rather than a starter set pair it with solve_lineup, which also keeps
+    the lineup assignment available for downstream ΔBV computation.
 
     Returns dict with keys for all 10 categories PLUS 'PA' and 'IP':
         {'R': 823, 'HR': 245, ..., 'ERA': 3.85, ..., 'PA': 5200, 'IP': 1100}
 
     PA and IP are simple sums of starters. These are needed by the MEW
     formula (ratio stat baselines and total-weight denominators).
-    Counting stats are sums; ratio stats are weighted averages.
+
+    CRITICAL: ratio stats are PA/IP-weighted averages, NOT sums.
+        OPS = Σ(PA × OPS) / Σ(PA)
+        ERA = Σ(IP × ERA) / Σ(IP)
+        WHIP = Σ(IP × WHIP) / Σ(IP)
     """
 
 def assign_optimal_slots(
@@ -424,7 +426,7 @@ def compute_league_state(players: pd.DataFrame) -> dict:
 
 ## 8. `player_scoring.py` — Per-Player Scoring
 
-Merges v1's `player_scoring.py` (FV, PV) and v1's `player_valuation.add_mew` (MEW).
+Merges v1's `player_scoring.py` (FV) and v1's `player_valuation.add_mew` (MEW).
 
 All functions are DataFrame enrichment: `players` in → `players` with new column(s) out.
 
@@ -449,29 +451,7 @@ def add_fantasy_value(players: pd.DataFrame) -> pd.DataFrame:
     """
 ```
 
-### 8b. Perceived Value (PV)
-
-```python
-def add_perceived_value(players: pd.DataFrame) -> pd.DataFrame:
-    """Add 'PV' column: how opponents likely value a player in trade talks.
-
-    PV = max(FV, 0) + max(WAR − 3, 0) × 3
-
-    FV is the base: smart opponents evaluate players by projected fantasy
-    production. The fame premium (3 PV per WAR above 3.0) corrects FV's
-    systematic undervaluation of elite SPs (whose z-score totals are
-    suppressed by zero saves) and captures the general-quality / name-
-    recognition premium that real trade markets exhibit.
-
-    The per-player max constraint in trade_finder.py separately prevents
-    aggregating mid-tier players to acquire a superstar.
-
-    Requires: FV, WAR.
-    Adds: PV.
-    """
-```
-
-### 8c. Marginal Expected Wins (MEW)
+### 8b. Marginal Expected Wins (MEW)
 
 ```python
 def add_mew(
@@ -534,11 +514,11 @@ A "swap" is the universal operation: drop N players from my roster, add N player
 and multi-move batches are all swaps — same math, different constraints.
 
 - **FA swap**: add comes from FA pool. No constraint beyond roster fit.
-- **Trade**: add comes from an opponent's roster. PV constraint must be satisfied.
+- **Trade**: add comes from an opponent's roster. The trade-fairness constraint must be satisfied.
 - **Batch move**: trade + FA pickups evaluated together as a single N-for-N swap.
 
 By default, the optimizer only considers FA swaps. Trades are evaluated on
-request, subject to a PV constraint (see Section 10).
+request, subject to the fairness constraint (see Section 10).
 
 ### Dependencies
 
@@ -546,9 +526,10 @@ request, subject to a PV constraint (see Section 10).
 from .config import (
     ALL_CATEGORIES, HITTING_SLOTS, PITCHING_SLOTS, NEGATIVE_CATEGORIES,
     MY_TEAM_NAME, SLOT_ELIGIBILITY, N_STARTER_SLOTS, ROSTER_SIZE,
+    MIN_HITTERS, MAX_HITTERS, MIN_PITCHERS, MAX_PITCHERS,
 )
 from .lineup_solver import (
-    solve_lineup, compute_team_totals, compute_totals_for_starters,
+    solve_lineup, compute_totals_for_starters,
 )
 from .player_scoring import add_mew
 from .players import get_eligible_slots
@@ -602,9 +583,9 @@ def compute_exact_msv(
         7. new_ew, _ = compute_win_probability(new_totals, opponent_totals, category_sigmas)
         8. msv = new_ew − current_ew
 
-    Steps 5-6 use solve_lineup + compute_totals_for_starters (rather than
-    the combined compute_team_totals) so the lineup assignment is available
-    for downstream ΔBV computation in evaluate_top_k and evaluate_trade.
+    Steps 5-6 use solve_lineup + compute_totals_for_starters so the lineup
+    assignment is available for downstream ΔBV computation in evaluate_top_k
+    and evaluate_trade.
 
     Uses objective_column="MEW" for the lineup solve because this evaluates
     my team's roster (MATHEMATICAL_FRAMEWORK §5, §9h). The MEW values on the
@@ -628,68 +609,98 @@ def compute_exact_msv(
 For 1-for-1 FA swaps, call as `compute_exact_msv({drop}, {add}, ...)`.
 For a trade sending 2 + picking up 1 FA: `compute_exact_msv({a, b, c}, {x, y, z}, ...)`.
 
-### 9b. `screen_swaps` — Lineup-aware screening for all FA swaps
+### 9b. `screen_swaps` — Legality-filtered screening for all FA swaps
 
 ```python
+def compute_critical_slots(
+    my_roster_names: set[str],
+    players: pd.DataFrame,
+) -> dict[str, set[str]]:
+    """For each roster player, the slots that become unfillable without them.
+
+    Coverage is INJURY-AWARE: an IL player cannot start, so they neither
+    provide coverage nor need protection. A slot s with count k is
+    "critical" for player p when p is one of ≤ k startable covers —
+    dropping p would leave the slot short.
+
+    This is the basis for *conditional* drop protection: dropping p is only
+    sound if the incoming player covers all of p's critical slots (your only
+    startable catcher may be swapped for a better catcher, not for an
+    outfielder).
+
+    Returns {player_name: critical slots}, only for players with ≥ 1.
+    """
+
+def find_protected_players(
+    my_roster_names: set[str],
+    players: pd.DataFrame,
+) -> set[str]:
+    """Roster players that cannot be dropped for a non-covering replacement.
+
+    Injury-aware; the keys of compute_critical_slots. The conditional check
+    (does the incoming FA cover those slots?) lives in screen_swaps.
+    """
+
 def screen_swaps(
     players: pd.DataFrame,
     my_roster_names: set[str],
     my_lineup: dict[str, str],
     top_k: int = DEFAULT_SCREEN_TOP_K,
 ) -> pd.DataFrame:
-    """Screen all possible 1-for-1 FA swaps, ranked by approximate Value.
+    """Screen 1-for-1 FA swaps: top-MEW free agents vs. weakest legal drop.
 
-    Uses **lineup-aware** MSV_approx (MATHEMATICAL_FRAMEWORK §4): the EW
-    change from a swap depends on who enters and leaves the *starting lineup*,
-    not who enters and leaves the *roster*.
+    **The screen is deliberately dumb.** Its only job is to hand
+    `evaluate_top_k` a short list of plausible moves — exact ΔEW and ΔBV are
+    computed there. So free agents are ranked by raw MEW descending, and each
+    is paired with the lowest-MEW roster player it is *legal* to drop:
 
-    For each (FA, droppable_roster_player) pair, compute:
-        MSV_approx = lineup-aware EW change estimate (see cases below)
-        ΔBV_approx = change in total bench value (gradient-based)
+        msv_approx     = MEW(fa) − MEW(drop)
+        delta_bv_approx = 0.0
+        value_approx   = msv_approx
 
-    Approximate Value = MSV_approx + ΔBV_approx.
+    No approximate lineup-aware MSV, no approximate ΔBV. Screening error is
+    absorbed by exact evaluation; the screen only has to avoid *omitting*
+    good candidates.
 
-    Lineup-aware MSV_approx cases:
-        - Bench drop, FA displaces starter S at best eligible slot:
-            MSV_approx = MEW(FA) − MEW(S)
-        - Bench drop, FA doesn't start:
-            MSV_approx = 0
-        - Starter drop, FA eligible for vacated slot (direct replacement):
-            MSV_approx = MEW(FA) − MEW(dropped_starter)
-        - Starter drop, FA takes different slot (cascade):
-            Approximate as (MEW(bench_fill) − MEW(drop)) + FA displacement.
-            The exact evaluation handles cascades precisely.
+    Legality, by contrast, is NOT an approximation and is fully enforced here:
 
-    ΔBV_approx uses the gradient-based BV formula (Section 9d) with current
-    MEW values, without re-solving the lineup. When the swap involves only
-    bench players, ΔBV_approx is accurate. When lineup reshuffles occur
-    (dropping a starter), ΔBV_approx is rougher — exact evaluation handles it.
+    1. **Conditional drop protection** — the incoming FA must cover every
+       slot for which the dropped player is the last startable cover (see
+       compute_critical_slots). Injury-aware.
+    2. **Active-roster composition bounds** — the post-swap active roster
+       must stay within MIN_HITTERS…MAX_HITTERS and
+       MIN_PITCHERS…MAX_PITCHERS. Players with roster_status "IR" sit
+       outside the bounds and are not counted.
+    3. **IL-stash protection** — an IL player's rest-of-season projection is
+       already their post-return value, while the lineup model scores them
+       zero because they cannot start today. Dropping an IL player therefore
+       requires a strictly higher-MEW free agent.
 
     Algorithm:
-        1. Pre-filter: identify "protected" roster players (sole eligible
-           player for a required slot). These cannot be dropped.
-        2. Precompute per-slot weakest starter (for FA displacement check)
-           and per-slot best bench player (for cascade approximation).
-        3. For each FA f, find the droppable roster player r that maximizes
-           MSV_approx + ΔBV_approx.
-        4. Rank all (f, r) pairs by approximate Value descending. Keep top K.
+        1. critical = compute_critical_slots(my_roster_names, players)
+        2. droppable = my roster sorted by MEW ascending
+        3. FAs sorted by MEW descending; for each, take the first droppable
+           player passing all three legality checks and emit that pair
+        4. Stop once top_k pairs are collected; sort by value_approx desc
 
-    The exact evaluation phase (MILP re-solve + recomputed BV) handles
-    lineup cascades, position interactions, gradient changes, and EW
-    surface convexity that screening cannot see.
+    Known ceiling: raw-MEW ranking ignores lineup structure, so an FA who
+    would only sit on the bench can crowd a real upgrade out of the top_k.
+    Raising top_k is the fix if that ever bites.
 
     Args:
-        my_lineup: state['my_lineup'] from compute_league_state — a dict
-            mapping starter name → slot. Used to identify bench players,
-            compute lineup-aware MSV, and compute ΔBV_approx. Do NOT pass
-            state['my_starters'] (a set).
+        my_lineup: state['my_lineup'] from compute_league_state. Not used by
+            the screen itself; kept so existing callers need no change.
+        top_k: Maximum number of candidate swaps to return.
 
-    Requires columns: Name, owner, optimal_slot, MEW, Position, player_type.
-    Requires: add_mew() and add_bench_value() have already been called.
+    Requires columns: Name, owner, MEW, Position, player_type.
+        Optional: injury_status, roster_status (legality checks degrade
+        gracefully when absent).
+    Requires: add_mew() has already been called.
 
     Returns:
-        DataFrame with columns: fa_name, drop_name, msv_approx, delta_bv_approx, value_approx.
-        Sorted by value_approx descending. Length ≤ top_k.
+        DataFrame with columns: fa_name, drop_name, msv_approx,
+        delta_bv_approx, value_approx. Sorted by value_approx descending.
+        Length ≤ top_k.
     """
 ```
 
@@ -792,38 +803,12 @@ def add_bench_value(
     """
 ```
 
-### 9e. `compute_ew_ceiling` — Diagnostic for gap-to-optimal
+### 9e. *(retired)*
 
-```python
-def compute_ew_ceiling(
-    players: pd.DataFrame,
-    opponent_totals: dict[int, dict[str, float]],
-    category_sigmas: dict[str, float],
-) -> dict:
-    """Compute best achievable EW from full candidate pool (diagnostic).
-
-    Solves a larger MILP: pick ROSTER_SIZE players from all available
-    (my roster + FA pool) and assign 18 to starter slots, maximizing
-    Σ MEW(starters). MEW is the linear proxy for EW (EW itself is nonlinear
-    due to Φ). Position slot constraints are enforced. No PV constraint.
-
-    After solving, compute exact EW from the ceiling roster via
-    compute_totals_for_starters + compute_win_probability. The gap between
-    exact current EW and exact ceiling EW is the diagnostic.
-
-    This is NOT the optimizer — it is a diagnostic (MATHEMATICAL_FRAMEWORK §5).
-    If the gap between current EW and the ceiling is small, focus on bench
-    depth and marginal trades. If the gap is large, major structural upgrades
-    are available and aggressive moves are warranted.
-
-    Returns: {
-        'ceiling_ew': float,       # exact EW of the ceiling roster
-        'ceiling_roster': set[str],
-        'ceiling_lineup': dict,    # name → slot for the 18 starters
-        'gap': float,              # ceiling_ew − current_ew
-    }
-    """
-```
+Was `compute_ew_ceiling`, a gap-to-optimal diagnostic MILP (with a
+`plot_gap_to_ceiling` companion). Both are removed from the code. The number
+is left retired so §9f below still matches the section labels in
+`swap_evaluator.py`.
 
 ### 9f. `run_greedy_optimization` — The optimizer
 
@@ -848,7 +833,7 @@ def run_greedy_optimization(
            everything from scratch. On subsequent iterations, opponent totals
            are fixed; only my team's state is re-solved.
         2. Enrich players with MEW (from converged gradient) and BV
-        3. Screen all FA swaps via screen_swaps (ranked by MSV_approx + ΔBV_approx)
+        3. Screen all FA swaps via screen_swaps (ranked by MEW(fa) − MEW(drop))
         4. Exact-evaluate top K candidates (ΔEW + ΔBV, with recomputed gradient/MEW)
         5. If best Value > threshold: execute swap, update roster, loop to 1
         6. Else: stop
@@ -863,9 +848,9 @@ def run_greedy_optimization(
     concavity of Φ acts as a damper (MATHEMATICAL_FRAMEWORK §8).
 
     Limitation: greedy can miss complementary moves — two swaps that are
-    each negative individually but positive together. For strategic
-    awareness, use compute_ew_ceiling (Section 9e) to gauge how far
-    from optimal the greedy result is.
+    each negative individually but positive together. There is no
+    gap-to-optimal diagnostic; if this matters, evaluate multi-player move
+    combinations directly via compute_exact_msv (Section 9a).
 
     Output is a batch recommendation: the diff between the starting
     roster and the final optimized roster.
@@ -901,10 +886,7 @@ Trades are mathematically identical to FA swaps — same `compute_exact_msv`,
 same Value metric. The differences:
 
 1. The "adds" come from an opponent's roster, not the FA pool.
-2. Two PV constraints must be satisfied:
-   - **Aggregate**: opponent's total PV loss ≤ `pv_max_loss_frac` of what they give up.
-   - **Per-player max**: the most valuable player received can't vastly exceed
-     the most valuable player sent (prevents trading up by quantity).
+2. Two trade-fairness constraints must be satisfied (see below).
 3. Trades require opponent agreement (cannot be executed unilaterally).
 4. The affected opponent's totals change post-trade, requiring one extra
    MILP solve to re-solve their lineup (MATHEMATICAL_FRAMEWORK §7).
@@ -912,11 +894,54 @@ same Value metric. The differences:
 Because of (3), trades are NOT part of the greedy optimization loop.
 They are evaluated on request and presented as recommendations.
 
+### The trade value column
+
+Fairness is judged on one configurable per-player column, `value_column`
+(default `"FV"`): whatever number best approximates what the rest of the
+league thinks a player is worth. It is a **column name, not a formula** —
+point it at a real market price (e.g. Ottoneu auction salaries, joined on
+`PlayerId`) once that column exists and every check below follows unchanged.
+There is no hand-tuned valuation model in the optimizer.
+
+Both feasibility checks are **relative** fractions of `value_column`,
+governed by `max_value_loss_frac` (config.json `trade_engine.max_value_loss_frac`,
+surfaced as `MAX_VALUE_LOSS_FRAC`, default 0.15 = the opponent accepts up to
+a 15% loss):
+
+- **Aggregate** — the opponent's total value loss as a fraction of what they
+  give up must be ≤ `max_value_loss_frac`:
+
+  ```
+  (recv_value − send_value) / recv_value  ≤  max_value_loss_frac
+  ```
+
+  where `send_value` sums `value_column` over the players I route to the
+  opponent and `recv_value` over the players I receive from them. Keeps the
+  overall package roughly fair.
+
+- **Per-player max** — the highest-value player I *send* must be at least
+  `(1 − max_value_loss_frac)` × the highest-value player I *receive*:
+
+  ```
+  max_sent  ≥  max_recv × (1 − max_value_loss_frac)
+  ```
+
+  This prevents "trade up by quantity" — aggregating mid-tier players to
+  acquire a superstar. Opponents price stars above the sum of their parts,
+  so the aggregate check alone is not enough. **You need to send a star to
+  get a star.**
+
+A trade is feasible only if both hold. Both checks live in the shared helper
+`_opp_would_reject`, used by the exact evaluator and by both candidate
+enumerators so the approximate and exact stages can never disagree on
+feasibility. Only the opponent-routed portion of a move is checked;
+FA-routed components are unconstrained (MATHEMATICAL_FRAMEWORK §1).
+
 ### Constants
 
 ```python
-DEFAULT_PV_TOLERANCE: float = 0.10  # ε: opponent tolerates losing up to ε PV
-DEFAULT_TRADE_MAX_SIZE: int = 2     # max players per side
+DEFAULT_MAX_VALUE_LOSS_FRAC: float = MAX_VALUE_LOSS_FRAC  # from config.json
+DEFAULT_TRADE_MAX_SIZE: int = 2                            # max players per side
 ```
 
 ### 10a. `evaluate_trade` — Score a specific trade proposal
@@ -933,15 +958,19 @@ def evaluate_trade(
     category_sigmas: dict[str, float],
     current_ew: float,
     current_total_bv: float,
-    pv_tolerance: float = DEFAULT_PV_TOLERANCE,
+    value_column: str = "FV",
+    max_value_loss_frac: float = DEFAULT_MAX_VALUE_LOSS_FRAC,
 ) -> dict:
     """Evaluate a specific trade, including opponent roster change and ΔBV.
 
-    Same math as any swap (Value = MSV + ΔBV), plus PV check and opponent
-    lineup re-solve. See MATHEMATICAL_FRAMEWORK §7 for full rationale.
+    Same math as any swap (Value = MSV + ΔBV), plus the two-part fairness
+    check and an opponent lineup re-solve. See MATHEMATICAL_FRAMEWORK §7.
 
     Steps:
-        1. PV check: pv_balance = PV(send) − PV(receive). Must be ≥ −ε.
+        1. Fairness check on value_column, opponent-routed portion only:
+           send_value / recv_value → aggregate loss fraction and the
+           per-player max check. Both must pass or trade_feasible is False
+           and the evaluation short-circuits.
         2. My new roster: (my_roster − send) ∪ receive
         3. my_new_lineup = solve_lineup(my_new_roster, players, "MEW")
            my_new_totals = compute_totals_for_starters(set(my_new_lineup.keys()), players)
@@ -973,18 +1002,22 @@ def evaluate_trade(
     A trade can be combined with FA moves in a single batch:
         send_names = {traded_out_1, traded_out_2, fa_drop_1}
         receive_names = {traded_in_1, fa_pickup_1, fa_pickup_2}
-    The PV constraint applies only to the trade portion; FA moves are free.
+    The fairness constraint applies only to the opponent-routed portion; FA
+    moves are free. Callers pass the opponent-routed subset explicitly when
+    a send set mixes destinations (MATHEMATICAL_FRAMEWORK §1: moves carry
+    dest/src tags).
 
     Returns:
         {
             'msv': float,
             'new_ew': float,
             'delta_bv': float,
-            'value': float,           # msv + delta_bv
-            'pv_balance': float,
-            'pv_feasible': bool,
-            'new_totals': dict,       # my post-trade team totals
-            'new_lineup': dict,       # my post-trade lineup assignment
+            'value': float,               # msv + delta_bv
+            'value_balance': float,       # value sent − value received
+            'opp_value_loss_pct': float,  # % of value the opponent loses
+            'trade_feasible': bool,
+            'new_totals': dict,           # my post-trade team totals
+            'new_lineup': dict,           # my post-trade lineup assignment
         }
     """
 ```
@@ -1001,32 +1034,41 @@ def search_trades(
     category_sigmas: dict[str, float],
     current_ew: float,
     current_total_bv: float,
-    pv_tolerance: float = DEFAULT_PV_TOLERANCE,
+    value_column: str = "FV",
+    max_value_loss_frac: float = DEFAULT_MAX_VALUE_LOSS_FRAC,
     max_trade_size: int = DEFAULT_TRADE_MAX_SIZE,
-    top_k: int = 30,
-    min_value: float = 0.1,
+    must_send: set[str] | None = None,
+    must_receive: set[str] | None = None,
+    top_k: int | None = None,
+    min_value: float | None = None,
 ) -> list[dict]:
-    """Enumerate and rank PV-feasible trades, including imbalanced.
+    """Enumerate and rank feasible trades, including imbalanced ones.
 
     This is a search utility, not part of the core optimization loop.
 
-    For each opponent o:
+    For each searched opponent o:
         1. TARGETS: their players with high MEW (I want them)
-        2. CHIPS: my players with high PV but low MEW (expendable to me)
+        2. CHIPS: my players the market likes more than my lineup needs —
+           high `value_column` rank, low MEW rank (expendable to me)
         3. Enumerate trade shapes (MATHEMATICAL_FRAMEWORK §1):
            - 1-for-1: {chip} ↔ {target}
            - 2-for-2: {chip₁, chip₂} ↔ {target₁, target₂}
            - 2-for-1 + FA fill: send {chip₁, chip₂} to opp, receive {target},
              pick up best FA to maintain roster size
            - 1-for-2 + FA drop: send {chip} to opp, receive {target₁, target₂},
-             drop lowest-value roster player to maintain roster size
-        4. Filter: PV constraint on opponent-routed portion only
-           (FA-routed components are unconstrained)
-        5. Score: MSV_approx + ΔBV_approx (MATHEMATICAL_FRAMEWORK §8 screening
-           ranks all move types by approximate Value). MSV_approx from MEW
-           differences; ΔBV_approx from gradient-based BV (same as screen_swaps).
-        6. Exact-evaluate top K: evaluate_trade (my re-solve + opponent re-solve
-           + ΔBV). Rank by value = msv + delta_bv.
+             drop lowest-MEW bench player to maintain roster size
+        4. Filter: both fairness checks (aggregate + per-player max) on the
+           opponent-routed portion only; FA-routed components are
+           unconstrained. Same `_opp_would_reject` helper the exact
+           evaluator uses, so the two stages cannot disagree.
+        5. Score: MSV_approx = Σ MEW(receive) − Σ MEW(send). No approximate
+           ΔBV — exact ΔBV comes from evaluate_trade, mirroring screen_swaps.
+        6. Exact-evaluate top K: evaluate_trade (my re-solve + opponent
+           re-solve + ΔBV). Rank by value = msv + delta_bv.
+
+    `must_send` / `must_receive` pin players into every candidate ("what can
+    I get for X?", "what do I have to give up for Y?"); with neither set the
+    search runs broad over the full cross product per opponent.
 
     Imbalanced trades emerge naturally from the move abstraction
     (MATHEMATICAL_FRAMEWORK §1): FA-routed components fill or vacate
@@ -1035,12 +1077,13 @@ def search_trades(
     Returns list of:
         {
             'send': list[str],
+            'send_to_opp': list[str],     # opponent-routed subset of send
             'receive': list[str],
             'opponent': str,
             'msv_exact': float,
             'delta_bv': float,
-            'value': float,           # msv_exact + delta_bv
-            'pv_balance': float,
+            'value': float,               # msv_exact + delta_bv
+            'opp_value_loss_pct': float,
             'new_ew': float,
         }
     """
@@ -1083,8 +1126,10 @@ def test_team_totals_weighted_average():
 def test_msv_identity_swap():
     """Swapping a player with themselves → MSV = 0."""
 
-def test_pv_constraint_filters_correctly():
-    """Trades where PV(send) − PV(receive) < −ε must be excluded."""
+def test_trade_fairness_filters_correctly():
+    """Both fairness checks on value_column must exclude infeasible trades."""
+    # Aggregate: opponent losing > max_value_loss_frac of value given up.
+    # Per-player max: many mid-tier players for one star (max_sent too low).
 
 def test_gradient_based_bv_position_aware():
     """Bench player eligible for high-absence slot should have higher BV."""
@@ -1176,7 +1221,7 @@ For FA swaps (`compute_exact_msv`), opponent totals are unchanged — no extra s
 ### W10. Trade non-convexity: evaluate combined moves
 
 Multiple trades with the same opponent interact: trade A and trade B may each
-satisfy the PV constraint individually, but doing both changes both teams'
+pass the fairness checks individually, but doing both changes both teams'
 rosters, potentially making the combined package infeasible or suboptimal
 (MATHEMATICAL_FRAMEWORK §7). When considering multiple trades with one opponent,
 evaluate the **combined** move (all sends and receives as one batch), not
@@ -1192,17 +1237,23 @@ If the iteration reaches `_MAX_LINEUP_ITERATIONS` without converging (oscillatio
 between two lineups), evaluate both and pick the one with higher actual EW. Log
 a warning. Total cost: at most 3 MILP solves (< 3ms).
 
-### W12. Screening MSV must be lineup-aware
+### W12. Screening `msv_approx` is not an EW estimate — never report it as one
 
-The naive formula `MSV_approx = MEW(FA) − MEW(drop)` is **catastrophically wrong**
-when dropping a bench player. A bench player contributes zero EW to the starting
-lineup — their value is captured entirely by BV (Section 9d). The naive formula
-incorrectly attributes starter-level contribution to bench players, producing
-phantom MSV_approx values of 4–5 EW for swaps with zero actual MSV.
+`screen_swaps` computes `msv_approx = MEW(fa) − MEW(drop)`, which is not
+lineup-aware. A bench player contributes zero EW to the starting lineup — their
+value is captured entirely by BV (Section 9d) — so a bench-drop pair can carry a
+phantom `msv_approx` of several EW when the true ΔEW is zero.
 
-The correct approach (`_lineup_aware_msv` in `screen_swaps`): determine who actually
-enters and leaves the starting lineup after the swap, and compute MSV_approx from
-that lineup change. See MATHEMATICAL_FRAMEWORK §4 for the full case analysis.
+This is an accepted limitation, not a bug: `msv_approx` is a **ranking key for
+candidate generation only**. Every number a user sees comes from
+`evaluate_top_k` / `evaluate_trade`, which re-solve the lineup and compute exact
+ΔEW and ΔBV. Do not surface `msv_approx` or `value_approx` as a recommendation,
+and do not threshold on them.
+
+The cost is recall, not correctness: an FA who would only sit on the bench can
+crowd a real upgrade out of the top_k. Raise `top_k` if that bites. See
+MATHEMATICAL_FRAMEWORK §4 for why the first-order approximation breaks down on
+bench players.
 
 ### W13. EW surface convexity biases gradient-based screening
 
@@ -1233,7 +1284,7 @@ category, always compute exact EW. See MATHEMATICAL_FRAMEWORK §4a.
 - test_core.py — test stubs can start in Phase 1
 
 **Phase 3** (depends on Phase 2):
-- player_scoring.py — FV/PV from v1, add MEW (takes gradient as input)
+- player_scoring.py — FV from v1, add MEW (takes gradient as input)
 
 **Phase 4** (depends on Phase 3):
 - league_state.py — new: fixed-point iteration, calls add_mew

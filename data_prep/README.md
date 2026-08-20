@@ -1,128 +1,94 @@
 # Data prep (`data_prep`)
 
-Builds the **silver** `players` table: FanGraphs projections, merged with Fantrax rosters/positions/pool stats, then MLB Stats API ages. Downstream optimizers (v1/v2) read the written file or call `build_silver_table` in process.
+Fetch each source independently into a **raw layer** of dated snapshots, then
+**join once** into the wide `players` table all analysis reads.
 
-## Run: write silver table to disk
+```
+data/raw/projections/{steamer,atc}/YYYY-MM-DD.parquet   daily,  browser cookies
+data/raw/fantrax/YYYY-MM-DD.parquet                     on txn, PASTED cookies
+data/raw/standings/YYYY-MM-DD.parquet                   on txn, PASTED cookies
+data/raw/market/{ottoneu,adp,espn,hkb}/YYYY-MM-DD.parquet  daily, no auth
+data/raw/identity/YYYY-MM-DD.parquet                    ~never, no auth
+                              |
+                              v  build.build_players()
+data/players.parquet          the one wide table
+```
 
-From this directory:
+Storage is partitioned by **refresh cadence and auth**, not by processing stage.
+That is deliberate. The previous design baked projections, Fantrax rosters and
+ages into one "silver" table, so every refresh had to satisfy the union of their
+requirements: a stale Fantrax cookie blocked getting fresh projections, and the
+table could only ever hold one projection system. Both problems disappear when
+each source lands on its own.
+
+## Run
 
 ```bash
-cd data_prep
-uv sync
-uv run build-silver-table
+uv run fetch status         # how stale is each source?
+uv run fetch market         # no auth — safe anytime
+uv run fetch identity       # no auth
+uv run fetch projections    # FanGraphs, via browser cookies
+uv run fetch fantrax        # needs FRESH cookies in config.json
+uv run fetch build          # join latest snapshots -> data/players.parquet
+uv run fetch build --system steamer    # same snapshots, different projections
+uv run fetch all            # every source, then build
 ```
 
-Default output: **`data/silver_table.parquet`** (path is `data_prep/data/silver_table.parquet` relative to the repo).
+Switching projection systems is a read from a different directory — no rebuild,
+no re-auth. Reproduce a past day with `build_players(on_or_before=date(...))`.
 
-CSV instead:
+Only **Fantrax** needs hand-pasted cookies in repo-root `config.json` (see
+[docs/FANTRAX_API.md](docs/FANTRAX_API.md)); they expire every few weeks. Every
+other source is free to refresh.
 
-```bash
-uv run build-silver-table --output data/silver_table.csv
-```
+## Layers
 
-Custom projection files (otherwise uses `config.json` + latest `data/pulled_YYYYMMDD/`):
+**Fetchers** — one module per source, each writing raw snapshots verbatim. No
+cross-source joins, no derived values. `raw_io` holds the storage contract
+(`write_raw`, `read_latest_raw`, `available_dates`, `snapshot_ages`).
 
-```bash
-uv run build-silver-table \
-  --hitter data/pulled_20260323/fangraphs-atc-pt-adjusted-hitters.csv \
-  --pitcher data/pulled_20260323/fangraphs-atc-pt-adjusted-pitchers.csv \
-  -o data/silver_table.parquet
-```
+| Module | Writes |
+|---|---|
+| `scrape_fangraphs` | `raw/projections/{steamer,atc}` |
+| `fantrax_api` | `raw/fantrax`, `raw/standings` |
+| `market` | `raw/market/{ottoneu,adp,espn,hkb}` |
+| `mlb_api` | `raw/identity` |
 
-Skip MLB Stats API age fetch (Fantrax ages only):
+**The join** — `build.build_players()` is the *only* place identity is
+reconciled across sources. Keys in order of trust: `MLBAMID` (MLB's own),
+`PlayerId` (FanGraphs, and Ottoneu's `fg_id`), then normalized name as a last
+resort. No provider covers everyone, so each merge is a **cascade**: strong key
+first, name for the remainder. That measurably beats either key alone — Ottoneu
+prices 951 players by FanGraphs id but 987 by id-then-name, because ~245 of its
+rows are minor leaguers carrying only a FanGraphs *minor*-league id.
 
-```bash
-uv run build-silver-table --skip-mlb-api
-```
+Only projections are load-bearing. A missing Fantrax snapshot yields a table
+with no ownership; a missing market snapshot yields one without the dynasty
+axis.
 
-### Programmatic
+## `players` table contract
 
-```python
-from data_prep import (
-    build_silver_table,
-    write_silver_table,
-    HITTER_PROJ_PATH,
-    PITCHER_PROJ_PATH,
-    SILVER_TABLE_DEFAULT_PATH,
-)
+Identity: `Name` (with the `-H`/`-P` suffix distinguishing a two-way player's
+two sides), `Team`, `Position`, `player_type`, `PlayerId`, `MLBAMID`,
+`fantrax_id`, `age`, `birth_date`.
 
-players = build_silver_table(HITTER_PROJ_PATH, PITCHER_PROJ_PATH)
-write_silver_table(players, SILVER_TABLE_DEFAULT_PATH)
-```
+Projections: `PA R HR RBI SB OPS` / `IP W SV K ERA WHIP`, plus `WAR`. All 12
+scoring stats are always present and non-null — zero for the opposite player
+type — so the MEW formula needs no hitter/pitcher branching.
 
-Requires valid **Fantrax cookies** in repo-root `config.json` (see [docs/FANTRAX_API.md](docs/FANTRAX_API.md)).
+Fantrax: `owner` (null = free agent), `roster_status`, `injury_status`,
+`injury_detail`, `fantrax_score`, `pct_rostered`.
 
----
+Market: `market_value` (Ottoneu median salary), `salary_momentum` (last-10
+auctions vs. median), `adp`, `pct_owned`, `dynasty_value`, `dynasty_rank`.
 
-## Config and data layout
+Downstream columns (`FV`, `MEW`, `BV`, `optimal_slot`) are added by `optimizer/`,
+not here.
 
-- **Config:** `mlb_fantasy_roster_optimizer/config.json`.
-- **Projections:** Downloaded CSVs live under **`data_prep/data/`**, usually in `pulled_YYYYMMDD/`. The package picks the newest `pulled_*` folder (see `data_prep.config.find_latest_projection_folder`).
-- **Silver default path:** `data_prep.config.SILVER_TABLE_DEFAULT_PATH` → `data/silver_table.parquet`.
-
----
-
-## Playing time adjustment: how the external DB is used
-
-PT adjustment is **optional** and **separate** from `build_silver_table`. It reads raw FanGraphs-style CSVs and writes adjusted CSVs; the silver build then consumes whatever hitter/pitcher paths `config.json` points at (`use_adjusted` / file names).
-
-### Where the databases live
-
-| Source | Default path | Purpose |
-|--------|----------------|--------|
-| **Historical PA / IP** | `{parent_of_repo}/mlb_player_comps_dashboard/mlb_stats.db` | Actual 2023–2024 (by season) PA for hitters, IP (and GS) for pitchers, keyed by `player_id` = FanGraphs `MLBAMID` |
-| **Ages for PT step** | `data_prep/data/optimizer.db` | SQLite `players` table: `MLBAMID`, `age` — used only inside `adjust_projections()` for the age factor |
-
-Default `MLB_STATS_DB` is computed in `data_prep/playing_time.py` as:
-
-```text
-Path(__file__).resolve().parent.parent.parent.parent / "mlb_player_comps_dashboard" / "mlb_stats.db"
-```
-
-i.e. **sibling directory to `mlb_fantasy_roster_optimizer`** named `mlb_player_comps_dashboard`. If that file is missing, historical stats are treated as empty (no PA/IP shrink from history).
-
-Override when calling:
-
-```python
-from data_prep.playing_time import adjust_projections, MLB_STATS_DB
-
-adjust_projections(mlb_stats_db="/path/to/mlb_stats.db", optimizer_db="/path/to/optimizer.db")
-```
-
-### End-to-end trace (`adjust_projections`)
-
-1. **Load inputs:** Read hitter and pitcher CSVs from `hitters_input` / `pitchers_input` (defaults under `data_prep/data/`).
-2. **`_load_historical(mlb_stats_db)`:** If `mlb_stats.db` exists, run SQL aggregations for seasons 2024 and 2023 (hitters: `game_logs.pa`; pitchers: `pitcher_game_logs.ip`, `gs`). If the file is missing, both DataFrames are empty.
-3. **`_load_ages(optimizer_db)`:** If `optimizer.db` exists and has a `players` table with `mlbamid` and `age`, load ages; else empty.
-4. **`_adjust_hitters` / `_adjust_pitchers`:**
-   - Merge historical wide columns (`pa_2024`, `pa_2023` or `ip_*`) onto rows by `MLBAMID`.
-   - Merge ages onto rows by `MLBAMID`.
-   - For each row, **`_compute_historical_ratio`:** compare average of available actual PA (or IP) to **projected** PA (or IP); ratio = `min(1.0, actual_avg / projected)`; if no history, ratio = 1.0.
-   - **`_compute_age_factor`:** If age above threshold (hitter 32, pitcher 33), apply a linear penalty (5% per year over, floor 0.5); missing age → 1.0.
-   - **`_compute_talent_factor`:** If WAR below league 25th percentile for that file, multiply by 0.85; else 1.0.
-   - **`_blend`:** New PA (or IP) = `0.65 * projected + 0.35 * (projected * hist_ratio * age_factor * talent_factor)`.
-   - **Counting stats:** Every column listed in `HITTER_COUNTING_COLS` / `PITCHER_COUNTING_COLS` present in the CSV is multiplied by `(new_PA / old_PA)` or `(new_IP / old_IP)` so rates implied by FanGraphs totals stay consistent. **OPS, ERA, WHIP, etc. are not scaled** (they are not in those lists).
-5. **Write** `hitters_output` and `pitchers_output` CSVs.
-
-So: **`mlb_stats.db` drives how much we trust projected volume vs recent reality; `optimizer.db` only feeds the age penalty inside PT adjustment**, not the silver merge (silver ages come from Fantrax + MLB API in `build_silver_table`).
-
-More detail: [docs/PLAYING_TIME_ADJUSTMENT.md](docs/PLAYING_TIME_ADJUSTMENT.md).
-
----
-
-## Documentation ported from v1 `implementation_specs`
+## Docs
 
 | Doc | Topic |
 |-----|--------|
-| [docs/PLAYING_TIME_ADJUSTMENT.md](docs/PLAYING_TIME_ADJUSTMENT.md) | PT module, DBs, blend formula |
-| [docs/FANGRAPHS_LOADING.md](docs/FANGRAPHS_LOADING.md) | CSV expectations + `load_projections` behavior |
+| [docs/FANGRAPHS_LOADING.md](docs/FANGRAPHS_LOADING.md) | FanGraphs field expectations |
 | [docs/FANTRAX_API.md](docs/FANTRAX_API.md) | Auth, endpoints, parsing notes |
-| [docs/MLB_STATS_API.md](docs/MLB_STATS_API.md) | Ages batch fetch (`mlb_api`) |
-
-Original paths: `v1/implementation_specs 14-27-50-693/*.md`.
-
----
-
-## Silver table contract
-
-Columns align with v2’s silver input: `Name` (-H/-P), `Team`, `Position`, `player_type`, counting/rate stats, `WAR`, `owner`, `roster_status`, optional `fantrax_score`, `pct_rostered`, `age`, `MLBAMID`. No `FV`, `optimal_slot`, `PV`, `MEW`, `EWA` (gold layer).
+| [docs/MLB_STATS_API.md](docs/MLB_STATS_API.md) | Identity batch fetch |

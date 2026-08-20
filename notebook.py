@@ -34,239 +34,94 @@ def projection_controls(mo):
         value="ATC",
         label="Projection system",
     )
-    rebuild_data = mo.ui.button(
-        value=0,
-        on_click=lambda v: v + 1,
-        label="Rebuild pipeline (scrape + build silver table)",
-    )
     team_perspective = mo.ui.dropdown(
         label="Team perspective",
         options=ALL_TEAM_NAMES,
         value=MY_TEAM_NAME,
     )
-    return projection_system, rebuild_data, team_perspective
+    return projection_system, team_perspective
 
 
 @app.cell
-def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
-    import subprocess
-    from datetime import date
-    from pathlib import Path
+def data_freshness(mo):
+    """Show how stale each source is. Fetching is a CLI job, not a notebook job.
 
+    Each source refreshes independently (`uv run fetch <source>`), so a stale
+    Fantrax cookie never blocks refreshing projections or market prices.
+    """
+    from data_prep.cli import SOURCES
+    from data_prep.raw_io import snapshot_ages
+
+    _ages = snapshot_ages(SOURCES)
+    _stale = _ages[(_ages["days_old"].isna()) | (_ages["days_old"] > 3)]
+    freshness_section = mo.vstack(
+        [
+            mo.ui.table(_ages, selection=None, page_size=10),
+            mo.callout(
+                mo.md(
+                    "**Stale sources.** Refresh with `uv run fetch <source>`:\n\n"
+                    + "\n".join(
+                        f"- `uv run fetch "
+                        f"{r['source'].split('/')[0]}` — {r['source']} "
+                        + (
+                            "never fetched"
+                            if r["n_snapshots"] == 0
+                            else f"{r['days_old']}d old"
+                        )
+                        for _, r in _stale.iterrows()
+                    )
+                    + "\n\nThen `uv run fetch build`."
+                ),
+                kind="warn",
+            )
+            if len(_stale) > 0
+            else mo.md("*All sources fresh.*"),
+        ]
+    )
+    return (freshness_section,)
+
+
+@app.cell
+def data_pipeline(pd, projection_system, team_perspective):
+    """Read the joined players table and run the scoring pipeline.
+
+    All ingestion and identity reconciliation happened upstream in
+    `data_prep.build.build_players`; this cell only scores what it is given.
+    """
+    from data_prep.build import build_players
+    from data_prep.raw_io import available_dates, read_latest_raw
     from optimizer.banked import standings_to_banked_totals
     from optimizer.config import season_fraction_remaining
     from optimizer.league_state import compute_league_state
     from optimizer.lineup_solver import assign_optimal_slots
-    from optimizer.player_scoring import add_fantasy_value, add_mew, add_perceived_value
-    from optimizer.players import strip_diacritics
+    from optimizer.player_scoring import add_fantasy_value, add_mew
     from optimizer.swap_evaluator import add_bench_value
 
-    _rebuild_tick = rebuild_data.value
     _system = projection_system.value
     _team = team_perspective.value
-    print(f"Pipeline trigger count: {_rebuild_tick}  system: {_system}  team: {_team}")
+    season_frac = season_fraction_remaining()
 
-    _repo_root = Path(assign_optimal_slots.__code__.co_filename).resolve().parents[1]
-    _data_prep_dir = _repo_root / "data_prep"
-    assert _data_prep_dir.exists(), (
-        f"data_prep directory not found: {_data_prep_dir}. "
-        "Expected repo layout to include data_prep/ at repo root."
-    )
-    _data_dir = _data_prep_dir / "data"
-    _silver = _data_dir / "silver_table.parquet"
-    if not _silver.exists():
-        _silver = _data_dir / "silver_table.csv"
-
-    _file_map = {
-        "steamer": (
-            "fangraphs-steamer-projections-hitters_ros.csv",
-            "fangraphs-steamer-projections-pitchers_ros.csv",
-        ),
-        "atc": (
-            "fangraphs-atc-projections-hitters_ros.csv",
-            "fangraphs-atc-projections-pitchers_ros.csv",
-        ),
-    }
-
-    # ── On rebuild: scrape if stale, then build silver table (Fantrax refresh) ──
-    if _rebuild_tick > 0:
-        _today = date.today().strftime("%Y%m%d")
-        _today_dir = _data_dir / f"pulled_{_today}"
-
-        # Check for the actual files we need, not just the directory: a
-        # pulled_YYYYMMDD dir created by an older scraper (different file
-        # names) must not block scraping the rest-of-season feeds.
-        _h_name, _p_name = _file_map[_system]
-        _have_today = (_today_dir / _h_name).exists() and (
-            _today_dir / _p_name
-        ).exists()
-
-        if not _have_today:
-            print(f"Projections are stale — scraping FanGraphs for {_today}...")
-            _scrape = subprocess.run(
-                ["uv", "run", "scrape-fangraphs"],
-                cwd=str(_data_prep_dir),
-                capture_output=True,
-                text=True,
-            )
-            print(_scrape.stdout)
-            assert _scrape.returncode == 0, (
-                f"FanGraphs scrape failed (exit {_scrape.returncode}):\n{_scrape.stderr}"
-            )
-        else:
-            print(f"Today's projections already pulled: {_today_dir.name}")
-
-        _hitter_csv = str(_today_dir / _h_name)
-        _pitcher_csv = str(_today_dir / _p_name)
-
-        print(f"Building silver table with {_system.upper()} projections...")
-        _build = subprocess.run(
-            [
-                "uv",
-                "run",
-                "build-silver-table",
-                "--hitter",
-                _hitter_csv,
-                "--pitcher",
-                _pitcher_csv,
-            ],
-            cwd=str(_data_prep_dir),
-            capture_output=True,
-            text=True,
-        )
-        print(_build.stdout)
-        assert _build.returncode == 0, (
-            f"Silver table build failed (exit {_build.returncode}):\n{_build.stderr}"
-        )
-
-    # ── Find latest projections and load selected system ──
-    # Only consider pulled_* dirs that actually contain the rest-of-season
-    # files for the selected system (older dirs may hold legacy preseason
-    # pulls under different filenames).
-    _pulled_dirs = sorted(
-        d
-        for d in _data_dir.glob("pulled_*")
-        if (d / _file_map[_system][0]).exists() and (d / _file_map[_system][1]).exists()
-    )
-    if not _pulled_dirs:
-        print(
-            "No rest-of-season projection pulls found — "
-            "click Rebuild to scrape FanGraphs."
-        )
+    # Projections are the only load-bearing source. Without a snapshot there is
+    # nothing to score, so report that instead of asserting from every cell.
+    data_ready = bool(available_dates(f"projections/{_system}"))
+    if not data_ready:
+        print(f"No projections/{_system} snapshot — run `uv run fetch projections`.")
         players = pd.DataFrame()
         players_fv = pd.DataFrame()
         state = {}
         banked_totals = None
-        season_frac = season_fraction_remaining()
-        data_ready = False
     else:
-        _latest_dir = _pulled_dirs[-1]
-        _h_csv = _latest_dir / _file_map[_system][0]
-        _p_csv = _latest_dir / _file_map[_system][1]
+        players = build_players(system=_system)
 
-        # Load hitter projections
-        _h = pd.read_csv(str(_h_csv))
-        _h["Name"] = _h["Name"].astype(str).apply(strip_diacritics) + "-H"
-        _h["Team"] = _h["Team"].fillna("FA")
-        _h["player_type"] = "hitter"
-        _h["Position"] = "DH"
-        _h = _h.drop_duplicates(subset="Name", keep="first")
-        if "WAR" not in _h.columns:
-            _h["WAR"] = 0.0
-        _h["WAR"] = _h["WAR"].fillna(0.0)
-        if "MLBAMID" not in _h.columns:
-            _h["MLBAMID"] = None
-
-        # Load pitcher projections
-        _p = pd.read_csv(str(_p_csv))
-        _p["Name"] = _p["Name"].astype(str).apply(strip_diacritics) + "-P"
-        _p["Team"] = _p["Team"].fillna("FA")
-        _p = _p.rename(columns={"SO": "K"})
-        _p["player_type"] = "pitcher"
-        _p["Position"] = "RP"
-        _p = _p.drop_duplicates(subset="Name", keep="first")
-        if "WAR" not in _p.columns:
-            _p["WAR"] = 0.0
-        _p["WAR"] = _p["WAR"].fillna(0.0)
-        if "MLBAMID" not in _p.columns:
-            _p["MLBAMID"] = None
-
-        # Combine into single DataFrame
-        _h_stats = ["PA", "R", "HR", "RBI", "SB", "OPS"]
-        _p_stats = ["IP", "W", "SV", "K", "ERA", "WHIP"]
-        for _c in _p_stats:
-            _h[_c] = 0.0
-        for _c in _h_stats:
-            _p[_c] = 0.0
-
-        _all_cols = (
-            ["Name", "Team", "Position", "player_type"]
-            + _h_stats
-            + _p_stats
-            + ["WAR", "MLBAMID"]
-        )
-        players = pd.concat([_h[_all_cols], _p[_all_cols]], ignore_index=True)
-        players["owner"] = None
-        players["roster_status"] = None
-        players["age"] = None
-        players["fantrax_score"] = None
-        players["pct_rostered"] = None
-        print(
-            f"Loaded {_system.upper()} projections: "
-            f"{len(_h)} hitters + {len(_p)} pitchers = {len(players)} from {_latest_dir.name}"
-        )
-
-        # ── Merge Fantrax data from silver table (ownership, positions, ages) ──
-        if _silver.exists():
-            _st = (
-                pd.read_parquet(_silver)
-                if _silver.suffix == ".parquet"
-                else pd.read_csv(_silver)
-            )
-            _fantrax_fields = [
-                "owner",
-                "roster_status",
-                "age",
-                "fantrax_score",
-                "pct_rostered",
-            ]
-            _ft = _st[["Name", "Position"] + _fantrax_fields].rename(
-                columns={c: f"_ft_{c}" for c in ["Position"] + _fantrax_fields}
-            )
-            players = players.merge(_ft, on="Name", how="left")
-
-            _has_pos = players["_ft_Position"].notna()
-            players.loc[_has_pos, "Position"] = players.loc[_has_pos, "_ft_Position"]
-            for _c in _fantrax_fields:
-                players[_c] = players[f"_ft_{_c}"]
-            players = players.drop(
-                columns=[f"_ft_{_c}" for _c in ["Position"] + _fantrax_fields]
-            )
-            _rostered = players["owner"].notna().sum()
-            print(f"Merged Fantrax data: {_rostered} rostered players")
-        else:
-            print("No silver table found — run Rebuild to fetch Fantrax data")
-
-        # ── Load banked YTD totals (Fantrax standings) ──
-        # Adds the banked half of season totals so the win model compares
-        # full-season standings, not just rest-of-season. Degrades safely to
-        # rest-of-season-only when standings are absent or fail validation.
-        _standings_path = _data_dir / "standings.parquet"
         banked_totals = None
-        season_frac = season_fraction_remaining()
-        if _standings_path.exists():
-            _standings = pd.read_parquet(_standings_path)
+        if available_dates("standings"):
+            _standings, _ = read_latest_raw("standings")
             banked_totals = standings_to_banked_totals(_standings)
         else:
-            print(
-                "No standings.parquet found — rest-of-season-only model. "
-                "Click Rebuild to fetch banked YTD totals from Fantrax."
-            )
+            print("No standings snapshot — rest-of-season-only model.")
 
-        # ── Run math pipeline ──
         players = add_fantasy_value(players)
         players_fv = players.copy()
-
         state = compute_league_state(
             players,
             my_team_name=_team,
@@ -279,13 +134,11 @@ def data_pipeline(pd, rebuild_data, projection_system, team_perspective):
             state["opponent_lineups"],
             state["opponent_teams"],
         )
-        players = add_perceived_value(
-            players, season_fraction_remaining=season_fraction_remaining()
-        )
         players = add_mew(players, state["my_totals"], state["gradient"])
-        players = add_bench_value(players, state["my_lineup"], state["my_roster_names"])
-        print(f"Pipeline complete: {len(players)} players enriched")
-        data_ready = True
+        players = add_bench_value(
+            players, state["my_lineup"], state["my_roster_names"]
+        )
+        print(f"Pipeline complete: {len(players)} players scored")
     return banked_totals, data_ready, players, players_fv, season_frac, state
 
 
@@ -337,318 +190,6 @@ def game_logs_cell(data_ready, players, pd):
             f"{_with_data} players with data"
         )
     return (game_logs,)
-
-
-@app.cell
-def observed_windows(data_ready, game_logs, pd, players):
-    """Attach observed YTD and last-14-day stat versions to each player.
-
-    Alongside the rest-of-season projection columns already on `players`
-    (PA, R, HR, ... / IP, W, ...), this adds observed-actual columns compiled
-    directly from MLB game logs for two windows:
-      - YTD (suffix _ytd): all 2026 games
-      - L14 (suffix _l14): games in the last 14 calendar days
-
-    Hitter columns: G/PA/R/HR/RBI/SB/OPS per window. Pitcher columns:
-    G/IP/W/SV/K/ERA/WHIP per window. Values are NA where a player has no
-    games. The RoS projection columns on `players` remain the forward-looking
-    expectation; these are the realized actuals to compare against.
-
-    Returns `players_obs` (a copy of `players` with the window columns added).
-    """
-    if not data_ready:
-        players_obs = players
-    else:
-
-        def _agg_hit(logs: list[dict]) -> dict:
-            pa = sum(g.get("plateAppearances", 0) for g in logs)
-            ab = sum(g.get("atBats", 0) for g in logs)
-            ops = (
-                sum(float(g.get("obp", 0)) * g.get("plateAppearances", 0) for g in logs)
-                / pa
-                + sum(float(g.get("slg", 0)) * g.get("atBats", 0) for g in logs) / ab
-                if pa > 0 and ab > 0
-                else 0.0
-            )
-            return {
-                "G": len(logs),
-                "PA": pa,
-                "R": sum(g.get("runs", 0) for g in logs),
-                "HR": sum(g.get("homeRuns", 0) for g in logs),
-                "RBI": sum(g.get("rbi", 0) for g in logs),
-                "SB": sum(g.get("stolenBases", 0) for g in logs),
-                "OPS": ops,
-            }
-
-        def _agg_pit(logs: list[dict]) -> dict:
-            ip = sum(float(g.get("inningsPitched", 0)) for g in logs)
-            er = sum(g.get("earnedRuns", 0) for g in logs)
-            bb = sum(g.get("baseOnBalls", 0) for g in logs)
-            h = sum(g.get("hits", 0) for g in logs)
-            return {
-                "G": len(logs),
-                "IP": ip,
-                "W": sum(g.get("wins", 0) for g in logs),
-                "SV": sum(g.get("saves", 0) for g in logs),
-                "K": sum(g.get("strikeOuts", 0) for g in logs),
-                "ERA": (er * 9 / ip) if ip > 0 else 0.0,
-                "WHIP": ((bb + h) / ip) if ip > 0 else 0.0,
-            }
-
-        _cutoff = pd.Timestamp.today().normalize() - pd.Timedelta(days=14)
-
-        def _recent(gs: list[dict]) -> list[dict]:
-            return [
-                g
-                for g in gs
-                if g.get("date") is not None and pd.Timestamp(g["date"]) >= _cutoff
-            ]
-
-        _window_cols = [
-            f"{c}_{w}"
-            for w in ("ytd", "l14")
-            for c in [
-                "G",
-                "PA",
-                "R",
-                "HR",
-                "RBI",
-                "SB",
-                "OPS",
-                "IP",
-                "W",
-                "SV",
-                "K",
-                "ERA",
-                "WHIP",
-            ]
-        ]
-
-        _by_id: dict[int, dict] = {}
-        for _pid, _logs in game_logs.items():
-            _h = [g for g in _logs if g["group"] == "hitting"]
-            _p = [g for g in _logs if g["group"] == "pitching"]
-            _rec: dict = {}
-            if _h:
-                for _k, _v in _agg_hit(_h).items():
-                    _rec[f"{_k}_ytd"] = _v
-                for _k, _v in _agg_hit(_recent(_h)).items():
-                    _rec[f"{_k}_l14"] = _v
-            if _p:
-                for _k, _v in _agg_pit(_p).items():
-                    _rec[f"{_k}_ytd"] = _v
-                for _k, _v in _agg_pit(_recent(_p)).items():
-                    _rec[f"{_k}_l14"] = _v
-            if _rec:
-                _by_id[_pid] = _rec
-
-        _rows = []
-        for _, _r in players.iterrows():
-            _mid = int(_r["MLBAMID"]) if pd.notna(_r["MLBAMID"]) else None
-            _rows.append(_by_id.get(_mid, {}) if _mid is not None else {})
-        _obs_df = pd.DataFrame(_rows, index=players.index)
-        for _c in _window_cols:
-            if _c not in _obs_df.columns:
-                _obs_df[_c] = pd.NA
-        players_obs = pd.concat([players, _obs_df[_window_cols]], axis=1)
-        print(
-            f"Observed windows attached: {len(_by_id)} players with game-log data "
-            f"(YTD + last 14d through {_cutoff.date()})"
-        )
-    return (players_obs,)
-
-
-@app.cell
-def ytd_window_control(mo):
-    """Window selector for the actual-vs-projection table."""
-    ytd_window = mo.ui.radio(
-        options=["Year to date", "Last 14 days"],
-        value="Year to date",
-        label="Observed window",
-    )
-    return (ytd_window,)
-
-
-@app.cell
-def ytd_comparison(
-    data_ready,
-    mo,
-    my_roster_names,
-    pd,
-    players_obs,
-    strip_name_suffix,
-    ytd_window,
-):
-    """Observed actuals vs. rest-of-season projection rate for the user's roster.
-
-    Counting-stat cells show `actual / expected`, where expected applies the
-    RoS projection's per-PA (or per-IP) rate to the playing time the player has
-    actually accrued in the selected window. This makes the two directly
-    comparable and pace-independent. Color = rate over/under-performance vs the
-    projection (green over, red under). Rate stats (OPS/ERA/WHIP) compare
-    directly to the projected rate.
-    """
-    if not data_ready:
-        ytd_section = mo.md("")
-    else:
-        _w = "l14" if ytd_window.value == "Last 14 days" else "ytd"
-        _roster = players_obs[players_obs["Name"].isin(my_roster_names)]
-
-        def _wv(row: pd.Series, col: str) -> float:
-            v = row.get(col)
-            return float(v) if v is not None and not pd.isna(v) else 0.0
-
-        def _ratio_count(actual: float, expected: float) -> float | None:
-            # actual vs the projection-rate expectation over the same volume.
-            if expected <= 0:
-                return None
-            return actual / expected
-
-        def _ratio_higher(actual: float, ref: float) -> float | None:
-            # Rate stat, higher is better (OPS): actual rate vs projected rate.
-            if ref <= 0:
-                return None
-            return actual / ref
-
-        def _ratio_lower(actual: float, ref: float) -> float | None:
-            # Rate stat, lower is better (ERA, WHIP); invert so >1 = good.
-            if ref <= 0:
-                return None
-            if actual <= 0:
-                return 2.0  # zero ERA/WHIP is elite; clamp to full green
-            return ref / actual
-
-        def _residual_color(ratio: float | None) -> dict[str, str]:
-            # Map a performance ratio (1.0 == on projected rate) to a green
-            # (over) / red (under) background. Saturates at +/-20% deviation.
-            if ratio is None:
-                return {}
-            dev = ratio - 1.0
-            alpha = round(min(abs(dev) / 0.20, 1.0) * 0.55, 3)
-            if alpha == 0:
-                return {}
-            rgb = "34,160,34" if dev > 0 else "210,45,45"
-            return {"backgroundColor": f"rgba({rgb},{alpha})"}
-
-        def _avg_ratio(d: dict[str, float | None]) -> float:
-            vals = [v for v in d.values() if v is not None]
-            return sum(vals) / len(vals) if vals else float("-inf")
-
-        _h_rows: list[dict] = []
-        _p_rows: list[dict] = []
-        _h_ratios_by_player: dict[str, dict[str, float | None]] = {}
-        _p_ratios_by_player: dict[str, dict[str, float | None]] = {}
-        for _, _r in _roster.iterrows():
-            _name = strip_name_suffix(_r["Name"])
-
-            if _r["player_type"] == "hitter":
-                _vol = _wv(_r, f"PA_{_w}")
-                _has = _vol > 0
-                _proj_pa = float(_r["PA"])
-                _ratios: dict[str, float | None] = {}
-                _row: dict = {
-                    "Player": _name,
-                    "Pos": _r["Position"],
-                    "G": int(_wv(_r, f"G_{_w}")),
-                    "PA": f"{_vol:.0f}" if _has else "—",
-                }
-                for _stat, _dec in (("R", 0), ("HR", 0), ("RBI", 0), ("SB", 0)):
-                    _actual = _wv(_r, f"{_stat}_{_w}")
-                    _rate = float(_r[_stat]) / _proj_pa if _proj_pa > 0 else 0.0
-                    _exp = _rate * _vol
-                    _row[_stat] = f"{_actual:.0f} / {_exp:.1f}" if _has else "—"
-                    _ratios[_stat] = _ratio_count(_actual, _exp) if _has else None
-                _ops_actual = _wv(_r, f"OPS_{_w}")
-                _ops_ref = float(_r["OPS"])
-                _row["OPS"] = f"{_ops_actual:.3f} / {_ops_ref:.3f}" if _has else "—"
-                _ratios["OPS"] = _ratio_higher(_ops_actual, _ops_ref) if _has else None
-                _h_rows.append(_row)
-                _h_ratios_by_player[_name] = _ratios
-            else:
-                _vol = _wv(_r, f"IP_{_w}")
-                _has = _vol > 0
-                _proj_ip = float(_r["IP"])
-                _ratios = {}
-                _row = {
-                    "Player": _name,
-                    "Pos": _r["Position"],
-                    "G": int(_wv(_r, f"G_{_w}")),
-                    "IP": f"{_vol:.1f}" if _has else "—",
-                }
-                for _stat in ("W", "SV", "K"):
-                    _actual = _wv(_r, f"{_stat}_{_w}")
-                    _rate = float(_r[_stat]) / _proj_ip if _proj_ip > 0 else 0.0
-                    _exp = _rate * _vol
-                    _row[_stat] = f"{_actual:.0f} / {_exp:.1f}" if _has else "—"
-                    _ratios[_stat] = _ratio_count(_actual, _exp) if _has else None
-                for _stat in ("ERA", "WHIP"):
-                    _actual = _wv(_r, f"{_stat}_{_w}")
-                    _ref = float(_r[_stat])
-                    _row[_stat] = f"{_actual:.2f} / {_ref:.2f}" if _has else "—"
-                    _ratios[_stat] = _ratio_lower(_actual, _ref) if _has else None
-                _p_rows.append(_row)
-                _p_ratios_by_player[_name] = _ratios
-
-        _h_df = (
-            pd.DataFrame(_h_rows)
-            .sort_values(
-                "Player",
-                key=lambda s: s.map(
-                    lambda n: _avg_ratio(_h_ratios_by_player.get(n, {}))
-                ),
-                ascending=False,
-            )
-            .reset_index(drop=True)
-        )
-        _p_df = (
-            pd.DataFrame(_p_rows)
-            .sort_values(
-                "Player",
-                key=lambda s: s.map(
-                    lambda n: _avg_ratio(_p_ratios_by_player.get(n, {}))
-                ),
-                ascending=False,
-            )
-            .reset_index(drop=True)
-        )
-
-        _h_styles = {
-            str(_i): _h_ratios_by_player.get(_row["Player"], {})
-            for _i, _row in _h_df.iterrows()
-        }
-        _p_styles = {
-            str(_i): _p_ratios_by_player.get(_row["Player"], {})
-            for _i, _row in _p_df.iterrows()
-        }
-
-        def _h_style_cell(row_id: str, name: str, value: object) -> dict[str, str]:
-            return _residual_color(_h_styles.get(row_id, {}).get(name))
-
-        def _p_style_cell(row_id: str, name: str, value: object) -> dict[str, str]:
-            return _residual_color(_p_styles.get(row_id, {}).get(name))
-
-        _label = "year-to-date" if _w == "ytd" else "last 14 days"
-        ytd_section = mo.vstack(
-            [
-                ytd_window,
-                mo.md(
-                    f"*Window: **{_label}**. Counting cells: "
-                    "`actual / expected`, where expected = the rest-of-season "
-                    "projection's per-PA (or per-IP) rate applied to the "
-                    "playing time accrued in this window. Rate cells (OPS/ERA/"
-                    "WHIP): `actual / projected rate`. Color = performance vs. "
-                    "the projected rate: <span style='background-color:"
-                    "rgba(34,160,34,0.45);padding:0 4px'>green = over</span>, "
-                    "<span style='background-color:rgba(210,45,45,0.45);"
-                    "padding:0 4px'>red = under</span> (saturates at \u00b120%).*"
-                ),
-                mo.md("**Hitters**"),
-                mo.ui.table(_h_df, page_size=30, style_cell=_h_style_cell),
-                mo.md("**Pitchers**"),
-                mo.ui.table(_p_df, page_size=30, style_cell=_p_style_cell),
-            ]
-        )
-    return (ytd_section,)
 
 
 @app.cell
@@ -762,22 +303,18 @@ def dashboard_content(
     pd,
     players,
     projection_system,
-    rebuild_data,
     roster_map_section,
     state,
+    freshness_section,
     strip_name_suffix,
     team_perspective,
     title_odds_section,
-    ytd_section,
 ):
     if data_ready:
-        from optimizer.swap_evaluator import compute_ew_ceiling
         from optimizer.visualizations import (
             plot_category_heatmap,
-            plot_gap_to_ceiling,
             plot_starter_contributions,
         )
-        from optimizer.win_model import compute_category_regime
 
         _ew = state["current_ew"]
         _starters_fig = plot_starter_contributions(state["my_lineup"], players)
@@ -807,7 +344,6 @@ def dashboard_content(
             "MEW",
             "BV",
             "FV",
-            "PV",
         ]
         _display = _sorted[_roster_cols].round(2).reset_index(drop=True)
         _roster_table = mo.ui.table(_display, page_size=50)
@@ -828,12 +364,7 @@ def dashboard_content(
 
         _current_total_bv = float(players[players["Name"].isin(_my_bench)]["BV"].sum())
 
-        _screened = screen_swaps(
-            players,
-            my_roster_names,
-            state["my_lineup"],
-            top_k=50,
-        )
+        _screened = screen_swaps(players, my_roster_names, top_k=50)
 
         if len(_screened) > 0:
             _evaluated = evaluate_top_k(
@@ -990,55 +521,8 @@ def dashboard_content(
             ]
         )
 
-        _ceiling = compute_ew_ceiling(
-            players,
-            state["opponent_totals"],
-            state["category_sigmas"],
-            my_roster_names,
-            _ew,
-            my_team_name=state["my_team_name"],
-            my_banked_totals=state["my_banked"],
-        )
-        _gap_fig = plot_gap_to_ceiling(_ew, _ceiling["ceiling_ew"])
-
-        # --- Category Regime table ---
-        _regime_df = compute_category_regime(
-            state["my_totals"],
-            state["opponent_totals"],
-            state["category_sigmas"],
-            state["gradient"],
-        )
-        _regime_display = _regime_df.rename(
-            columns={
-                "category": "Category",
-                "avg_z": "Avg z",
-                "gradient": "Gradient (g_c)",
-                "convexity_ratio": "Convexity Ratio",
-                "regime": "Regime",
-            }
-        )[["Category", "Avg z", "Gradient (g_c)", "Convexity Ratio", "Regime"]]
-        _regime_display = _regime_display.round(2)
-        _regime_table = mo.ui.table(_regime_display, page_size=10)
-
-        _undervalued = _regime_df[_regime_df["convexity_ratio"] > 1.05]
-        if len(_undervalued) > 0:
-            _uv_parts = ", ".join(
-                f"**{row['category']}** ({row['convexity_ratio']:.0%})"
-                for _, row in _undervalued.iterrows()
-            )
-            _regime_callout = mo.callout(
-                mo.md(
-                    f"Gradient undervalues improvements in: {_uv_parts}. "
-                    f"Actual EW gains exceed MEW estimates — "
-                    f"trades shifting these categories deserve exact EW evaluation."
-                ),
-                kind="warn",
-            )
-        else:
-            _regime_callout = mo.md("")
-
         _controls = mo.hstack(
-            [projection_system, team_perspective, rebuild_data], justify="start", gap=1
+            [projection_system, team_perspective], justify="start", gap=1
         )
 
         dashboard_tab = mo.vstack(
@@ -1051,24 +535,20 @@ def dashboard_content(
                 ),
                 title_odds_section,
                 mo.md("### Recommended Actions"),
-                fig_to_png(_gap_fig),
                 _actions,
                 fig_to_png(_starters_fig),
                 fig_to_png(_heatmap_fig),
-                mo.md("### Category Regime (Convexity Diagnostics)"),
-                _regime_callout,
-                _regime_table,
                 mo.md(f"### {state['my_team_name']} Roster"),
                 _roster_table,
-                mo.md("### Actual YTD vs. Projection"),
-                ytd_section,
                 mo.md("### Roster Value Map"),
                 roster_map_section,
+                mo.md("### Data freshness"),
+                freshness_section,
             ]
         )
     else:
         _controls = mo.hstack(
-            [projection_system, team_perspective, rebuild_data],
+            [projection_system, team_perspective],
             justify="start",
             gap=1,
         )
@@ -1224,12 +704,12 @@ def trade_controls(data_ready, mo, state):
         label="Receive (comma-separated)", placeholder="Target players"
     )
     trade_opp = mo.ui.dropdown(label="Opponent", options=[""] + _opts)
-    trade_pv_loss_pct = mo.ui.slider(
+    trade_value_loss_pct = mo.ui.slider(
         start=0,
         stop=50,
         step=5,
         value=15,
-        label="Max opp. PV loss %",
+        label="Max opp. value loss %",
         show_value=True,
     )
     trade_min_value = mo.ui.slider(
@@ -1257,7 +737,7 @@ def trade_controls(data_ready, mo, state):
         trade_min_msv,
         trade_min_value,
         trade_opp,
-        trade_pv_loss_pct,
+        trade_value_loss_pct,
         trade_recv,
         trade_search_btn,
         trade_send,
@@ -1280,7 +760,7 @@ def trade_results(
     trade_min_msv,
     trade_min_value,
     trade_opp,
-    trade_pv_loss_pct,
+    trade_value_loss_pct,
     trade_recv,
     trade_search_btn,
     trade_send,
@@ -1354,7 +834,7 @@ def trade_results(
                     category_sigmas=state["category_sigmas"],
                     current_ew=state["current_ew"],
                     current_total_bv=current_total_bv,
-                    pv_max_loss_frac=trade_pv_loss_pct.value / 100,
+                    max_value_loss_frac=trade_value_loss_pct.value / 100,
                     my_lineup=state["my_lineup"],
                     my_banked_totals=state["my_banked"],
                     trade_opponent_banked=state["opponent_banked"].get(_oid),
@@ -1383,12 +863,12 @@ def trade_results(
                             f"**ΔBV:** {_res['delta_bv']:+.2f} | "
                             f"**Value:** {_res['value']:+.2f}\n\n"
                             f"**New EW:** {_res['new_ew']:.2f} | "
-                            f"**Opp PV loss:** {_res['opp_pv_loss_pct']:+.1f}% | "
-                            f"**PV feasible:** "
-                            f"{'Yes' if _res['pv_feasible'] else 'No'}"
+                            f"**Opp value loss:** {_res['opp_value_loss_pct']:+.1f}% | "
+                            f"**Trade feasible:** "
+                            f"{'Yes' if _res['trade_feasible'] else 'No'}"
                             + (f"\n\n{_auto_line}" if _auto_line else "")
                         ),
-                        kind="success" if _res["pv_feasible"] else "danger",
+                        kind="success" if _res["trade_feasible"] else "danger",
                     )
                     _parts = [_callout]
                     if _res["new_totals"]:
@@ -1462,7 +942,7 @@ def trade_results(
                 category_sigmas=state["category_sigmas"],
                 current_ew=state["current_ew"],
                 current_total_bv=current_total_bv,
-                pv_max_loss_frac=trade_pv_loss_pct.value / 100,
+                max_value_loss_frac=trade_value_loss_pct.value / 100,
                 must_send=_send_names or None,
                 must_receive=_recv_names or None,
                 opponent_filter=_opp_filter,
@@ -1484,7 +964,7 @@ def trade_results(
                 category_sigmas=state["category_sigmas"],
                 current_ew=state["current_ew"],
                 current_total_bv=current_total_bv,
-                pv_max_loss_frac=trade_pv_loss_pct.value / 100,
+                max_value_loss_frac=trade_value_loss_pct.value / 100,
                 min_value=trade_min_value.value,
                 my_team_name=state["my_team_name"],
                 my_banked_totals=state["my_banked"],
@@ -1517,7 +997,7 @@ def trade_results(
                             "Value": round(t["value"], 2),
                             "MSV": round(t["msv_exact"], 2),
                             "ΔBV": round(t["delta_bv"], 2),
-                            "Opp PV Loss%": round(t["opp_pv_loss_pct"], 1),
+                            "Opp Value Loss%": round(t["opp_value_loss_pct"], 1),
                             "New EW": round(t["new_ew"], 2),
                         }
                         for t in trade_results_data
@@ -1537,7 +1017,7 @@ def trade_results(
     else:
         trade_section = mo.md(
             "*Enter send + receive for a specific evaluation, "
-            "or click **Search Trades** to find all PV-feasible trades. "
+            "or click **Search Trades** to find all value-feasible trades. "
             "Send/receive/opponent fields act as filters on search.*"
         )
         trade_results_data = []
@@ -1557,7 +1037,7 @@ def trade_impact(
     players,
     state,
     strip_name_suffix,
-    trade_pv_loss_pct,
+    trade_value_loss_pct,
     trade_results_data,
     trade_results_table,
 ):
@@ -1584,7 +1064,7 @@ def trade_impact(
             category_sigmas=state["category_sigmas"],
             current_ew=state["current_ew"],
             current_total_bv=current_total_bv,
-            pv_max_loss_frac=trade_pv_loss_pct.value / 100,
+            max_value_loss_frac=trade_value_loss_pct.value / 100,
             my_lineup=state["my_lineup"],
             send_to_opp_names=set(_trade.get("send_to_opp", _trade["send"])),
             my_banked_totals=state["my_banked"],
@@ -1603,7 +1083,6 @@ def trade_impact(
                     "Position": _row.get("Position", ""),
                     "FV": round(_row.get("FV", 0), 2),
                     "MEW": round(_row.get("MEW", 0), 2),
-                    "PV": round(_row.get("PV", 0), 2),
                 }
             )
         _player_df = pd.DataFrame(_player_rows)
@@ -1615,9 +1094,9 @@ def trade_impact(
                     f"**ΔBV:** {_res['delta_bv']:+.2f} | "
                     f"**Value:** {_res['value']:+.2f}\n\n"
                     f"**New EW:** {_res['new_ew']:.2f} | "
-                    f"**Opp PV loss:** {_res['opp_pv_loss_pct']:+.1f}%"
+                    f"**Opp value loss:** {_res['opp_value_loss_pct']:+.1f}%"
                 ),
-                kind="success" if _res["pv_feasible"] else "danger",
+                kind="success" if _res["trade_feasible"] else "danger",
             ),
             mo.ui.table(_player_df, selection=None),
         ]
@@ -1663,7 +1142,7 @@ def moves_assembly(
                 mo.md("## Trades"),
                 mo.md(
                     "*Enter send + receive for a specific evaluation, "
-                    "or click **Search Trades** to find all PV-feasible trades. "
+                    "or click **Search Trades** to find all value-feasible trades. "
                     "Send/receive/opponent act as filters on search.*"
                 ),
                 trade_controls_ui,
@@ -1682,7 +1161,7 @@ def trade_controls_layout(
     trade_min_msv,
     trade_min_value,
     trade_opp,
-    trade_pv_loss_pct,
+    trade_value_loss_pct,
     trade_recv,
     trade_search_btn,
     trade_send,
@@ -1691,7 +1170,7 @@ def trade_controls_layout(
         [
             mo.hstack([trade_send, trade_recv, trade_opp]),
             mo.hstack(
-                [trade_pv_loss_pct, trade_min_value, trade_min_msv, trade_search_btn],
+                [trade_value_loss_pct, trade_min_value, trade_min_msv, trade_search_btn],
                 justify="start",
                 gap=2,
             ),
@@ -1952,7 +1431,6 @@ def sandbox_results(
                                 "Type": _row.get("player_type", ""),
                                 "FV": round(float(_row.get("FV", 0)), 2),
                                 "MEW": round(float(_row.get("MEW", 0)), 2),
-                                "PV": round(float(_row.get("PV", 0)), 2),
                             }
                         )
                     for _n in sorted(_add_set):
@@ -1965,7 +1443,6 @@ def sandbox_results(
                                 "Type": _row.get("player_type", ""),
                                 "FV": round(float(_row.get("FV", 0)), 2),
                                 "MEW": round(float(_row.get("MEW", 0)), 2),
-                                "PV": round(float(_row.get("PV", 0)), 2),
                             }
                         )
                     _player_df = pd.DataFrame(_player_rows)
