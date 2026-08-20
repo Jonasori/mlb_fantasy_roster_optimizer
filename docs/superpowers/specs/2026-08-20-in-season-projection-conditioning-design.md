@@ -4,6 +4,7 @@
 **Date:** 2026-08-20
 **Supersedes:** `design_descriptions/TRUE_TALENT_RESIDUALS.md` (its method survives; its central
 empirical claim §2.6 is falsified — see §2.3 below).
+**Data availability verified:** 2026-08-20 (Wayback `__NEXT_DATA__` route spot-checked directly).
 **Depends on:** `AGENTS.md` (style), `design_descriptions/IMPLEMENTATION_SPEC.md` (silver/gold
 column contracts), `design_descriptions/MATHEMATICAL_FRAMEWORK.md` (MEW, gradient, EW).
 
@@ -263,17 +264,53 @@ failure mode §1.2 exists to prevent.
 | Evidence | 2026 stats through 06-11, from MLB StatsAPI game logs, decomposed to skills |
 | Target | actual 06-11 → 08-20 performance (~70 days, ~500 hitters, ~600 pitchers) |
 
-Snapshots at 06-12/13/14/18/23/26 exist but are 15 days apart on the same players. **Report them,
-but treat the whole set as approximately one independent window, not seven.** Any claim of
-significance must be justified against n≈1 window, not n=7.
+Local snapshots at 06-12/13/14/18/23/26 exist but are 15 days apart on the same players. **Report
+them, but treat the local set as approximately one independent window, not seven.**
 
-**Secondary test (estimation of per-skill `M_league`):** does not require projection archives at
-all. For any past season and any split date, ask "given stats through D, how well does each
-component predict D→end?" This yields the shrinkage constants from many seasons of data. The scarce
-projection archive is then needed only to calibrate the **single** ratio `M_vs_ATC / M_league` per
-stat — which one window can support.
+**Extending the archive (verified 2026-08-20).** FanGraphs' `/projections` page is server-rendered
+and embeds the full dataset in `<script id="__NEXT_DATA__">`; the Wayback Machine captured it
+repeatedly. The JSON API is paywalled, the page is not.
 
-This decomposition is what makes a thin projection archive sufficient.
+```python
+r = requests.get(f"https://web.archive.org/web/{ts}id_/{url}", headers=BROWSER_UA)
+j = json.loads(re.search(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', r.text, re.S).group(1))
+data = j["props"]["pageProps"]["dehydratedState"]["queries"][0]["state"]["data"]
+```
+
+Reported inventory, filtered to RoS types with stored length >150 KB: **139 distinct hitter-days**
+across 8 systems, 2023–2026 (`ratcdc/bat` = 23 days); **15 pitcher-days**, of which 8 are
+`steamerr/pit`.
+
+Spot-verified directly: `type=ratcdc&stats=bat` at 2025-08-01 returned 587 rows × 57 fields with
+Witt PA = 199 — unambiguously rest-of-season.
+
+**Extraction friction is real and must be designed around:**
+
+- **Wayback rate-limits hard.** 2 of 3 verification requests returned HTTP 503 despite escalating
+  backoff. A 503 body contains no `__NEXT_DATA__` and parses as "no data" rather than raising —
+  **a naive scraper silently records false empties.** Retry with backoff and assert non-empty.
+- **Pages are partial.** That 587-row capture is against 1,327 rows in our live pull; pagination
+  state is baked into each capture. Per-snapshot player coverage is incomplete and varies.
+- **Some captures are mislabelled.** A `type=steamerr` capture has been observed returning
+  full-season values. Validate: PA must decay monotonically with date within a season. (The
+  companion "integer values imply contamination" test is **Steamer-specific** — ATC's `ratcdc` feed
+  emits integer PA natively, as our own live pull confirms.)
+- **URL strings are literal.** CDX stores some URLs with `&amp;`; substituting `&` silently returns
+  a different capture.
+
+**Hitters and pitchers are separate projects with different data budgets.** 139 hitter-days vs 15
+pitcher-days is not a difference of degree. The pitcher side cannot support a fitted `M_vs_ATC` from
+vendor archives and must lean entirely on the reconstruction route below.
+
+**Secondary route — reconstruction (no archives needed).** For any past season and split date, ask
+"given stats through D, how well does each component predict D→end?" Preseason archives
+(`type=steamer_YYYY` / `zips_YYYY`, reported back to 2013/2010) plus StatsAPI `byDateRange` give
+unlimited cut dates at ~28 requests / 20 seconds, covering hitters and pitchers **equally**. This
+yields per-skill `M_league` from many seasons.
+
+The vendor archive is then needed only to calibrate the **single** ratio `M_vs_ATC / M_league` per
+stat. That decomposition is what keeps a lumpy, partial archive sufficient — and it is the only
+thing that makes the pitcher side tractable at all.
 
 **Metric — the part that matters.** Report error in **both** stat units and **MEW units**. Decide on
 the MEW column. A method that cuts OPS RMSE 20% but moves no decision has earned nothing.
@@ -406,16 +443,23 @@ Per `AGENTS.md`: module-level functions only, no classes, no try/except, descrip
 
 ## 5. Open questions
 
-1. **Is one held-out window enough to calibrate `M_vs_ATC`?** The §3.1 decomposition is designed so
-   that it only has to support a single ratio per stat, but this should be checked with a bootstrap
-   before any fitted constant is trusted.
-2. **Start snapshotting now.** Whatever we conclude this season, daily RoS snapshots make a properly
-   fitted model possible next season. Cheap, and the archive we do have exists only because
-   snapshots happened to be kept.
-3. **Pitcher volume** — IP RMSE ≈ 49% of the mean and SV RMSE ≈ 68% are far worse than hitter PA.
-   Part 2a's model is specified from hitter-based literature; the pitcher analogue (rotation slot,
-   closer role churn, IL) may need a different feature set. Closer role in particular is a discrete
-   observable, not a regression target.
+1. **How much of the Wayback archive survives validation?** 139 hitter-days is the *reported*
+   inventory; after discarding 503s, partial pages, and mislabelled captures the usable count is
+   unknown. Harvest and validate before committing to a fitted `M_vs_ATC`, and bootstrap the
+   estimate over whatever survives. If the answer is "a handful," fall back to the §3.1
+   reconstruction route and treat the vendor archive as a benchmark only.
+2. **Start snapshotting now — this is time-critical.** Wayback's coverage of this page tapers after
+   July 2026 and nobody archives it publicly. Daily RoS snapshots persisted outside `.gitignore`
+   make a properly fitted model possible next season. The archive we do have exists only because
+   pulls happened to be kept. Likewise the `steamer_YYYY` / `zips_YYYY` preseason endpoints are
+   undocumented and could vanish; harvest them once, now.
+3. **Pitcher volume, and the pitcher side generally.** IP RMSE ≈ 49% of the mean and SV RMSE ≈ 68%
+   are far worse than hitter PA, so the upside is larger — but the vendor archive is 15 days against
+   the hitters' 139, so the calibration evidence is far thinner. Part 2a's model is specified from
+   hitter-based literature; the pitcher analogue (rotation slot, closer role churn, IL) needs a
+   different feature set, and closer role is a discrete observable rather than a regression target.
+   Given §2.2 ranks pitcher WHIP and IP as the two highest-leverage inputs in the whole model, this
+   asymmetry — most value, least evidence — is the sharpest open risk in the design.
 4. **Where does the Fantrax live injury/roster status fit?** `injury_status`, `injury_detail`, and
    `roster_status` are already on `players` and are fresher than anything ATC sees. They are a
    natural Part 2a feature and are currently unused by valuation.
