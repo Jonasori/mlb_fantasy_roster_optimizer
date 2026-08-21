@@ -10,7 +10,6 @@ leaderboard, so any split date costs two requests.
 
 import datetime
 
-import numpy as np
 import pandas as pd
 
 from data_prep.skills import HITTING_SKILLS, PITCHING_SKILLS, add_skill_rates
@@ -82,6 +81,15 @@ def assemble_backtest_frame(
     assert group in ("hitting", "pitching"), (
         f"assemble_backtest_frame: group must be 'hitting' or 'pitching', got {group!r}."
     )
+    dup_proj_ids = sorted(
+        projection.loc[projection["MLBAMID"].duplicated(keep=False), "MLBAMID"].unique()
+    )
+    assert not dup_proj_ids, (
+        f"assemble_backtest_frame: projection has duplicate MLBAMIDs "
+        f"{dup_proj_ids} — a traded player split into two team rows (a real "
+        f"FanGraphs export pattern) must be combined into one row before this "
+        f"call, or the join below would silently keep an arbitrary one."
+    )
     assert season in SEASON_END, (
         f"assemble_backtest_frame: no season end date recorded for {season}. "
         f"Known: {sorted(SEASON_END)}. Add it to SEASON_END."
@@ -101,6 +109,13 @@ def assemble_backtest_frame(
         f"(today is {today}) — that window has not finished, so the outcome "
         f"data would be right-censored. Pass an explicit past outcome_end, or "
         f"use a completed season."
+    )
+    assert outcome_end > split, (
+        f"assemble_backtest_frame: outcome_end {outcome_end} is not after "
+        f"split {split} — the outcome window would be empty or negative. "
+        f"This bypasses fetch_stats_range's own start<=end check whenever "
+        f"evidence/actual are injected rather than fetched, so it must be "
+        f"checked here too."
     )
 
     if evidence is None:
@@ -152,7 +167,15 @@ def assemble_backtest_frame(
         .merge(out, on="MLBAMID", how="inner")
         .merge(names, on="MLBAMID", how="left")
     )
-    frame = frame[~frame["MLBAMID"].duplicated()].reset_index(drop=True)
+    dup_ids = sorted(
+        frame.loc[frame["MLBAMID"].duplicated(keep=False), "MLBAMID"].unique()
+    )
+    assert not dup_ids, (
+        f"assemble_backtest_frame: duplicate MLBAMIDs survived the join: "
+        f"{dup_ids}. Each player must appear once in projection, evidence, "
+        f"and actual — picking one at random would silently drop a "
+        f"traded/split row. Check the source(s) for these IDs."
+    )
 
     # Projected volume must be multiplied by this before it is compared to
     # actual volume — a rest-of-season projection covers split..season-end,
