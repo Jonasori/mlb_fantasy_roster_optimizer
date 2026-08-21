@@ -1184,6 +1184,33 @@ def test_baselines_present_and_atc_is_identity():
     )
 
 
+def test_raw_ytd_baseline_actually_differs_from_atc():
+    """Guard against raw_ytd silently degenerating into the atc baseline.
+
+    raw_ytd reads evid_R/HR/RBI/SB. If those columns ever go missing from the
+    backtest frame, every .get() falls through to the projection and this
+    baseline becomes 'atc with one OPS column swapped' — it would still
+    produce a plausible number and no other test would notice.
+    """
+    frame = _scored_frame()
+    for stat, value in (("R", 40.0), ("HR", 12.0), ("RBI", 41.0), ("SB", 6.0)):
+        frame[f"evid_{stat}"] = [value, value * 0.8]
+    frame["evid_OPS"] = [0.770, 0.640]
+
+    atc = BASELINES["atc"](frame, "hitting")
+    ytd = BASELINES["raw_ytd"](frame, "hitting")
+    differing = [
+        stat
+        for stat in ("R", "HR", "RBI", "SB", "OPS")
+        if not atc[f"pred_{stat}"].equals(ytd[f"pred_{stat}"])
+    ]
+    assert set(differing) >= {"R", "HR", "RBI", "SB", "OPS"}, (
+        f"raw_ytd differs from atc only in {differing}. It must re-project "
+        f"every counting stat from observed rates, not pass them through. "
+        f"Check that assemble_backtest_frame still carries evid_R/HR/RBI/SB."
+    )
+
+
 def test_run_baselines_returns_one_row_per_baseline():
     result = run_baselines(_scored_frame(), _TOTALS, _GRADIENT, "hitting")
     assert set(result["baseline"]) >= {"atc", "raw_ytd", "flat_volume"}, (
