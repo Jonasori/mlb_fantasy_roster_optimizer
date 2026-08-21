@@ -3,10 +3,13 @@ Offline tests for the StatsAPI byDateRange parser.
 No network access. Per AGENTS.md: no classes, no fixtures, no mocking.
 """
 
+import datetime
+
 import numpy as np
 import pandas as pd
+import pytest
 
-from data_prep.statsapi_stats import parse_rate, parse_stat_splits
+from data_prep.statsapi_stats import _range_params, parse_rate, parse_stat_splits
 
 _HITTING_PAYLOAD = {
     "stats": [
@@ -57,6 +60,63 @@ _PITCHING_PAYLOAD = {
         }
     ]
 }
+
+
+_DUPLICATE_PAYLOAD = {
+    "stats": [
+        {
+            "splits": [
+                {
+                    "player": {"id": 663728, "fullName": "Cal Raleigh"},
+                    "numTeams": 2,
+                    "stat": {
+                        "plateAppearances": 200, "atBats": 180, "hits": 30,
+                        "homeRuns": 8, "runs": 20, "rbi": 25, "stolenBases": 0,
+                        "caughtStealing": 0, "baseOnBalls": 15, "strikeOuts": 60,
+                        "sacFlies": 1, "avg": ".167", "obp": ".250", "slg": ".300",
+                        "babip": ".200",
+                    },
+                },
+                {
+                    # Same player, second team — an unaggregated team-split
+                    # response instead of the expected league-wide aggregate.
+                    "player": {"id": 663728, "fullName": "Cal Raleigh"},
+                    "numTeams": 2,
+                    "stat": {
+                        "plateAppearances": 192, "atBats": 160, "hits": 23,
+                        "homeRuns": 9, "runs": 22, "rbi": 26, "stolenBases": 1,
+                        "caughtStealing": 0, "baseOnBalls": 30, "strikeOuts": 65,
+                        "sacFlies": 3, "avg": ".144", "obp": ".295", "slg": ".294",
+                        "babip": ".190",
+                    },
+                },
+            ]
+        }
+    ]
+}
+
+
+def test_range_params_includes_player_pool_all():
+    params = _range_params(
+        "hitting", 2026, datetime.date(2026, 1, 1), datetime.date(2026, 6, 11)
+    )
+    assert params["playerPool"] == "ALL", (
+        f"playerPool is {params.get('playerPool')!r}, expected 'ALL' — omitting "
+        f"it silently returns ~140 players instead of ~1450."
+    )
+    assert params["stats"] == "byDateRange", f"stats is {params['stats']!r}"
+    assert params["group"] == "hitting", f"group is {params['group']!r}"
+    assert params["season"] == 2026, f"season is {params['season']!r}"
+    assert params["gameType"] == "R", f"gameType is {params['gameType']!r}"
+    assert params["sportId"] == 1, f"sportId is {params['sportId']!r}"
+    assert params["limit"] == 3000, f"limit is {params['limit']!r}"
+    assert params["startDate"] == "2026-01-01", f"startDate is {params['startDate']!r}"
+    assert params["endDate"] == "2026-06-11", f"endDate is {params['endDate']!r}"
+
+
+def test_parse_stat_splits_rejects_duplicate_mlbamid():
+    with pytest.raises(AssertionError, match="duplicate MLBAMIDs"):
+        parse_stat_splits(_DUPLICATE_PAYLOAD, "hitting")
 
 
 def test_parse_rate_handles_string_and_sentinel():

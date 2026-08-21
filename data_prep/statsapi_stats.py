@@ -28,6 +28,34 @@ _PITCHING_FIELDS: dict[str, str] = {
 }
 _RATE_FIELDS: tuple[str, ...] = ("avg", "obp", "slg", "babip")
 
+# Below this, a hitting/pitching frame is almost certainly the ~140-player
+# collapse caused by a dropped playerPool=ALL, not a real narrow slate.
+_MIN_PLAUSIBLE_ROWS = 50
+
+
+def _range_params(
+    group: str, season: int, start: datetime.date, end: datetime.date
+) -> dict:
+    """Build the byDateRange query params for one group.
+
+    Pulled out of `fetch_stats_range` so `playerPool=ALL` — whose omission
+    silently returns ~140 players instead of ~1450 — is covered by an offline
+    test instead of only living behind a comment.
+    """
+    return {
+        "stats": "byDateRange",
+        "group": group,
+        "season": season,
+        "gameType": "R",
+        "sportId": 1,
+        # MANDATORY: without playerPool=ALL this silently returns only
+        # ~140 qualified players.
+        "playerPool": "ALL",
+        "limit": _ROW_LIMIT,
+        "startDate": start.isoformat(),
+        "endDate": end.isoformat(),
+    }
+
 
 def parse_rate(series: pd.Series) -> pd.Series:
     """Parse StatsAPI rate strings ('.319') to float, with '.---' as missing.
@@ -111,27 +139,18 @@ def fetch_stats_range(
     )
     frames = []
     for group in ("hitting", "pitching"):
-        payload = statsapi.get(
-            "stats",
-            {
-                "stats": "byDateRange",
-                "group": group,
-                "season": season,
-                "gameType": "R",
-                "sportId": 1,
-                # MANDATORY: without playerPool=ALL this silently returns only
-                # ~140 qualified players.
-                "playerPool": "ALL",
-                "limit": _ROW_LIMIT,
-                "startDate": start.isoformat(),
-                "endDate": end.isoformat(),
-            },
-        )
+        payload = statsapi.get("stats", _range_params(group, season, start, end))
         frame = parse_stat_splits(payload, group)
         assert len(frame) < _ROW_LIMIT, (
             f"fetch_stats_range: {group} returned {len(frame)} rows, at the "
             f"{_ROW_LIMIT} limit — the response is probably truncated. Raise "
             f"_ROW_LIMIT."
+        )
+        assert len(frame) > _MIN_PLAUSIBLE_ROWS, (
+            f"fetch_stats_range: {group} returned only {len(frame)} rows, "
+            f"below the {_MIN_PLAUSIBLE_ROWS}-row floor. This is the signature "
+            f"of the playerPool=ALL trap (a dropped playerPool silently "
+            f"returns ~140 'qualified' players) — check _range_params."
         )
         print(f"  byDateRange {group} {start}..{end}: {len(frame)} players")
         frames.append(frame)
