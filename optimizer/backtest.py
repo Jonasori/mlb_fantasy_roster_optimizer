@@ -302,24 +302,32 @@ def _baseline_raw_ytd(frame: pd.DataFrame, group: str) -> pd.DataFrame:
 
     if group == "hitting":
         per_pa = frame["proj_PA"] / frame["n_evid"].where(frame["n_evid"] > 0)
-        for stat in ("R", "HR", "RBI", "SB"):
-            observed = frame.get(f"evid_{stat}")
-            frame[f"pred_{stat}"] = (
-                observed * per_pa if observed is not None else frame[f"proj_{stat}"]
+        for stat in ("R", "HR", "RBI", "SB", "OPS"):
+            col = f"evid_{stat}"
+            assert col in frame.columns, (
+                f"_baseline_raw_ytd: missing {col}. assemble_backtest_frame "
+                f"must carry evid_R/HR/RBI/SB/OPS for group='hitting' — this "
+                f"baseline must not silently fall back to the projection."
             )
-        frame["pred_OPS"] = frame.get("evid_OPS", frame["proj_OPS"])
+        for stat in ("R", "HR", "RBI", "SB"):
+            frame[f"pred_{stat}"] = frame[f"evid_{stat}"] * per_pa
+        frame["pred_OPS"] = frame["evid_OPS"]
         return frame
 
     # n_evid is BF for pitchers — the wrong denominator for scaling counting
     # stats by innings — so evidence-window IP (n_evid_ip) is used instead.
     per_ip = frame["proj_IP"] / frame["n_evid_ip"].where(frame["n_evid_ip"] > 0)
-    for stat in ("W", "SV", "K"):
-        observed = frame.get(f"evid_{stat}")
-        frame[f"pred_{stat}"] = (
-            observed * per_ip if observed is not None else frame[f"proj_{stat}"]
+    for stat in ("W", "SV", "K", "ERA", "WHIP"):
+        col = f"evid_{stat}"
+        assert col in frame.columns, (
+            f"_baseline_raw_ytd: missing {col}. assemble_backtest_frame must "
+            f"carry evid_W/SV/K/ERA/WHIP for group='pitching' — this "
+            f"baseline must not silently fall back to the projection."
         )
+    for stat in ("W", "SV", "K"):
+        frame[f"pred_{stat}"] = frame[f"evid_{stat}"] * per_ip
     for stat in ("ERA", "WHIP"):
-        frame[f"pred_{stat}"] = frame.get(f"evid_{stat}", frame[f"proj_{stat}"])
+        frame[f"pred_{stat}"] = frame[f"evid_{stat}"]
     return frame
 
 

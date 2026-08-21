@@ -9,7 +9,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from optimizer.backtest import SEASON_END, assemble_backtest_frame
+from optimizer.backtest import (
+    BASELINES,
+    SEASON_END,
+    assemble_backtest_frame,
+    run_baselines,
+    score_in_mew,
+)
 
 
 def _projection() -> pd.DataFrame:
@@ -268,9 +274,19 @@ def test_assemble_pitching_group():
     assert abs(ace["evid_K_pct"] - 90.0 / 300.0) < 1e-9, (
         f"evid_K_pct is {ace['evid_K_pct']}, expected {90 / 300} (90 SOA / 300 BF)"
     )
+    assert ace["evid_W"] == 5.0, f"evid_W is {ace['evid_W']}, expected 5"
+    assert ace["evid_SV"] == 0.0, f"evid_SV is {ace['evid_SV']}, expected 0"
+    assert ace["evid_K"] == 90.0, f"evid_K is {ace['evid_K']}, expected 90 (SOA)"
+    assert ace["n_evid_ip"] == 65.0, (
+        f"n_evid_ip is {ace['n_evid_ip']}, expected 65 (evidence-window IP)"
+    )
+    assert abs(ace["evid_ERA"] - 180.0 / 65.0) < 1e-9, (
+        f"evid_ERA is {ace['evid_ERA']}, expected {180 / 65} (20 ER * 9 / 65 IP)"
+    )
+    assert abs(ace["evid_WHIP"] - 74.0 / 65.0) < 1e-9, (
+        f"evid_WHIP is {ace['evid_WHIP']}, expected {74 / 65} ((50 HA + 24 BBA) / 65 IP)"
+    )
 
-
-from optimizer.backtest import BASELINES, run_baselines, score_in_mew
 
 _TOTALS = {
     "PA": 7000.0, "IP": 1000.0, "R": 897.0, "HR": 240.0, "RBI": 764.0,
@@ -296,6 +312,13 @@ def _scored_frame() -> pd.DataFrame:
             "actual_HR": [9.0, 4.0], "actual_RBI": [28.0, 17.0],
             "actual_SB": [5.0, 1.0], "actual_OPS": [0.790, 0.690],
             "n_evid": [300.0, 280.0],
+            # evid_*: assemble_backtest_frame guarantees these for hitting
+            # (see its docstring), and raw_ytd now reads them directly with
+            # no fallback — a bare frame missing them must raise, not
+            # silently degrade into atc.
+            "evid_R": [20.0, 14.0], "evid_HR": [6.0, 3.0],
+            "evid_RBI": [21.0, 13.0], "evid_SB": [3.0, 1.0],
+            "evid_OPS": [0.760, 0.670],
         }
     )
 
