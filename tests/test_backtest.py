@@ -7,6 +7,7 @@ import datetime
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from optimizer.backtest import SEASON_END, assemble_backtest_frame
 
@@ -62,9 +63,12 @@ def test_season_end_dates_known():
 
 
 def test_assemble_joins_and_prefixes():
+    # outcome_end must be explicit and in the past: the 2026 season's default
+    # (SEASON_END[2026] = 2026-09-27) has not happened yet as of this run.
     frame = assemble_backtest_frame(
         2026, datetime.date(2026, 6, 11), _projection(),
         evidence=_evidence(), actual=_actual(),
+        outcome_end=datetime.date(2026, 6, 20),
     )
     assert len(frame) == 2, (
         f"Expected 2 rows (inner join on players with both evidence and "
@@ -90,6 +94,7 @@ def test_actual_ops_is_derived_not_copied():
     frame = assemble_backtest_frame(
         2026, datetime.date(2026, 6, 11), _projection(),
         evidence=_evidence(), actual=_actual(),
+        outcome_end=datetime.date(2026, 6, 20),
     )
     kept = frame[frame["MLBAMID"] == 1].iloc[0]
     assert abs(kept["actual_OPS"] - (0.335 + 0.455)) < 1e-9, (
@@ -111,4 +116,49 @@ def test_rejects_split_outside_season():
         raise AssertionError(
             "A split date after the season end must fail loudly — it silently "
             "produces an empty outcome window otherwise."
+        )
+
+
+def test_proj_horizon_frac_is_one_at_full_season_end():
+    # 2025 is fully complete, so the default outcome_end (SEASON_END[2025])
+    # passes the not-in-the-future check, and covers the full projected
+    # horizon: frac must be exactly 1.0.
+    frame = assemble_backtest_frame(
+        2025, datetime.date(2025, 6, 11), _projection(),
+        evidence=_evidence(), actual=_actual(),
+    )
+    assert (frame["proj_horizon_frac"] == 1.0).all(), (
+        f"proj_horizon_frac at the default (season-end) outcome_end should be "
+        f"1.0 for every row, got {frame['proj_horizon_frac'].tolist()}"
+    )
+
+
+def test_proj_horizon_frac_short_window():
+    # SEASON_END[2025] = 2025-09-28. split = 2025-08-29 puts the full horizon
+    # at exactly 30 days (2 days left in August + 28 in September).
+    # outcome_end 15 days later = 2025-09-13, so the window covers exactly
+    # half the projected horizon.
+    split = datetime.date(2025, 8, 29)
+    outcome_end = datetime.date(2025, 9, 13)
+    assert (SEASON_END[2025] - split).days == 30, (
+        f"Test setup assumption broken: full horizon is "
+        f"{(SEASON_END[2025] - split).days} days, expected 30"
+    )
+    frame = assemble_backtest_frame(
+        2025, split, _projection(),
+        evidence=_evidence(), actual=_actual(),
+        outcome_end=outcome_end,
+    )
+    assert (abs(frame["proj_horizon_frac"] - 0.5) < 1e-9).all(), (
+        f"proj_horizon_frac for a 15-of-30-day window should be 0.5, got "
+        f"{frame['proj_horizon_frac'].tolist()}"
+    )
+
+
+def test_future_outcome_end_rejected_as_censored():
+    with pytest.raises(AssertionError, match="censor"):
+        assemble_backtest_frame(
+            2026, datetime.date(2026, 6, 11), _projection(),
+            evidence=_evidence(), actual=_actual(),
+            outcome_end=datetime.date(2026, 9, 27),
         )

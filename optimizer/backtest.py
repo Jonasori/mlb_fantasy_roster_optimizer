@@ -52,23 +52,32 @@ def assemble_backtest_frame(
     group: str = "hitting",
     evidence: pd.DataFrame | None = None,
     actual: pd.DataFrame | None = None,
+    outcome_end: datetime.date | None = None,
 ) -> pd.DataFrame:
     """Build one (projection, evidence, outcome) triple for a split date.
 
     Args:
         season: Season year.
         split: The cut date. Evidence is season-start..split; the outcome
-            window is split+1..season end.
+            window is split+1..outcome_end.
         projection: A dated rest-of-season projection as of `split`. Must
             carry MLBAMID plus the scoring columns for `group`.
         group: "hitting" or "pitching".
         evidence: Pre-fetched evidence frame. Fetched from StatsAPI if None.
         actual: Pre-fetched outcome frame. Fetched from StatsAPI if None.
+        outcome_end: Last date of the outcome window. Defaults to the season
+            end. A rest-of-season projection made at `split` projects all the
+            way to the season end, so any shorter outcome window covers only
+            part of what was projected — pass one explicitly (and see
+            `proj_horizon_frac`) when scoring a partial, completed window.
 
     Returns:
         One row per player present in all three sources. Adds columns
-        prefixed `proj_`, `evid_`, `actual_`, plus `n_evid` (the evidence
-        sample size, PA for hitters and BF for pitchers).
+        prefixed `proj_`, `evid_`, `actual_`, `n_evid` (the evidence sample
+        size, PA for hitters and BF for pitchers), and `proj_horizon_frac`
+        (the fraction of the projection's full split-to-season-end horizon
+        that the outcome window actually covers; 1.0 unless `outcome_end` is
+        set short of the season end).
     """
     assert group in ("hitting", "pitching"), (
         f"assemble_backtest_frame: group must be 'hitting' or 'pitching', got {group!r}."
@@ -84,18 +93,25 @@ def assemble_backtest_frame(
         f"inside the {season} season ({start}..{end}). Outside it, one of the "
         f"two windows is empty and the backtest silently scores nothing."
     )
+    if outcome_end is None:
+        outcome_end = end
+    today = datetime.date.today()
+    assert outcome_end <= today, (
+        f"assemble_backtest_frame: outcome_end {outcome_end} is in the future "
+        f"(today is {today}) — that window has not finished, so the outcome "
+        f"data would be right-censored. Pass an explicit past outcome_end, or "
+        f"use a completed season."
+    )
 
     if evidence is None:
         evidence = fetch_stats_range(season, start, split)
     if actual is None:
         actual = fetch_stats_range(
-            season, split + datetime.timedelta(days=1), end
+            season, split + datetime.timedelta(days=1), outcome_end
         )
 
     evidence = add_skill_rates(evidence[evidence["group"] == group])
     actual_raw = actual[actual["group"] == group].copy()
-    if group == "pitching" and "IP" not in actual_raw.columns:
-        actual_raw["IP"] = actual_raw["outs"] / 3.0
 
     skills = HITTING_SKILLS if group == "hitting" else PITCHING_SKILLS
     n_col = "n_PA" if group == "hitting" else "n_BF"
@@ -137,6 +153,11 @@ def assemble_backtest_frame(
         .merge(names, on="MLBAMID", how="left")
     )
     frame = frame[~frame["MLBAMID"].duplicated()].reset_index(drop=True)
+
+    # Projected volume must be multiplied by this before it is compared to
+    # actual volume — a rest-of-season projection covers split..season-end,
+    # and a shorter outcome window only realizes part of that.
+    frame["proj_horizon_frac"] = (outcome_end - split).days / (end - split).days
 
     assert len(frame) > 0, (
         f"assemble_backtest_frame: no players survived the join for {season} "
