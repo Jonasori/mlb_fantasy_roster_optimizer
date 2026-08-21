@@ -1568,9 +1568,14 @@ _NEXT_DATA_RE = re.compile(
 _CDX = "https://web.archive.org/cdx/search/cdx"
 _PROJECTIONS_URL = "https://www.fangraphs.com/projections"
 
-# Wayback rate-limits hard; 2 of 3 probe requests returned 503 without this.
-_MAX_ATTEMPTS = 4
-_BACKOFF_SECONDS = 6
+# Politeness policy. The Archive answers 503 when it wants a client to back
+# off, and we treat that as a stop signal rather than something to retry
+# through: one attempt per capture, a fixed delay between requests, and a hard
+# ceiling on how many we make in a run. Fewer captures survive this way, and
+# that is the intended trade.
+_MAX_ATTEMPTS = 1
+_DELAY_SECONDS = 2.0
+_MAX_REQUESTS_PER_RUN = 40
 
 # Rest-of-season endpoint codes, matching scrape_fangraphs.PROJECTION_TYPES.
 ROS_TYPES: tuple[str, ...] = ("ratcdc", "steamerr", "rthebatx", "rzipsdc")
@@ -1687,27 +1692,63 @@ def list_captures(
 def harvest_capture(
     timestamp: str, proj_type: str, stats: str = "bat"
 ) -> pd.DataFrame | None:
-    """Fetch and parse one capture, retrying through Wayback's 503s.
+    """Fetch and parse one capture. One attempt, then give up.
 
-    Returns None if every attempt failed — the caller decides whether a gap
-    is tolerable. Never returns an empty frame for a failed fetch.
+    A 503 from the Archive means it wants fewer requests, so we take it at
+    its word rather than retrying through it. Returns None when a capture
+    does not come back — the caller decides whether a gap is tolerable.
+    Never returns an empty frame for a failed fetch, so "no data" and
+    "not fetched" stay distinguishable.
     """
     url = f"{_PROJECTIONS_URL}?type={proj_type}&stats={stats}&pos=all"
-    for attempt in range(_MAX_ATTEMPTS):
-        response = requests.get(
-            f"https://web.archive.org/web/{timestamp}id_/{url}",
-            headers=_BROWSER_UA,
-            timeout=120,
-        )
-        records = extract_next_data(response.text)
-        if records:
-            frame = pd.DataFrame(records)
-            print(f"  {timestamp} {proj_type}/{stats}: {len(frame)} rows")
-            return frame
-        time.sleep(_BACKOFF_SECONDS * (attempt + 1))
+    response = requests.get(
+        f"https://web.archive.org/web/{timestamp}id_/{url}",
+        headers=_BROWSER_UA,
+        timeout=120,
+    )
+    records = extract_next_data(response.text)
+    if records:
+        frame = pd.DataFrame(records)
+        print(f"  {timestamp} {proj_type}/{stats}: {len(frame)} rows")
+        return frame
 
-    print(f"  {timestamp} {proj_type}/{stats}: FAILED after {_MAX_ATTEMPTS} attempts")
+    print(
+        f"  {timestamp} {proj_type}/{stats}: no data (HTTP {response.status_code}) — skipping"
+    )
     return None
+
+
+def harvest_dates(
+    timestamps: list[str], proj_type: str, stats: str = "bat"
+) -> dict[str, pd.DataFrame]:
+    """Harvest a list of captures serially, within the per-run request cap.
+
+    Serial by design: one request at a time, a fixed pause between them, and
+    at most `_MAX_REQUESTS_PER_RUN` requests. Anything beyond the cap is
+    reported as skipped rather than silently dropped.
+    """
+    assert timestamps, "harvest_dates: no timestamps given."
+    attempted = timestamps[:_MAX_REQUESTS_PER_RUN]
+    skipped = len(timestamps) - len(attempted)
+    if skipped:
+        print(
+            f"harvest_dates: attempting {len(attempted)} of {len(timestamps)} "
+            f"captures ({skipped} beyond the {_MAX_REQUESTS_PER_RUN}-request "
+            f"per-run cap; re-run to continue)"
+        )
+
+    harvested: dict[str, pd.DataFrame] = {}
+    for index, timestamp in enumerate(attempted):
+        frame = harvest_capture(timestamp, proj_type, stats)
+        if frame is not None:
+            harvested[timestamp] = frame
+        if index + 1 < len(attempted):
+            time.sleep(_DELAY_SECONDS)
+
+    print(
+        f"harvest_dates: {len(harvested)} of {len(attempted)} captures returned data"
+    )
+    return harvested
 ```
 
 - [ ] **Step 4: Run tests to verify they pass**
@@ -1722,17 +1763,16 @@ Run:
 ```bash
 uv run python -c "
 import pandas as pd
-from data_prep.wayback import list_captures, harvest_capture, validate_ros_capture
+from data_prep.wayback import list_captures, harvest_dates, validate_ros_capture
 ts = list_captures('ratcdc', 'bat')
 print('captures:', len(ts))
+harvested = harvest_dates(ts[:12], 'ratcdc', 'bat')
 kept, prev = [], None
-for t in ts[:6]:
-    f = harvest_capture(t, 'ratcdc', 'bat')
-    if f is None: continue
+for t, f in harvested.items():
     ok, why = validate_ros_capture(f, prev)
     print(f'  {t}: {len(f)} rows  valid={ok}  {why}')
     if ok: kept.append((t, f)); prev = f
-print('kept', len(kept), 'of', len(ts[:6]))
+print(f'listed {len(ts)} | attempted {len(ts[:12])} | fetched {len(harvested)} | validated {len(kept)}')
 "
 ```
 
