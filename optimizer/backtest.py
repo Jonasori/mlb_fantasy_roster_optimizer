@@ -78,6 +78,13 @@ def assemble_backtest_frame(
         (the fraction of the projection's full split-to-season-end horizon
         that the outcome window actually covers; 1.0 unless `outcome_end` is
         set short of the season end).
+
+        Hitting also carries evid_R/HR/RBI/SB (raw observed counts) and
+        evid_OPS, so a baseline can re-project observed rates. Pitching
+        carries the equivalent evid_W/SV/K/ERA/WHIP, plus n_evid_ip: n_evid
+        for pitchers is BF (batters faced), which is the wrong denominator
+        for scaling counting stats by innings, so evidence-window IP is
+        carried separately.
     """
     assert group in ("hitting", "pitching"), (
         f"assemble_backtest_frame: group must be 'hitting' or 'pitching', got {group!r}."
@@ -142,6 +149,22 @@ def assemble_backtest_frame(
         # strikeout-heavy arms. Carrying only n_evid (= n_BF) would let later
         # shrinkage over-trust those two rates by more than 2x.
         evid["n_evid_bip"] = evidence["n_BIP"].astype(float).values
+        # Raw observed pitching counts/rates, so the raw_ytd baseline can
+        # project them onto the projection's volume — the pitching mirror of
+        # evid_R/HR/RBI/SB below. Without these it silently degenerates into
+        # the ATC baseline, same failure as the hitting side.
+        evid["evid_W"] = evidence["W"].astype(float).values
+        evid["evid_SV"] = evidence["SV"].astype(float).values
+        evid["evid_K"] = evidence["SOA"].astype(float).values
+        # ERA/WHIP derived exactly as _derive_outcome_stats does for actuals.
+        evid_innings = evidence["IP"].where(evidence["IP"] > 0)
+        evid["evid_ERA"] = (evidence["ER"] * 9.0 / evid_innings).astype(float).values
+        evid["evid_WHIP"] = (
+            (evidence["HA"] + evidence["BBA"]) / evid_innings
+        ).astype(float).values
+        # n_evid (= BF) is the wrong denominator for scaling W/SV/K by
+        # innings, so evidence-window IP is carried under its own name.
+        evid["n_evid_ip"] = evidence["IP"].astype(float).values
     if group == "hitting":
         # The volume corrector's slump term needs the observed composite, even
         # though every *rate* consumer downstream must use the components.
@@ -274,7 +297,6 @@ def _baseline_raw_ytd(frame: pd.DataFrame, group: str) -> pd.DataFrame:
     average. It is here to confirm that finding rather than to compete.
     """
     frame = frame.copy()
-    stats = HITTING_STATS if group == "hitting" else PITCHING_STATS
     vol_col = "PA" if group == "hitting" else "IP"
     frame[f"pred_{vol_col}"] = frame[f"proj_{vol_col}"]
 
@@ -288,9 +310,16 @@ def _baseline_raw_ytd(frame: pd.DataFrame, group: str) -> pd.DataFrame:
         frame["pred_OPS"] = frame.get("evid_OPS", frame["proj_OPS"])
         return frame
 
-    for stat in stats:
-        if stat != vol_col:
-            frame[f"pred_{stat}"] = frame[f"proj_{stat}"]
+    # n_evid is BF for pitchers — the wrong denominator for scaling counting
+    # stats by innings — so evidence-window IP (n_evid_ip) is used instead.
+    per_ip = frame["proj_IP"] / frame["n_evid_ip"].where(frame["n_evid_ip"] > 0)
+    for stat in ("W", "SV", "K"):
+        observed = frame.get(f"evid_{stat}")
+        frame[f"pred_{stat}"] = (
+            observed * per_ip if observed is not None else frame[f"proj_{stat}"]
+        )
+    for stat in ("ERA", "WHIP"):
+        frame[f"pred_{stat}"] = frame.get(f"evid_{stat}", frame[f"proj_{stat}"])
     return frame
 
 

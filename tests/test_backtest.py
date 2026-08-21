@@ -216,6 +216,12 @@ def _pitching_evidence() -> pd.DataFrame:
             "BF": [300.0, 250.0], "SOA": [90.0, 60.0], "BBA": [24.0, 20.0],
             "HRA": [5.0, 4.0], "groundOuts": [70.0, 55.0], "airOuts": [50.0, 45.0],
             "babip": [0.290, 0.280],
+            # IP/W/SV/ER/HA: parse_stat_splits derives IP from outs and maps
+            # these directly from the byDateRange payload (statsapi_stats.py
+            # _PITCHING_FIELDS) — carried here so evid_W/SV/K/ERA/WHIP and
+            # n_evid_ip have real inputs.
+            "IP": [65.0, 50.0], "W": [5.0, 3.0], "SV": [0.0, 8.0],
+            "ER": [20.0, 18.0], "HA": [50.0, 42.0],
         }
     )
 
@@ -242,6 +248,7 @@ def test_assemble_pitching_group():
     for col in (
         "proj_IP", "proj_ERA", "evid_K_pct", "evid_GB_pct", "n_evid",
         "n_evid_bip", "actual_ERA", "actual_WHIP", "actual_K",
+        "evid_W", "evid_SV", "evid_K", "evid_ERA", "evid_WHIP", "n_evid_ip",
     ):
         assert col in frame.columns, f"Missing column {col}: {list(frame.columns)}"
 
@@ -427,6 +434,39 @@ def test_raw_ytd_baseline_actually_differs_from_atc():
         f"raw_ytd differs from atc only in {differing}. It must re-project "
         f"every counting stat from observed rates, not pass them through. "
         f"Check that assemble_backtest_frame still carries evid_R/HR/RBI/SB."
+    )
+
+
+def test_raw_ytd_baseline_actually_differs_from_atc_pitching():
+    """Pitching mirror of the hitting guard above.
+
+    raw_ytd's pitching branch used to be a literal no-op relative to atc —
+    it copied every non-volume stat straight from proj_<stat> without ever
+    touching evidence, so the two baselines scored identically for
+    pitchers. This is the same silent-degeneration failure the hitting
+    guard exists to catch, reproduced on a path nothing was watching.
+    """
+    frame = _pitch_frame()
+    frame["evid_W"] = [4.0, 3.2]
+    frame["evid_SV"] = [0.0, 6.0]
+    frame["evid_K"] = [80.0, 55.0]
+    frame["evid_ERA"] = [3.40, 2.90]
+    frame["evid_WHIP"] = [1.15, 1.00]
+    frame["n_evid_ip"] = [60.0, 45.0]
+
+    atc = BASELINES["atc"](frame, "pitching")
+    ytd = BASELINES["raw_ytd"](frame, "pitching")
+    differing = [
+        stat
+        for stat in ("W", "SV", "K", "ERA", "WHIP")
+        if not atc[f"pred_{stat}"].equals(ytd[f"pred_{stat}"])
+    ]
+    assert set(differing) >= {"W", "SV", "K", "ERA", "WHIP"}, (
+        f"raw_ytd differs from atc only in {differing}. It must re-project "
+        f"every pitching counting stat from observed rates (scaled by "
+        f"proj_IP / n_evid_ip) and use observed ERA/WHIP directly, not pass "
+        f"proj_<stat> through. Check that assemble_backtest_frame still "
+        f"carries evid_W/SV/K/ERA/WHIP and n_evid_ip."
     )
 
 
