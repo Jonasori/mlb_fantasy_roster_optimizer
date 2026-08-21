@@ -428,11 +428,16 @@ Requirements carried from §2.7:
 - Performance-dependent, not only n-dependent.
 - Never on composites.
 
-**Expected value, stated honestly.** Hitter rate correction has near-zero decision value in the
-2026 league (§2.6). It has real value for **pitchers now** — `g_WHIP` and `g_ERA` at 38%/37% of
-ceiling, leverage ~1/7 rather than 1/18, and a 10% WHIP error worth 0.115 MEW against a 0.023
-threshold — and for **hitters in any season where the OPS race is live**, where `g_OPS = 311` would
-make it the most important input in the model.
+**Why this is gated, and why the reason is NOT "small MEW change in 2026."** The observed smallness
+of a Raleigh correction (§2.6) is circumstantial — `g_OPS` sits at 0.13% of its ceiling because
+2026's OPS race happens to be decided, and in a live race `g_OPS = 311` would make hitter rate the
+single most important input in the model. **No design decision here should rest on that number**,
+and any constant tuned to make 2026's magnitudes look right would be overfitting to one league-year.
+
+The gate rests on the structural argument in §1.4 instead: volume is the only **gradient-invariant**
+input, so Part 2a's value holds in every league state, while rate correction's value moves with the
+gradient. That ordering is about which result generalizes, not about which is bigger today. The gate
+itself is simply the §3.1 discipline applied uniformly — 2a must clear the same bar.
 
 Caveat specific to pitchers: WHIP decomposes into BB% (M≈237 BF) and BABIP-against (M≈1,409 BIP,
 very slow). In-season WHIP is therefore heavily luck-driven and must be regressed hard. The gain
