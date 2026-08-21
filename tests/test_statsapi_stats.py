@@ -174,15 +174,37 @@ def test_ytd_registered_as_source():
         f"will not report its staleness."
     )
 
+    args = _build_parser().parse_args(["ytd"])
+    assert args.command == "ytd", (
+        f"Parser accepted 'ytd' but parsed as command={args.command!r}, "
+        f"expected 'ytd'. Check the choices list in _build_parser()."
+    )
+
+
+def test_cli_choices_and_sources_stay_in_sync():
+    """SOURCES and the argparse choices literal are separate lists that can drift."""
+    from data_prep.cli import SOURCES, _build_parser
+
+    # Commands that fetch nothing, and sources with no command of their own.
+    command_only = {"status", "build", "all"}
+    source_without_command = {"standings"}  # fetched by cmd_fantrax alongside rosters
+
     parser = _build_parser()
-    # Verify ytd is an accepted command choice in the parser
-    try:
-        args = parser.parse_args(["ytd"])
-        assert args.command == "ytd", (
-            f"Parser accepted 'ytd' but parsed as command={args.command!r}, expected 'ytd'"
-        )
-    except SystemExit as e:
-        raise AssertionError(
-            f"'ytd' is not in parser choices. "
-            f"Check _build_parser() choices list and dispatch in main()."
-        ) from e
+    # Find the command argument by its dest, not by index (more robust)
+    command_action = None
+    for action in parser._actions:
+        if action.dest == "command":
+            command_action = action
+            break
+
+    assert command_action is not None, "Could not find 'command' argument in parser"
+    choices = set(command_action.choices)
+    source_commands = {s.split("/")[0] for s in SOURCES} - source_without_command
+
+    assert source_commands == choices - command_only, (
+        f"SOURCES and the argparse choices literal have drifted. "
+        f"In SOURCES only: {sorted(source_commands - choices)}. "
+        f"In choices only: {sorted(choices - command_only - source_commands)}. "
+        f"Update both, or extend command_only / source_without_command if the "
+        f"new entry legitimately belongs to neither."
+    )
