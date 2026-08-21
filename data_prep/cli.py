@@ -4,6 +4,7 @@ Command line: fetch one source, or join what has been fetched.
     uv run fetch status         # how stale is each source?
     uv run fetch market         # no auth       — safe to run anytime
     uv run fetch identity       # no auth
+    uv run fetch ytd            # no auth
     uv run fetch projections    # browser cookies (FanGraphs)
     uv run fetch fantrax        # PASTED cookies in config.json (they expire)
     uv run fetch build          # join latest snapshots -> data/players.parquet
@@ -23,6 +24,7 @@ SOURCES: list[str] = [
     "fantrax",
     "standings",
     "identity",
+    "ytd",
     "market/ottoneu",
     "market/adp",
     "market/espn",
@@ -84,6 +86,15 @@ def cmd_identity() -> None:
     fetch_identity_snapshot(sorted(ids))
 
 
+def cmd_ytd() -> None:
+    """Fetch season-to-date player stats from MLB StatsAPI."""
+    import datetime
+
+    from .statsapi_stats import fetch_ytd_snapshot
+
+    fetch_ytd_snapshot(datetime.date.today().year)
+
+
 def cmd_build(system: str) -> None:
     """Join the latest snapshot of every source into data/players.parquet."""
     from .build import build_players, write_players
@@ -97,7 +108,7 @@ def main() -> None:
     )
     parser.add_argument(
         "command",
-        choices=["status", "projections", "fantrax", "market", "identity", "build", "all"],
+        choices=["status", "projections", "fantrax", "market", "identity", "ytd", "build", "all"],
         help="What to run. 'all' fetches every source then builds.",
     )
     parser.add_argument(
@@ -117,6 +128,8 @@ def main() -> None:
         cmd_market()
     elif args.command == "identity":
         cmd_identity()
+    elif args.command == "ytd":
+        cmd_ytd()
     elif args.command == "build":
         cmd_build(args.system)
     elif args.command == "all":
@@ -124,6 +137,7 @@ def main() -> None:
         cmd_fantrax()
         cmd_market()
         cmd_identity()
+        cmd_ytd()
         cmd_build(args.system)
 
 
