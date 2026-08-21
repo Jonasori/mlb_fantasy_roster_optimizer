@@ -656,6 +656,7 @@ def test_value_constraint_filters_correctly():
                 position="1B",
             ),
             "FV": 2.0,
+            "market_value": 2.0,
             "MEW": 1.5,
         },
         {
@@ -672,6 +673,7 @@ def test_value_constraint_filters_correctly():
                 position="1B",
             ),
             "FV": 4.0,
+            "market_value": 4.0,
             "MEW": 3.0,
         },
     ]
@@ -680,8 +682,9 @@ def test_value_constraint_filters_correctly():
     my_roster = {"MyGuy-H"}
     opp_roster = {"TheirStar-H"}
 
-    # Default value_column='FV': send 2.0 vs receive 4.0 → the opponent gives
-    # up 50% of the value they receive, far past the 10% they'd accept.
+    # Default value_column='market_value': send 2.0 vs receive 4.0 → the
+    # opponent gives up 50% of the value they receive, far past the 10% they
+    # would accept.
     result = evaluate_trade(
         send_names={"MyGuy-H"},
         receive_names={"TheirStar-H"},
@@ -1490,3 +1493,108 @@ def test_fv_ignores_undefined_rates_for_zero_volume_players():
         f"A stored ERA of 0.00 is being read as an elite rate."
     )
     assert fv["Prospect-P"] < fv["Good-P"], "Zero-innings pitcher must not lead"
+
+
+def test_participation_scale_flags_only_abandoned_teams():
+    """An abandoned roster's rest-of-season projection is shrunk; live teams are not."""
+    from optimizer.league_state import _participation_scale, _scale_ros_volume
+
+    f = 0.2  # 20% of the season remains, so elapsed:remaining = 4:1
+    ros = {"PA": 1500.0, "IP": 220.0}
+
+    # A team on a full-season pace has banked 4x its remaining volume.
+    active = _participation_scale({"PA": 6000.0, "IP": 880.0}, ros, f, "PA")
+    assert abs(active - 1.0) < 1e-9, (
+        f"a team banking 4x its remaining PA is on pace; expected 1.0, got {active}"
+    )
+
+    # An abandoned team banked only a quarter of that, so it plays ~1/4 as much.
+    dead = _participation_scale({"PA": 1500.0, "IP": 220.0}, ros, f, "PA")
+    assert abs(dead - 0.25) < 1e-9, (
+        f"a team banking 1x its remaining PA is at quarter pace; got {dead}"
+    )
+
+    # Unmeasurable cases must not shrink anyone.
+    assert _participation_scale(None, ros, f, "PA") == 1.0, (
+        "a team with no banked data must not be scaled"
+    )
+    assert _participation_scale({"PA": 6000.0, "IP": 880.0}, ros, 1.0, "PA") == 1.0, (
+        "with the full season remaining there is no elapsed play to measure"
+    )
+
+
+def test_scale_ros_volume_shrinks_counting_but_not_rates():
+    """Scaling participation shrinks counting stats and weights, never rate stats."""
+    from optimizer.league_state import _scale_ros_volume
+
+    ros = {
+        "R": 200.0, "HR": 50.0, "RBI": 180.0, "SB": 30.0, "PA": 1500.0,
+        "W": 15.0, "SV": 10.0, "K": 220.0, "IP": 220.0,
+        "OPS": 0.750, "ERA": 3.80, "WHIP": 1.20,
+    }
+    out = _scale_ros_volume(ros, 0.5, 0.25)
+
+    assert out["R"] == 100.0 and out["PA"] == 750.0, (
+        f"hitting counting stats and PA must scale by 0.5; got R={out['R']}, PA={out['PA']}"
+    )
+    assert out["K"] == 55.0 and out["IP"] == 55.0, (
+        f"pitching counting stats and IP must scale by 0.25; got K={out['K']}, IP={out['IP']}"
+    )
+    for rate in ("OPS", "ERA", "WHIP"):
+        assert out[rate] == ros[rate], (
+            f"{rate} is a rate and must not scale with participation: "
+            f"{out[rate]} != {ros[rate]}"
+        )
+    assert ros["R"] == 200.0, "_scale_ros_volume must not mutate its input"
+
+
+def test_il_player_startable_only_when_projection_is_empty():
+    """IL gating depends on remaining projection, and only when asked for."""
+    from optimizer.players import get_startable_slots
+
+    # Default (today's lineup): an IL player cannot start, projection or not.
+    assert get_startable_slots("C", "IL") == set(), (
+        "without a projected volume an IL player must not be startable"
+    )
+    assert get_startable_slots("C", "IL", 0.0) == set(), (
+        "an IL player with a dead rest-of-season projection must not be startable"
+    )
+
+    # Projecting season totals: a live RoS projection already prices the
+    # missed games, so the player still contributes.
+    assert "C" in get_startable_slots("C", "IL", 90.0), (
+        "an IL player with 90 projected PA must count toward projected totals"
+    )
+
+    # DTD and healthy are unaffected in every mode.
+    assert "C" in get_startable_slots("C", "DTD"), "DTD players are startable"
+    assert "C" in get_startable_slots("C", None), "healthy players are startable"
+    assert "C" in get_startable_slots("C", "DTD", 0.0), (
+        "a DTD player is startable regardless of projected volume"
+    )
+
+
+def test_composition_guard_is_monotone_not_absolute():
+    """A roster already outside league bounds still allows non-worsening swaps."""
+    from optimizer.config import MAX_HITTERS, MAX_PITCHERS, MIN_HITTERS, MIN_PITCHERS
+
+    def violation(h, p):
+        return (
+            max(0, MIN_HITTERS - h)
+            + max(0, h - MAX_HITTERS)
+            + max(0, MIN_PITCHERS - p)
+            + max(0, p - MAX_PITCHERS)
+        )
+
+    # The live shape that broke screening: 18 hitters, 9 pitchers (min is 10).
+    base = violation(18, 9)
+    assert base > 0, (
+        f"18H/9P must register as a violation given bounds "
+        f"{MIN_HITTERS}-{MAX_HITTERS}H / {MIN_PITCHERS}-{MAX_PITCHERS}P"
+    )
+    # Hitter-for-hitter leaves the pitcher shortfall untouched — must be allowed.
+    assert violation(18, 9) <= base, "a hitter-for-hitter swap must stay allowed"
+    # Repairing the shortfall must also be allowed.
+    assert violation(17, 10) <= base, "a hitter-out/pitcher-in swap must stay allowed"
+    # Deepening the shortfall must not be.
+    assert violation(19, 8) > base, "a swap that worsens composition must be blocked"

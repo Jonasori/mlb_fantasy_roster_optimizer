@@ -322,12 +322,60 @@ def dashboard_content(
             state["my_totals"],
             state["opponent_totals"],
             state["opponent_teams"],
+            state["category_sigmas"],
+        )
+
+        # --- Category race board: where the remaining points actually are ---
+        from optimizer.win_model import category_race_board
+
+        _board = category_race_board(
+            state["my_totals"], state["opponent_totals"], state["category_sigmas"]
+        )
+        _board_disp = _board.rename(
+            columns={
+                "cat": "Cat",
+                "my_total": "My Total",
+                "rank": "Rank",
+                "pts_now": "Pts Now",
+                "pts_expected": "Pts Exp",
+                "live_races": "Live",
+                "pts_winnable": "Winnable",
+                "pts_at_risk": "At Risk",
+            }
+        ).round(2)
+        _board_section = mo.vstack(
+            [
+                mo.md(
+                    f"### Where the points are — "
+                    f"**{_board['pts_winnable'].sum():.1f}** still winnable, "
+                    f"**{_board['pts_at_risk'].sum():.1f}** at risk"
+                ),
+                mo.md(
+                    "*`Winnable` is upside left in contested races; a category "
+                    "with 0 is decided and a roster move there buys nothing, "
+                    "however large its gradient.*"
+                ),
+                mo.ui.table(_board_disp, selection=None, page_size=10),
+            ]
         )
 
         # --- My Roster table with Status and Optimal Slot ---
         _rdf = players[players["Name"].isin(my_roster_names)].copy()
         _rdf["Player"] = _rdf["Name"].apply(strip_name_suffix)
-        _rdf["Status"] = _rdf["roster_status"].str.capitalize()
+        # Injury state is what makes a roster row actionable — an IL starter is
+        # the thing you most need to see and it was previously invisible here.
+        # Explicit labels — .capitalize() would render the IR slot as "Ir".
+        _rdf["Status"] = _rdf["roster_status"].map(
+            {
+                "active": "Active",
+                "reserve": "Reserve",
+                "IR": "IR",
+                "minors": "Minors",
+            }
+        ).fillna(_rdf["roster_status"])
+        _inj = _rdf["injury_status"].fillna("")
+        _rdf["Status"] = _rdf["Status"].where(_inj == "", _rdf["Status"] + " · " + _inj)
+        _rdf["Injury"] = _rdf["injury_detail"].fillna("")
         _rdf["Optimal Slot"] = _rdf["optimal_slot"].fillna("Bench")
         _is_st = _rdf["optimal_slot"].notna()
         _sorted = pd.concat(
@@ -340,6 +388,7 @@ def dashboard_content(
             "Player",
             "Position",
             "Status",
+            "Injury",
             "Optimal Slot",
             "MEW",
             "BV",
@@ -534,6 +583,7 @@ def dashboard_content(
                     f"| Projected Standing Points: {10 + _ew:.1f} / 70"
                 ),
                 title_odds_section,
+                _board_section,
                 mo.md("### Recommended Actions"),
                 _actions,
                 fig_to_png(_starters_fig),
@@ -704,11 +754,15 @@ def trade_controls(data_ready, mo, state):
         label="Receive (comma-separated)", placeholder="Target players"
     )
     trade_opp = mo.ui.dropdown(label="Opponent", options=[""] + _opts)
+    # Seed from config so the slider starts where the league is configured;
+    # a hardcoded default silently overrode trade_engine.fairness_threshold_percent.
+    from optimizer.config import MAX_VALUE_LOSS_FRAC as _cfg_loss
+
     trade_value_loss_pct = mo.ui.slider(
         start=0,
         stop=50,
         step=5,
-        value=15,
+        value=int(round(_cfg_loss * 100)),
         label="Max opp. value loss %",
         show_value=True,
     )

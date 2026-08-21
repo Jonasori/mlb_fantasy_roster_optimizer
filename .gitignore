@@ -54,3 +54,10 @@ explore_*.py
 debug_*.py
 test_*.py
 !tests/test_*.py
+
+# Local agent/tooling runtime state
+.atl/
+.pi/
+node_modules/
+package.json
+package-lock.json

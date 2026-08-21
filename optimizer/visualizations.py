@@ -11,6 +11,7 @@ import pandas as pd
 import seaborn as sns
 from matplotlib.lines import Line2D
 from matplotlib.patches import ConnectionPatch
+from scipy import stats
 
 from .config import (
     ALL_CATEGORIES,
@@ -31,48 +32,65 @@ def plot_category_heatmap(
     my_totals: dict[str, float],
     opponent_totals: dict[int, dict[str, float]],
     opponent_teams: list[str],
+    category_sigmas: dict[str, float],
 ) -> plt.Figure:
-    """Heatmap of win/loss margins vs each opponent across 10 categories.
+    """Heatmap of win PROBABILITY vs each opponent across 10 categories.
 
-    Positive cell = I am winning. Rate stats (OPS, ERA, WHIP) scaled ×1000
-    so they display alongside counting stats.
+    Each cell is Φ(z_{c,o}) — the modeled chance I finish ahead of that
+    opponent in that category. Probability is the only quantity comparable
+    across categories: a raw margin of +40 K and +0.05 WHIP are not on the
+    same scale, and colouring them from one gradient makes whichever category
+    carries the biggest raw numbers dominate the picture regardless of whether
+    the race is close. Bold cells are the live races — the only ones a roster
+    move can still swing.
 
     Args:
         my_totals: My team's projected totals per category.
         opponent_totals: {opp_id (1-indexed): {cat: total}}.
         opponent_teams: Alphabetically sorted opponent team names.
+        category_sigmas: σ_c per category, for the z-score denominator.
 
     Returns:
         Figure with annotated seaborn heatmap.
     """
-    rate_cats = {"OPS", "ERA", "WHIP"}
     n_opps = len(opponent_teams)
-    margin_data = np.zeros((n_opps, len(ALL_CATEGORIES)))
+    prob = np.zeros((n_opps, len(ALL_CATEGORIES)))
 
     for i in range(n_opps):
         opp_id = i + 1
         for j, cat in enumerate(ALL_CATEGORIES):
-            if cat in NEGATIVE_CATEGORIES:
-                margin = opponent_totals[opp_id][cat] - my_totals[cat]
-            else:
-                margin = my_totals[cat] - opponent_totals[opp_id][cat]
-            if cat in rate_cats:
-                margin *= 1000
-            margin_data[i, j] = margin
+            denom = category_sigmas[cat] * np.sqrt(2)
+            mine, theirs = my_totals[cat], opponent_totals[opp_id][cat]
+            z = (theirs - mine) if cat in NEGATIVE_CATEGORIES else (mine - theirs)
+            prob[i, j] = stats.norm.cdf(z / denom)
 
-    df = pd.DataFrame(margin_data, index=opponent_teams, columns=ALL_CATEGORIES)
+    df = pd.DataFrame(prob, index=opponent_teams, columns=ALL_CATEGORIES)
 
     fig, ax = plt.subplots(figsize=(14, max(4, n_opps * 0.8 + 1)))
     sns.heatmap(
         df,
         cmap="RdYlGn",
-        center=0,
+        vmin=0.0,
+        vmax=1.0,
+        center=0.5,
         annot=True,
-        fmt=".0f",
+        fmt=".0%",
         linewidths=0.5,
+        cbar_kws={"label": "P(I win this category)"},
         ax=ax,
     )
-    ax.set_title("Win/Loss Matrix (positive = winning, rate stats ×1000)")
+    # Live races are the actionable ones; settled cells are noise on a dashboard.
+    n_live = 0
+    for i in range(n_opps):
+        for j in range(len(ALL_CATEGORIES)):
+            if 0.10 < prob[i, j] < 0.90:
+                n_live += 1
+                ax.texts[i * len(ALL_CATEGORIES) + j].set_fontweight("bold")
+
+    ax.set_title(
+        f"Category win probability — {n_live} of {n_opps * len(ALL_CATEGORIES)} "
+        f"races still live (bold)"
+    )
     ax.set_ylabel("")
     fig.tight_layout()
     return fig

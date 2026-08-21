@@ -18,6 +18,9 @@ id-then-name, because ~245 of its rows are minor leaguers carrying only a
 FanGraphs *minor*-league id.
 """
 
+import datetime
+import re
+
 import pandas as pd
 
 from .names import normalize_name, strip_name_suffix
@@ -90,6 +93,29 @@ def match_rows(
     return matched
 
 
+# Team qualifier added by _resolve_name_collisions ("Max Muncy (ATH)-H").
+# It disambiguates our primary key; no external provider knows about it, so
+# every join key strips it back off.
+_TEAM_QUALIFIER_RE = re.compile(r"\s*\([A-Z]{2,3}\)(?=(-[HP])?$)")
+
+# FanGraphs and Fantrax abbreviate five clubs differently. Without this the
+# team-qualified first pass of every name match silently degrades to the
+# name-only fallback for ~17% of the table — exactly the rows the strong pass
+# exists to protect.
+_TEAM_ALIASES: dict[str, str] = {
+    "KCR": "KC",
+    "SDP": "SD",
+    "SFG": "SF",
+    "TBR": "TB",
+    "WSN": "WSH",
+}
+
+
+def _team_key(teams: pd.Series) -> pd.Series:
+    """Canonical MLB team abbreviation for match keys (FanGraphs → Fantrax)."""
+    return teams.astype(str).str.upper().replace(_TEAM_ALIASES)
+
+
 def _suffixed_key(names: pd.Series) -> pd.Series:
     """Name key that KEEPS the -H/-P suffix, for joining two suffixed sides.
 
@@ -97,7 +123,8 @@ def _suffixed_key(names: pd.Series) -> pd.Series:
     hitter row can never match his pitcher row. Use this when both sides carry
     the suffix (the Fantrax merge).
     """
-    return names.astype(str).map(normalize_name)
+    stripped = names.astype(str).str.replace(_TEAM_QUALIFIER_RE, "", regex=True)
+    return stripped.map(normalize_name)
 
 
 def _plain_key(names: pd.Series) -> pd.Series:
@@ -108,7 +135,63 @@ def _plain_key(names: pd.Series) -> pd.Series:
     match his single external row, which is what we want — one market price
     applies to the player, not to a side of him.
     """
-    return names.astype(str).map(strip_name_suffix).map(normalize_name)
+    stripped = names.astype(str).str.replace(_TEAM_QUALIFIER_RE, "", regex=True)
+    return stripped.map(strip_name_suffix).map(normalize_name)
+
+
+def _resolve_name_collisions(
+    frame: pd.DataFrame, label: str, volume_col: str
+) -> pd.DataFrame:
+    """Make `Name` unique without deleting anybody.
+
+    Two different things both look like a duplicate name, and collapsing them
+    into one `drop_duplicates(subset="Name")` gets both wrong:
+
+    - **Same person, listed twice** (identical PlayerId — FanGraphs occasionally
+      emits split rows). Keep the higher-volume row; the fragment is the stale
+      one.
+    - **Different people who share a name** (different PlayerId — e.g. Max Muncy
+      of LAD and Max Muncy of ATH are both real major leaguers). Dropping one
+      erases a rosterable player. Qualify each with his team instead.
+
+    Args:
+        frame: One player type's projection rows, `Name` already suffixed.
+        label: 'hitter' or 'pitcher', for the status line.
+        volume_col: 'PA' or 'IP' — which column decides the survivor of a
+            same-id duplicate.
+
+    Returns:
+        A new frame with unique `Name`; no rows dropped except true same-id
+        duplicates.
+    """
+    frame = frame.copy()
+    same_person = frame.duplicated(subset=["Name", "PlayerId"]).sum()
+    if same_person:
+        print(f"  collapsing {same_person} split {label} row(s) (same PlayerId)")
+        frame = frame.sort_values(volume_col, ascending=False, kind="stable")
+        frame = frame.drop_duplicates(subset=["Name", "PlayerId"], keep="first")
+
+    collides = frame["Name"].duplicated(keep=False)
+    if collides.any():
+        names = sorted(frame.loc[collides, "Name"].unique())
+        print(
+            f"  {len(names)} {label} name(s) shared by different players — "
+            f"qualifying with team: {names}"
+        )
+        # "Max Muncy-H" -> "Max Muncy (ATH)-H"; the -H/-P tag stays last so
+        # strip_name_suffix and every -H/-P check downstream keep working.
+        base = frame.loc[collides, "Name"].str[:-2]
+        tag = frame.loc[collides, "Name"].str[-2:]
+        frame.loc[collides, "Name"] = (
+            base + " (" + frame.loc[collides, "Team"].astype(str) + ")" + tag
+        )
+
+    assert not frame["Name"].duplicated().any(), (
+        f"_resolve_name_collisions: {label} names still collide after team "
+        f"qualification: {sorted(frame.loc[frame['Name'].duplicated(keep=False), 'Name'])}. "
+        f"Two players share both a name and a team."
+    )
+    return frame
 
 
 def prepare_projections(raw: pd.DataFrame) -> pd.DataFrame:
@@ -147,12 +230,8 @@ def prepare_projections(raw: pd.DataFrame) -> pd.DataFrame:
     hitters["Name"] = hitters["Name"].astype(str) + "-H"
     pitchers["Name"] = pitchers["Name"].astype(str) + "-P"
 
-    for frame, label in ((hitters, "hitter"), (pitchers, "pitcher")):
-        dupes = frame["Name"].duplicated().sum()
-        if dupes:
-            print(f"  dropping {dupes} duplicate {label} name(s)")
-    hitters = hitters.drop_duplicates(subset="Name", keep="first")
-    pitchers = pitchers.drop_duplicates(subset="Name", keep="first")
+    hitters = _resolve_name_collisions(hitters, "hitter", "PA")
+    pitchers = _resolve_name_collisions(pitchers, "pitcher", "IP")
 
     for col in PITCHING_STATS:
         hitters[col] = 0.0
@@ -365,8 +444,8 @@ def merge_fantrax(players: pd.DataFrame, fantrax: pd.DataFrame) -> pd.DataFrame:
     team_col = "mlb_team" if "mlb_team" in fantrax.columns else None
 
     if team_col is not None:
-        left_keys = [left_name + "|" + players["Team"].astype(str), left_name]
-        right_keys = [right_name + "|" + fantrax[team_col].astype(str), right_name]
+        left_keys = [left_name + "|" + _team_key(players["Team"]), left_name]
+        right_keys = [right_name + "|" + _team_key(fantrax[team_col]), right_name]
     else:
         left_keys, right_keys = [left_name], [right_name]
 
@@ -540,6 +619,34 @@ def merge_market(players: pd.DataFrame, market: dict[str, pd.DataFrame]) -> pd.D
     return _split_across_sides(players)
 
 
+# Sources refresh on different cadences, so a few days apart is normal. Beyond
+# this the join is mixing eras: three-week-old ownership against today's
+# projections attributes traded and dropped players to the wrong team.
+_MAX_SNAPSHOT_SPREAD_DAYS: int = 10
+
+
+def _warn_if_sources_disagree_on_date(used: dict[str, datetime.date]) -> None:
+    """Warn when the snapshots being joined span too many days.
+
+    `read_latest_raw` picks each source's newest snapshot independently, so a
+    stale source is joined silently. Fantrax in particular only refreshes on
+    transactions, so it drifts furthest while looking fine.
+    """
+    if len(used) < 2:
+        return
+    oldest_source = min(used, key=used.get)
+    newest_source = max(used, key=used.get)
+    spread = (used[newest_source] - used[oldest_source]).days
+    if spread > _MAX_SNAPSHOT_SPREAD_DAYS:
+        print(
+            f"  WARNING: snapshots span {spread} days — {oldest_source} is from "
+            f"{used[oldest_source]} while {newest_source} is from "
+            f"{used[newest_source]}. Ownership, injuries and projections may "
+            f"describe different weeks. Refresh with `uv run fetch "
+            f"{oldest_source.split('/')[0]}`."
+        )
+
+
 def build_players(
     system: str = "atc",
     on_or_before=None,
@@ -571,30 +678,40 @@ def build_players(
 
     from .raw_io import available_dates
 
-    if available_dates("fantrax"):
+    # Every snapshot date that goes into this table, so staleness can be
+    # asserted at the end and stamped onto the frame for downstream display.
+    used: dict[str, datetime.date] = {f"projections/{system}": proj_date}
+
+    if available_dates("fantrax", on_or_before):
         fantrax, date = read_latest_raw("fantrax", on_or_before)
         print(f"fantrax snapshot: {date}")
+        used["fantrax"] = date
         players = merge_fantrax(players, fantrax)
     else:
         print("fantrax: no snapshot — table will have no ownership")
     players = apply_volume_floors(players)
 
-    if include_identity and available_dates("identity"):
+    if include_identity and available_dates("identity", on_or_before):
         identity, date = read_latest_raw("identity", on_or_before)
         print(f"identity snapshot: {date}")
+        used["identity"] = date
         players = merge_identity(players, identity)
 
     if include_market:
         market: dict[str, pd.DataFrame] = {}
         for source in ("ottoneu", "adp", "espn", "hkb"):
-            if available_dates(f"market/{source}"):
+            if available_dates(f"market/{source}", on_or_before):
                 frame, date = read_latest_raw(f"market/{source}", on_or_before)
                 market[source] = frame
+                used[f"market/{source}"] = date
                 print(f"market/{source} snapshot: {date}")
         if market:
             players = merge_market(players, market)
         else:
             print("market: no snapshots — no dynasty axis")
+
+    _warn_if_sources_disagree_on_date(used)
+    players.attrs["snapshot_dates"] = {k: str(v) for k, v in used.items()}
 
     print(f"=== players table complete: {len(players)} rows ===")
     return players

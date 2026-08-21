@@ -43,23 +43,32 @@ def get_eligible_slots(position_str: str) -> set[str]:
 
 
 def get_startable_slots(
-    position_str: str, injury_status: str | None = None
+    position_str: str,
+    injury_status: str | None = None,
+    projected_volume: float | None = None,
 ) -> set[str]:
     """Slots a player can START in, honoring real-world injury state.
 
-    A player on the Injured List ("IL") cannot fill a starting slot, so the
-    lineup MILP must never assign them. Day-to-Day ("DTD") players are still
-    startable (short-term, not roster-blocking). Any other injury_status
-    (including None) is treated as healthy.
+    Day-to-Day ("DTD") players are startable (short-term, not roster-blocking).
+
+    An "IL" player is excluded ONLY when their rest-of-season projection is
+    empty. This is the §9c point applied to the lineup model: a RoS projection
+    for an injured player is *already* their post-return value — the feed has
+    discounted the games they will miss. Zeroing them again charges the same
+    absence twice, which understates every roster holding such a player. A
+    player with a genuinely dead season projects zero volume and is excluded on
+    that basis instead of on the flag.
 
     Args:
         position_str: Comma-separated position string (e.g., "SS,2B").
         injury_status: "IL", "DTD", None, or NaN (from the silver table's
             optional injury_status column).
+        projected_volume: Rest-of-season PA + IP. None means unknown, in which
+            case an IL player is excluded (the conservative reading).
 
     Returns:
-        Eligible starting slots, or an empty set if the player is on the IL.
+        Eligible starting slots, or an empty set if the player cannot start.
     """
-    if injury_status == "IL":
+    if injury_status == "IL" and (projected_volume is None or projected_volume <= 0.0):
         return set()
     return get_eligible_slots(position_str)
