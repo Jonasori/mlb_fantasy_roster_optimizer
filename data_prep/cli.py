@@ -102,7 +102,8 @@ def cmd_build(system: str) -> None:
     write_players(build_players(system=system))
 
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
+    """Construct argument parser. Extracted for test access."""
     parser = argparse.ArgumentParser(
         description="Fetch one data source into the raw layer, or join them.",
     )
@@ -116,6 +117,11 @@ def main() -> None:
         default="atc",
         help="Projection system for 'build' (atc or steamer). Default: atc",
     )
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
     args = parser.parse_args()
 
     if args.command == "status":
