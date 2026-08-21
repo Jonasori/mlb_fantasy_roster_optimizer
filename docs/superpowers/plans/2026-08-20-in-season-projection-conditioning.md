@@ -1009,6 +1009,12 @@ def assemble_backtest_frame(
     evid = evidence[["MLBAMID", *skills, n_col]].rename(
         columns={s: f"evid_{s}" for s in skills} | {n_col: "n_evid"}
     )
+    if group == "pitching":
+        # GB_pct and HRFB are computed over batted balls, not batters faced —
+        # on real data n_BIP is a median 0.465 of n_BF and as low as 0.32 for
+        # strikeout-heavy arms. Carrying only n_evid (= n_BF) would let later
+        # shrinkage over-trust those two rates by more than 2x.
+        evid["n_evid_bip"] = evidence["n_BIP"].astype(float).values
     if group == "hitting":
         # The volume corrector's slump term needs the observed composite, even
         # though every *rate* consumer downstream must use the components.
