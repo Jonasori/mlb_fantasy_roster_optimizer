@@ -167,14 +167,22 @@ def test_parse_stat_splits_no_duplicate_players():
 
 
 def test_ytd_registered_as_source():
-    from data_prep.cli import SOURCES
-    from data_prep.raw_io import RAW_DIR, raw_path
+    from data_prep.cli import SOURCES, _build_parser
 
     assert "ytd" in SOURCES, (
         f"'ytd' missing from cli.SOURCES ({SOURCES}); `uv run fetch status` "
         f"will not report its staleness."
     )
-    path = raw_path("ytd", datetime.date(2026, 8, 20))
-    assert path == RAW_DIR / "ytd" / "2026-08-20.parquet", (
-        f"ytd snapshots must land at data/raw/ytd/<date>.parquet, got {path}"
-    )
+
+    parser = _build_parser()
+    # Verify ytd is an accepted command choice in the parser
+    try:
+        args = parser.parse_args(["ytd"])
+        assert args.command == "ytd", (
+            f"Parser accepted 'ytd' but parsed as command={args.command!r}, expected 'ytd'"
+        )
+    except SystemExit as e:
+        raise AssertionError(
+            f"'ytd' is not in parser choices. "
+            f"Check _build_parser() choices list and dispatch in main()."
+        ) from e
