@@ -164,3 +164,17 @@ def test_parse_stat_splits_no_duplicate_players():
         "byDateRange aggregates traded players across teams; duplicate MLBAMIDs "
         "mean the parser is splitting on team."
     )
+
+
+def test_ytd_registered_as_source():
+    from data_prep.cli import SOURCES
+    from data_prep.raw_io import RAW_DIR, raw_path
+
+    assert "ytd" in SOURCES, (
+        f"'ytd' missing from cli.SOURCES ({SOURCES}); `uv run fetch status` "
+        f"will not report its staleness."
+    )
+    path = raw_path("ytd", datetime.date(2026, 8, 20))
+    assert path == RAW_DIR / "ytd" / "2026-08-20.parquet", (
+        f"ytd snapshots must land at data/raw/ytd/<date>.parquet, got {path}"
+    )
