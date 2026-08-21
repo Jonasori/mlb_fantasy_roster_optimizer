@@ -1015,6 +1015,11 @@ def assemble_backtest_frame(
         evid["evid_OPS"] = (
             evidence["obp"].astype(float) + evidence["slg"].astype(float)
         ).values
+        # Raw observed counting stats, so the raw_ytd baseline can project them
+        # onto the projection's volume. Without these it silently degenerates
+        # into the ATC baseline with one column swapped.
+        for stat in ("R", "HR", "RBI", "SB"):
+            evid[f"evid_{stat}"] = evidence[stat].astype(float).values
     proj = projection[["MLBAMID", *stats]].rename(
         columns={s: f"proj_{s}" for s in stats}
     )
@@ -2193,7 +2198,7 @@ Add to the docstring's Args:
             docs/superpowers/specs/2026-08-20-in-season-projection-conditioning-design.md.
 ```
 
-Immediately before the existing `return players` (line ~717), insert:
+Insert the block **immediately before the `_warn_if_sources_disagree_on_date(used)` call at line ~713** — NOT before `return players` at ~717. The `used` dict is consumed at 713 (staleness warning) and 714 (`players.attrs["snapshot_dates"]`); inserting after those makes `used["ytd"] = ytd_date` dead code and the ytd snapshot date silently vanishes from provenance:
 
 ```python
     if adjust_volume:
@@ -2299,4 +2304,19 @@ def test_evid_ops_is_carried_from_evidence():
     assert abs(kept["evid_OPS"] - (0.330 + 0.440)) < 1e-9, (
         f"evid_OPS is {kept['evid_OPS']}, expected obp+slg = 0.770"
     )
+
+
+def test_evid_counting_stats_are_carried():
+    """The raw_ytd baseline needs observed counts, not just skill rates."""
+    frame = assemble_backtest_frame(
+        2026, datetime.date(2026, 6, 11), _projection(),
+        evidence=_evidence(), actual=_actual(),
+    )
+    kept = frame[frame["MLBAMID"] == 1].iloc[0]
+    for stat, expected in (("R", 40.0), ("HR", 12.0), ("RBI", 41.0), ("SB", 6.0)):
+        assert kept[f"evid_{stat}"] == expected, (
+            f"evid_{stat} is {kept[f'evid_{stat}']}, expected {expected}. "
+            f"Without these the raw_ytd baseline silently degenerates into the "
+            f"ATC baseline with one column swapped."
+        )
 ```
