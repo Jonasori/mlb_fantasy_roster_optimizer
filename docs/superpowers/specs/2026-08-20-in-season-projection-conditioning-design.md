@@ -255,14 +255,41 @@ Three parts. Part 0 gates everything; Part 2b is gated on Part 0's results.
 Not a feature. Without it, every constant becomes a knob tuned until Raleigh looks right — the
 failure mode §1.2 exists to prevent.
 
+**The horizon trap (found during implementation, 2026-08-21).** A rest-of-season projection made
+at date D projects to **season end**. Comparing it against actual performance over any shorter
+window is apples-to-oranges — and if that window has not finished, the outcome data is
+additionally **right-censored**. Both errors push the same direction and are invisible in the
+output: fitting `log(actual_volume / projected_volume)` on a 70-day outcome against a 108-day
+projection learns a large negative intercept and concludes the projection over-forecasts volume
+by ~30%, when the true cause is the calendar.
+
+The version of this section published on 2026-08-20 specified exactly that flawed comparison.
+Two consequences follow, and they change where the fit happens:
+
+1. **The real fit belongs on completed seasons (2023–2025)**, where a projection at D and the
+   actual outcome from D both run to the same season end. This is what the §3.1 archive exists
+   for.
+2. **2026 is a prorated diagnostic, not a fitting set**, until the season ends on 2026-09-27.
+
+`assemble_backtest_frame` therefore takes an explicit `outcome_end`, **asserts it is not in the
+future** rather than silently returning censored rows, and emits `proj_horizon_frac` =
+(outcome window days) / (D → season end days). Consumers comparing *volume* must multiply
+projected volume by it. On a completed season with `outcome_end` at season end it is exactly
+1.0 and is a no-op.
+
 **Primary test (calibration of `M_vs_ATC`):**
 
 | | |
 |---|---|
-| Split date | 2026-06-11 |
-| Baseline | ATC RoS snapshot `data_prep/data/pulled_20260611/` — a genuine dated held-out projection |
-| Evidence | 2026 stats through 06-11, from MLB StatsAPI game logs, decomposed to skills |
-| Target | actual 06-11 → 08-20 performance (~70 days, ~500 hitters, ~600 pitchers) |
+| Split date | a mid-season date in a **completed** season (2023–2025) |
+| Baseline | that season's dated RoS snapshot, from the §3.1 Wayback archive |
+| Evidence | stats through D, from MLB StatsAPI `byDateRange`, decomposed to skills |
+| Target | actual D → season end, with `proj_horizon_frac` = 1.0 |
+
+**Secondary diagnostic (2026, prorated):** split 2026-06-11 against the local
+`data_prep/data/pulled_20260611/` snapshot, `outcome_end` 2026-08-20, ~500 hitters. Usable for
+sanity checks and rate comparisons; **not** for fitting volume without applying
+`proj_horizon_frac`.
 
 Local snapshots at 06-12/13/14/18/23/26 exist but are 15 days apart on the same players. **Report
 them, but treat the local set as approximately one independent window, not seven.**

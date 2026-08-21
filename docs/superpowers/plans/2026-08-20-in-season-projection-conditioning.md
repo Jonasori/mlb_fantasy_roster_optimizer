@@ -2061,7 +2061,10 @@ def fit_volume_correction(
         f"or fall back to the reconstruction route (spec §3.1)."
     )
 
-    target = np.log(usable[f"actual_{vol}"] / usable[f"proj_{vol}"])
+    # The projection spans D..season-end; the outcome may span a shorter window.
+    # Without this the fit learns the calendar gap as if it were a volume bias.
+    horizon = usable["proj_horizon_frac"] if "proj_horizon_frac" in usable else 1.0
+    target = np.log(usable[f"actual_{vol}"] / (usable[f"proj_{vol}"] * horizon))
     design = np.column_stack(
         [
             np.ones(len(usable)),
