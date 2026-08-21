@@ -35,11 +35,15 @@ def _safe_ratio(numerator: pd.Series, denominator: pd.Series) -> pd.Series:
 def add_skill_rates(stats: pd.DataFrame) -> pd.DataFrame:
     """Add per-skill rate columns to a parsed stats frame.
 
-    Requires columns: group, and for hitting rows PA/AB/H/HR/SB/CS/BB/SO/slg/avg/babip;
+    Requires columns: group, and for hitting rows PA/SB/CS/BB/SO/slg/avg/babip;
     for pitching rows BF/SOA/BBA/HRA/groundOuts/airOuts/babip.
 
     Adds columns: K_pct, BB_pct, ISO, BABIP, SBA_rate, n_PA (hitting rows);
-    K_pct, BB_pct, GB_pct, HRFB, BABIP_against, n_BF (pitching rows).
+    K_pct, BB_pct, GB_pct, HRFB, BABIP_against, n_BF, n_BIP (pitching rows).
+    n_BIP (groundOuts + airOuts) is the real sample size behind GB_pct and
+    HRFB, which are batted-ball rates, not plate-appearance rates like
+    K_pct/BB_pct — a high-strikeout pitcher can have a large n_BF and very
+    few batted balls, so n_BF alone would overstate their reliability.
     Rows of the other group get NaN in that group's columns.
     """
     stats = stats.copy()
@@ -52,10 +56,10 @@ def add_skill_rates(stats: pd.DataFrame) -> pd.DataFrame:
     is_pit = stats["group"] == "pitching"
     assert (is_hit | is_pit).all(), (
         f"add_skill_rates: unexpected group values "
-        f"{sorted(set(stats.loc[~(is_hit | is_pit), 'group']))}."
+        f"{stats.loc[~(is_hit | is_pit), 'group'].unique().tolist()}."
     )
 
-    for col in (*HITTING_SKILLS, *PITCHING_SKILLS, "n_PA", "n_BF"):
+    for col in (*HITTING_SKILLS, *PITCHING_SKILLS, "n_PA", "n_BF", "n_BIP"):
         stats[col] = np.nan
 
     if is_hit.any():
@@ -77,6 +81,7 @@ def add_skill_rates(stats: pd.DataFrame) -> pd.DataFrame:
         stats.loc[is_pit, "HRFB"] = _safe_ratio(p["HRA"], p["airOuts"])
         stats.loc[is_pit, "BABIP_against"] = p["babip"].astype(float)
         stats.loc[is_pit, "n_BF"] = p["BF"].astype(float)
+        stats.loc[is_pit, "n_BIP"] = (p["groundOuts"] + p["airOuts"]).astype(float)
 
     n_hit = int(is_hit.sum())
     n_pit = int(is_pit.sum())
