@@ -4,7 +4,18 @@ Player name normalization and display helpers (data prep layer).
 Pure functions — no optimizer config.
 """
 
+import re
 import unicodedata
+
+# Generational suffixes, matched only at the END of the name and longest-first.
+# A plain substring replace is wrong twice over: " ii" fires inside " iii"
+# (leaving "hasselli"), and " iv" fires mid-word (turning "Ivey" into "ey").
+_SUFFIX_RE = re.compile(r"\s+(?:jr\.?|sr\.?|iii|ii|iv)$")
+
+# Punctuation providers disagree on: "J.R. Ritchie" vs "JR Ritchie".
+# Apostrophes and hyphens are kept — they are part of the name proper
+# ("O'Hoppe", "Jung-hoo") and both sides spell them consistently.
+_PUNCT_RE = re.compile(r"[^\w\s'\-]")
 
 
 def strip_diacritics(name: str) -> str:
@@ -31,7 +42,8 @@ def normalize_name(name: str) -> str:
 
     Handles:
         - Accented characters (Rodríguez → rodriguez)
-        - Name suffixes like Jr., Sr. (removed)
+        - Trailing generational suffixes: Jr., Sr., II, III, IV (removed)
+        - Punctuation providers disagree on (J.R. Ritchie → jr ritchie)
     """
     suffix = ""
     if name.endswith("-H"):
@@ -45,9 +57,10 @@ def normalize_name(name: str) -> str:
     name = "".join(c for c in name if unicodedata.category(c) != "Mn")
     name = name.lower()
 
-    for suffix_remove in [" jr.", " jr", " sr.", " sr", " ii", " iii", " iv"]:
-        name = name.replace(suffix_remove, "")
-
     name = name.replace("\u2019", "'").replace("`", "'")
+    name = _SUFFIX_RE.sub("", name)
+    name = _PUNCT_RE.sub("", name)
+    # Collapse whitespace left behind by removed punctuation ("j.r." -> "jr").
+    name = " ".join(name.split())
 
-    return name.strip() + suffix.lower()
+    return name + suffix.lower()

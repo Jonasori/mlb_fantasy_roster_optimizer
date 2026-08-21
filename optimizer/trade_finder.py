@@ -8,10 +8,16 @@ same Value metric. The differences:
 3. The affected opponent's totals change post-trade (1 extra MILP).
 
 **Trade value column.** Fairness is judged on one configurable per-player
-column, `value_column` (default `"FV"`): whatever number best approximates
-what the rest of the league thinks a player is worth. It is a column name,
-not a formula — point it at a real market price (e.g. Ottoneu auction
-salaries) once that column exists and every check below follows.
+column, `value_column` (default `"market_value"`, Ottoneu median auction
+salary): whatever number best approximates what the rest of the league thinks
+a player is worth. It is a column name, not a formula.
+
+It must be EXOGENOUS. FV was the historical default and is wrong for this job:
+it is built from our own projections, so corr(FV, MEW) = 0.96 and the
+constraint ends up checking our valuation against itself, which is exactly the
+circularity the fairness model exists to avoid. FV is also a z-score sum, so a
+third of rostered players carry a negative value and both RELATIVE conditions
+below lose their meaning.
 
 Feasibility uses two checks on that column:
   - Aggregate: opponent's total value loss ≤ max_value_loss_frac of what
@@ -35,7 +41,11 @@ from .lineup_solver import (
     solve_lineup,
 )
 from .player_scoring import add_mew
-from .swap_evaluator import _solve_lineup_holding_half, add_bench_value
+from .swap_evaluator import (
+    _solve_lineup_holding_half,
+    add_bench_value,
+    composition_violation,
+)
 from .win_model import (
     compute_ew_gradient,
     compute_win_probability,
@@ -82,8 +92,13 @@ def _opp_would_reject(
     Returns:
         True if either fairness check fails.
     """
-    if recv_value <= 0:
-        return False
+    assert recv_value > 0 and send_value > 0, (
+        f"_opp_would_reject: trade values must be positive market prices, got "
+        f"send={send_value}, recv={recv_value}. Both fairness conditions are "
+        f"RELATIVE, so a zero or negative side makes them meaningless — the "
+        f"previous `return False` silently waved such trades through as fair. "
+        f"Point value_column at a real market price (e.g. 'market_value')."
+    )
     if (recv_value - send_value) / recv_value > max_value_loss_frac:
         return True
     ms = max_send_value if max_send_value is not None else send_value
@@ -91,6 +106,16 @@ def _opp_would_reject(
     if mr > 0 and ms < mr * (1 - max_value_loss_frac):
         return True
     return False
+
+
+def _i_overpay_by(send_value: float, recv_value: float) -> float:
+    """Fraction of value at stake that I hand over above a fair exchange.
+
+    The two spec conditions bound only the OPPONENT's loss, so a trade that
+    massively overpays passes both — §7 asks for value balance ≈ 0, and this
+    is the other half of ≈. Positive means I am giving up more than I get.
+    """
+    return (send_value - recv_value) / recv_value if recv_value > 0 else 0.0
 
 
 # ============================================================================
@@ -109,7 +134,7 @@ def evaluate_trade(
     category_sigmas: dict[str, float],
     current_ew: float,
     current_total_bv: float,
-    value_column: str = "FV",
+    value_column: str = "market_value",
     max_value_loss_frac: float = DEFAULT_MAX_VALUE_LOSS_FRAC,
     my_lineup: dict[str, str] | None = None,
     send_to_opp_names: set[str] | None = None,
@@ -285,10 +310,13 @@ def evaluate_trade(
     #
     # opp gives up: recv_value (I receive from them)
     # opp receives: send_value (I send to them)
-    if recv_value > 0:
-        opp_value_loss_frac = (recv_value - send_value) / recv_value
-    else:
-        opp_value_loss_frac = 0.0
+    assert recv_value > 0 and send_value > 0, (
+        f"evaluate_trade: '{value_column}' must be a positive market price for "
+        f"every traded player. Got send={send_value}, recv={recv_value} for "
+        f"send={sorted(send_to_opp)}, recv={sorted(recv_from_opp)}. A relative "
+        f"fairness check on a zero or negative side is meaningless."
+    )
+    opp_value_loss_frac = (recv_value - send_value) / recv_value
     opp_value_loss_pct = round(opp_value_loss_frac * 100, 1)
     agg_ok = opp_value_loss_frac <= max_value_loss_frac
 
@@ -319,6 +347,29 @@ def evaluate_trade(
         f"evaluate_trade: my new roster size {len(my_new_roster)} != "
         f"original {len(my_roster_names)}"
     )
+
+    # Roster composition, per §8 SCREEN and §9c. FA swaps already enforce this;
+    # trades did not, so the highest-value proposals were free to take a roster
+    # already short of pitchers and remove another one. Monotone, not absolute,
+    # for the same reason screening is: an already-illegal roster must still be
+    # allowed to make neutral and repairing moves.
+    if composition_violation(my_new_roster, players) > composition_violation(
+        my_roster_names, players
+    ):
+        return {
+            "msv": 0.0,
+            "new_ew": current_ew,
+            "delta_bv": 0.0,
+            "value": 0.0,
+            "value_balance": value_balance,
+            "opp_value_loss_pct": opp_value_loss_pct,
+            "trade_feasible": False,
+            "infeasible_reason": "worsens roster hitter/pitcher composition",
+            "new_totals": {},
+            "new_lineup": {},
+            "auto_fa_add": auto_fa_add,
+            "auto_drop": auto_drop,
+        }
 
     # 3. My new lineup (MEW objective) — hold the untouched player-type half
     # fixed for single-type trades so unaffected categories don't drift from
@@ -776,7 +827,7 @@ def search_trades(
     category_sigmas: dict[str, float],
     current_ew: float,
     current_total_bv: float,
-    value_column: str = "FV",
+    value_column: str = "market_value",
     max_value_loss_frac: float = DEFAULT_MAX_VALUE_LOSS_FRAC,
     max_trade_size: int = DEFAULT_TRADE_MAX_SIZE,
     must_send: set[str] | None = None,
@@ -860,6 +911,26 @@ def search_trades(
 
     mew_lookup = players.set_index("Name")["MEW"].to_dict()
     value_lookup = players.set_index("Name")[value_column].to_dict()
+
+    # A player the market has not priced cannot be checked for fairness: every
+    # comparison against NaN is False, so an unpriced player silently satisfies
+    # BOTH conditions and can be used to pad any package. Drop them from the
+    # tradeable universe and say so, rather than letting them through.
+    unpriced = {
+        n
+        for n in my_roster_names | {p for r in opponent_rosters.values() for p in r}
+        if not (pd.notna(value_lookup.get(n)) and float(value_lookup.get(n, 0.0)) > 0)
+    }
+    if unpriced:
+        print(
+            f"search_trades: {len(unpriced)} player(s) have no positive "
+            f"'{value_column}' and are excluded from trades (cannot price "
+            f"fairness). Examples: {sorted(unpriced)[:5]}"
+        )
+    my_roster_names = my_roster_names - unpriced
+    opponent_rosters = {
+        oid: roster - unpriced for oid, roster in opponent_rosters.items()
+    }
 
     my_starters = set(my_lineup.keys())
     fa_names = set(players[players["owner"].isna()]["Name"])
@@ -984,6 +1055,22 @@ def search_trades(
         )
 
     results.sort(key=lambda r: r["value"], reverse=True)
+
+    # Prune trades where I overpay past the same tolerance the opponent gets.
+    # Without this the top of the list fills with giveaways: the fairness
+    # conditions only ever asked whether the OPPONENT was losing value.
+    overpaying = [
+        r
+        for r in results
+        if r.get("opp_value_loss_pct") is not None
+        and r["opp_value_loss_pct"] < -100 * max_value_loss_frac
+    ]
+    if overpaying:
+        results = [r for r in results if r not in overpaying]
+        print(
+            f"search_trades: dropped {len(overpaying)} trade(s) where I overpay "
+            f"by more than {100 * max_value_loss_frac:.0f}% of the value at stake"
+        )
 
     print(f"search_trades: {len(results)} trades above min_value {min_value}")
     return results

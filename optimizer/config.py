@@ -58,8 +58,21 @@ ALL_TEAM_NAMES: list[str] = sorted(LEAGUE["fantrax_team_ids"].keys())
 MIN_STAT_STANDARD_DEVIATION: float = LEAGUE["min_stat_standard_deviation"]  # 0.001
 
 # Trade fairness: max fraction of trade value an opponent will accept losing.
+# Read by the JSON key that actually exists. A `.get(..., default)` here is a
+# silent fallback in disguise: the key was previously misspelled relative to
+# config.json, so the configured value was ignored and the engine ran on a
+# hardcoded 0.15 with nothing to indicate it.
 _TRADE_CONFIG: dict = _CONFIG.get("trade_engine", {})
-MAX_VALUE_LOSS_FRAC: float = _TRADE_CONFIG.get("max_value_loss_frac", 0.15)
+assert "fairness_threshold_percent" in _TRADE_CONFIG, (
+    "config.json is missing trade_engine.fairness_threshold_percent — the max "
+    "fraction of trade value an opponent will accept losing (e.g. 0.10). "
+    f"Found keys: {sorted(_TRADE_CONFIG)}"
+)
+MAX_VALUE_LOSS_FRAC: float = float(_TRADE_CONFIG["fairness_threshold_percent"])
+assert 0.0 <= MAX_VALUE_LOSS_FRAC < 1.0, (
+    f"trade_engine.fairness_threshold_percent must be a FRACTION in [0, 1), got "
+    f"{MAX_VALUE_LOSS_FRAC}. A value of 10 would mean a 1000% tolerance."
+)
 
 # Regular-season window (used to compute the fraction of season remaining,
 # which rescales projection uncertainty σ to the remaining horizon).

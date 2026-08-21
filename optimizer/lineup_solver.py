@@ -39,6 +39,7 @@ def solve_lineup(
     objective_column: str = "FV",
     force_start: set[str] | None = None,
     slots: dict[str, int] | None = None,
+    count_injured_with_projection: bool = False,
 ) -> dict[str, str]:
     """Solve lineup assignment via MILP, maximizing Σ objective_column for starters.
 
@@ -65,6 +66,14 @@ def solve_lineup(
             halves are independent (disjoint players and slots), so solving one
             half is exact — used to hold the untouched half of a roster fixed
             during single-type swap evaluation.
+        count_injured_with_projection: Let an IL player start if their
+            rest-of-season projection is non-empty. Use this when the solve
+            exists to PROJECT a team's season totals (opponent lineups): the
+            RoS feed has already discounted the games they will miss, so
+            zeroing them again charges the same absence twice and understates
+            that team. Leave False when the solve answers "who do I field
+            today" — an IL player cannot be in tonight's lineup whatever their
+            projection says.
 
     Returns:
         Dict mapping starter name → assigned slot. Bench players omitted.
@@ -99,6 +108,9 @@ def solve_lineup(
         i: get_startable_slots(
             roster_df.iloc[i]["Position"],
             roster_df.iloc[i]["injury_status"] if has_injury_col else None,
+            (float(roster_df.iloc[i]["PA"]) + float(roster_df.iloc[i]["IP"]))
+            if count_injured_with_projection
+            else None,
         )
         & set(active_slots)
         for i in range(n_players)
@@ -111,33 +123,31 @@ def solve_lineup(
         for s in eligibility[i]:
             a[i, s] = LpVariable(f"a_{i}_{s}", cat="Binary")
 
+    # Filling a slot always beats leaving it empty, so every assignment carries
+    # a bonus strictly larger than any objective spread the roster can produce.
+    # This lets the fill constraints be `<=` instead of `==`: the MILP maximizes
+    # filled slots on its own, and never becomes infeasible.
+    obj_span = float(roster_df[objective_column].abs().sum()) + 1.0
+
     prob += lpSum(
-        roster_df.iloc[i][objective_column]
+        (roster_df.iloc[i][objective_column] + obj_span)
         * lpSum(a[i, s] for s in eligibility[i] if (i, s) in a)
         for i in range(n_players)
     )
 
-    unfillable: list[str] = []
+    # A per-slot count of eligible players is NOT a feasibility test: one player
+    # can be the only cover for two different slots, so independently-satisfiable
+    # counts can be jointly unsatisfiable (Hall's condition). Pre-computing an
+    # exact fill target from those counts and forcing it with `==` therefore made
+    # legitimate rosters Infeasible and crashed the caller. Bound the slots
+    # instead and read the true fill off the solution.
     for slot, count in active_slots.items():
         eligible_for_slot = [i for i in range(n_players) if slot in eligibility[i]]
-        slots_to_fill = min(len(eligible_for_slot), count)
-        if slots_to_fill < count:
-            unfillable.append(f"{slot} ({slots_to_fill}/{count})")
-        if slots_to_fill > 0:
+        if eligible_for_slot:
             prob += (
-                lpSum(a[i, slot] for i in eligible_for_slot if (i, slot) in a)
-                == slots_to_fill,
+                lpSum(a[i, slot] for i in eligible_for_slot if (i, slot) in a) <= count,
                 f"fill_{slot}",
             )
-
-    if unfillable:
-        # Leniency keeps opponent solves robust (e.g. all their catchers on
-        # IL), but an under-filled lineup forfeits starter stats — screening
-        # and validate_transaction should have prevented this for MY moves.
-        print(
-            f"WARNING: solve_lineup leaving slots under-filled: "
-            f"{', '.join(unfillable)}. Roster lacks startable coverage."
-        )
 
     for i in range(n_players):
         slots_for_player = [s for s in eligibility[i] if (i, s) in a]
@@ -164,11 +174,27 @@ def solve_lineup(
     )
 
     slot_assignments: dict[str, str] = {}
+    filled: dict[str, int] = {slot: 0 for slot in active_slots}
     for i in range(n_players):
         for s in eligibility[i]:
             if (i, s) in a and pulp.value(a[i, s]) > 0.5:
                 slot_assignments[roster_df.iloc[i]["Name"]] = s
+                filled[s] += 1
                 break
+
+    unfilled = [
+        f"{slot} ({filled[slot]}/{count})"
+        for slot, count in active_slots.items()
+        if filled[slot] < count
+    ]
+    if unfilled:
+        # Leniency keeps opponent solves robust (e.g. all their catchers on IL).
+        # An under-filled lineup forfeits starter stats, so screening and
+        # validate_transaction should have prevented this for MY moves.
+        print(
+            f"WARNING: solve_lineup leaving slots under-filled: "
+            f"{', '.join(unfilled)}. Roster lacks startable coverage."
+        )
 
     return slot_assignments
 

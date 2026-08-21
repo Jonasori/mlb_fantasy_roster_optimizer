@@ -53,6 +53,47 @@ POSITION_ABSENCE_RATES: dict[str, float] = {
 _ALL_SLOTS: dict[str, int] = {**HITTING_SLOTS, **PITCHING_SLOTS}
 
 # ============================================================================
+# Roster composition
+# ============================================================================
+
+
+def _bounds_violation(h: int, p: int) -> int:
+    """Slots an h/p split is outside the league's hitter and pitcher bounds by."""
+    return (
+        max(0, MIN_HITTERS - h)
+        + max(0, h - MAX_HITTERS)
+        + max(0, MIN_PITCHERS - p)
+        + max(0, p - MAX_PITCHERS)
+    )
+
+
+def composition_violation(roster_names: set[str], players: pd.DataFrame) -> int:
+    """How many roster slots this active roster is outside league h/p bounds by.
+
+    Zero means legal. Callers compare BEFORE and AFTER a move rather than
+    testing the after-state against the bounds absolutely: a roster that is
+    already out of bounds (injuries, a mid-season churn) would otherwise have
+    every move rejected, including the ones that fix it.
+
+    IR players sit outside the active roster and do not count.
+
+    Args:
+        roster_names: Player names on the roster (with -H/-P suffix).
+        players: Players DataFrame with player_type and roster_status.
+
+    Returns:
+        Total slots out of bounds, summed over the hitter and pitcher bounds.
+    """
+    df = players[players["Name"].isin(roster_names)]
+    if "roster_status" in df.columns:
+        df = df[df["roster_status"] != "IR"]
+    return _bounds_violation(
+        int((df["player_type"] == "hitter").sum()),
+        int((df["player_type"] == "pitcher").sum()),
+    )
+
+
+# ============================================================================
 # Sandbox: validate_transaction — Positional feasibility check
 # ============================================================================
 
@@ -154,15 +195,26 @@ def validate_transaction(
         active_df = new_roster_df
     n_active_hitters = int((active_df["player_type"] == "hitter").sum())
     n_active_pitchers = int((active_df["player_type"] == "pitcher").sum())
-    if not (MIN_HITTERS <= n_active_hitters <= MAX_HITTERS):
+    # Judge the move, not the roster. Testing the after-state against the bounds
+    # absolutely rejects EVERY transaction once the roster is already out of
+    # compliance — including the ones that repair it — so the composition
+    # problem gets reported as if each individual swap had caused it. Blocking
+    # is therefore reserved for moves that make compliance worse; a move that
+    # merely inherits an existing violation is a warning.
+    before_violation = composition_violation(my_roster_names, players)
+    after_violation = _bounds_violation(n_active_hitters, n_active_pitchers)
+    if after_violation > before_violation:
         errors.append(
-            f"New roster has {n_active_hitters} active hitters; league requires "
-            f"{MIN_HITTERS}-{MAX_HITTERS}."
+            f"New roster would be {n_active_hitters}H/{n_active_pitchers}P; league "
+            f"requires {MIN_HITTERS}-{MAX_HITTERS} hitters and "
+            f"{MIN_PITCHERS}-{MAX_PITCHERS} pitchers. This move moves you further "
+            f"out of compliance."
         )
-    if not (MIN_PITCHERS <= n_active_pitchers <= MAX_PITCHERS):
-        errors.append(
-            f"New roster has {n_active_pitchers} active pitchers; league requires "
-            f"{MIN_PITCHERS}-{MAX_PITCHERS}."
+    elif after_violation > 0:
+        warnings.append(
+            f"Roster is {n_active_hitters}H/{n_active_pitchers}P, outside the "
+            f"league's {MIN_HITTERS}-{MAX_HITTERS}H / {MIN_PITCHERS}-{MAX_PITCHERS}P "
+            f"bounds — it already was before this move, which does not worsen it."
         )
 
     # Per-slot feasibility — injury-aware: IL players cannot fill a starting
@@ -626,10 +678,11 @@ def screen_swaps(
         if "roster_status" in players.columns
         else {}
     )
-
     def _startable(name: str) -> set[str]:
         """Injury-aware startable slots for any player by name."""
-        return get_startable_slots(str(pos_lookup.get(name, "")), inj_lookup.get(name))
+        return get_startable_slots(
+            str(pos_lookup.get(name, "")), inj_lookup.get(name)
+        )
 
     # Active-roster composition (IR players sit outside the bounds).
     n_act_h = sum(
@@ -643,8 +696,32 @@ def screen_swaps(
         if status_lookup.get(n) != "IR" and type_lookup.get(n) == "pitcher"
     )
 
+    def _violation(h: int, p: int) -> int:
+        """How many roster slots the h/p split is outside league bounds by."""
+        return (
+            max(0, MIN_HITTERS - h)
+            + max(0, h - MAX_HITTERS)
+            + max(0, MIN_PITCHERS - p)
+            + max(0, p - MAX_PITCHERS)
+        )
+
+    _base_violation = _violation(n_act_h, n_act_p)
+    if _base_violation:
+        print(
+            f"  NOTE: active roster is {n_act_h}H/{n_act_p}P, outside the league's "
+            f"{MIN_HITTERS}-{MAX_HITTERS}H / {MIN_PITCHERS}-{MAX_PITCHERS}P bounds. "
+            f"Screening will accept any swap that does not make it worse."
+        )
+
     def _composition_ok(fa_name: str, drop_name: str) -> bool:
-        """Would the swap keep the active roster inside league h/p bounds?"""
+        """Would the swap leave the active roster no further outside league bounds?
+
+        An absolute bound is wrong whenever the CURRENT roster already violates
+        it: every same-type swap would be rejected, collapsing the candidate
+        pool to whichever single move happens to repair the shortfall, and
+        hiding real upgrades that leave the violation untouched. §9c only asks
+        that a move not make composition infeasible, so the guard is monotone.
+        """
         h, p = n_act_h, n_act_p
         if status_lookup.get(drop_name) != "IR":
             if type_lookup.get(drop_name) == "hitter":
@@ -655,7 +732,7 @@ def screen_swaps(
             h += 1
         else:
             p += 1
-        return MIN_HITTERS <= h <= MAX_HITTERS and MIN_PITCHERS <= p <= MAX_PITCHERS
+        return _violation(h, p) <= _base_violation
 
     # 3. Screen: walk free agents from highest MEW down, pairing each with the
     # weakest roster player it is legal to drop, until top_k pairs are found.

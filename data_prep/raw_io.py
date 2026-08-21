@@ -80,8 +80,18 @@ def write_raw(df: pd.DataFrame, source: str, date: datetime.date | None = None) 
     return path
 
 
-def available_dates(source: str) -> list[datetime.date]:
-    """All snapshot dates for a source, oldest first. Empty if none exist."""
+def available_dates(
+    source: str, on_or_before: datetime.date | None = None
+) -> list[datetime.date]:
+    """All snapshot dates for a source, oldest first. Empty if none exist.
+
+    Args:
+        source: Source directory (see `raw_path`).
+        on_or_before: Ignore snapshots newer than this date, so a caller asking
+            "does this source have anything usable?" gets the same answer
+            `read_latest_raw` will act on. Without it a caller reproducing a
+            past day sees a source as present, then hard-fails reading it.
+    """
     directory = RAW_DIR / source
     if not directory.is_dir():
         return []
@@ -89,7 +99,9 @@ def available_dates(source: str) -> list[datetime.date]:
     for entry in directory.iterdir():
         match = _DATE_RE.match(entry.name)
         if match:
-            dates.append(datetime.date.fromisoformat(match.group(1)))
+            date = datetime.date.fromisoformat(match.group(1))
+            if on_or_before is None or date <= on_or_before:
+                dates.append(date)
     return sorted(dates)
 
 

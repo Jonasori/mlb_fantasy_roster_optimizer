@@ -52,6 +52,7 @@ FANTRAX_API_URL = "https://www.fantrax.com/fxpa/req"
 FANTRAX_NAME_CORRECTIONS = {
     "Logan OHoppe": "Logan O'Hoppe",  # Missing apostrophe
     "Leodalis De Vries": "Leo De Vries",  # Completely different first name
+    "Jake Latz": "Jacob Latz",  # Nickname; FanGraphs uses the legal first name
 }
 
 # Fantrax's own roster-slot enum, from the API's `statusTotals` block.
@@ -292,6 +293,14 @@ def _parse_roster_rows(data: dict, owner: str) -> list[dict]:
             pos = scorer.get("posShortNames", "")
             status_id = str(row.get("statusId", ""))
             injury_status, injury_detail = _parse_injury(scorer)
+            # An owner only spends an IR slot on someone who cannot play, but
+            # Fantrax does not always serve the injury icon alongside it. The
+            # slot itself is the authoritative signal: without this, the lineup
+            # solver reads injury_status=None as healthy and happily starts a
+            # pitcher who is on the shelf.
+            if injury_status is None and ROSTER_STATUS_BY_ID.get(status_id) == "IR":
+                injury_status = "IL"
+                injury_detail = injury_detail or "On IR slot (no Fantrax injury icon)"
             cells = row.get("cells", [])
 
             rows.append(
@@ -723,11 +732,60 @@ def _parse_standings_data(data: dict) -> list[dict]:
                     entry[col] = value
             rows_out.append(entry)
 
-    rows_out.sort(key=lambda x: x.get("team_name", ""))
-    for i, row in enumerate(rows_out):
-        row["overall_rank"] = i + 1
-
+    _assign_roto_points(rows_out)
     return rows_out
+
+
+# Roto scoring: rank each team 1..N in every category, award N points for
+# first down to 1 for last, and sum. Lower is better for ERA and WHIP.
+_ROTO_NEGATIVE_COLS: tuple[str, ...] = ("era", "whip")
+
+
+def _assign_roto_points(rows_out: list[dict]) -> None:
+    """Fill in `total_points` and `overall_rank` from the category totals.
+
+    Fantrax's response carries the category values but not the roto points, so
+    both fields used to be stamped as constants and `overall_rank` was then
+    overwritten with ALPHABETICAL row order — which printed and stored as if it
+    were the real standing. Roto points are fully determined by the category
+    columns already parsed here, so compute them rather than invent them.
+
+    Mutates rows_out in place. If the category columns are absent (the
+    Stat-Totals table was missing), both fields are left as None so downstream
+    code sees "unknown" instead of a fabricated rank.
+    """
+    cats = [c for c in _STANDINGS_SHORTNAME_TO_COL.values() if c not in ("ab", "ip")]
+    usable = [c for c in cats if all(r.get(c) is not None for r in rows_out)]
+    if not usable or len(rows_out) < 2:
+        for row in rows_out:
+            row["total_points"] = None
+            row["overall_rank"] = None
+        return
+
+    n = len(rows_out)
+    points = {id(r): 0.0 for r in rows_out}
+    for cat in usable:
+        # Sort worst-first so the best team is awarded n points.
+        order = sorted(
+            rows_out, key=lambda r: r[cat], reverse=(cat in _ROTO_NEGATIVE_COLS)
+        )
+        i = 0
+        while i < n:
+            j = i
+            while j + 1 < n and order[j + 1][cat] == order[i][cat]:
+                j += 1
+            # Ties split the points they jointly occupy, as roto scoring does.
+            shared = sum(range(i + 1, j + 2)) / (j - i + 1)
+            for k in range(i, j + 1):
+                points[id(order[k])] += shared
+            i = j + 1
+
+    for row in rows_out:
+        row["total_points"] = round(points[id(row)], 1)
+    for rank, row in enumerate(
+        sorted(rows_out, key=lambda r: -r["total_points"]), start=1
+    ):
+        row["overall_rank"] = rank
 
 
 def fetch_standings(session: requests.Session) -> pd.DataFrame:
@@ -780,8 +838,16 @@ def fetch_standings(session: requests.Session) -> pd.DataFrame:
         )
 
     print(f"Standings ({len(df)} teams):")
-    for _, row in df.sort_values("overall_rank").iterrows():
-        print(f"  {int(row['overall_rank'])}. {row['team_name']}")
+    if df["overall_rank"].notna().all():
+        for _, row in df.sort_values("overall_rank").iterrows():
+            print(
+                f"  {int(row['overall_rank'])}. {row['team_name']} "
+                f"— {row['total_points']:.1f} pts"
+            )
+    else:
+        print("  (roto points unavailable — category columns missing)")
+        for name in sorted(df["team_name"]):
+            print(f"  - {name}")
 
     return df
 

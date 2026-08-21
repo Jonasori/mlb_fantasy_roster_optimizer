@@ -23,6 +23,75 @@ from .win_model import (
 
 _MAX_LINEUP_ITERATIONS: int = 5
 
+# A team whose participation is at least this fraction of the league median is
+# treated as fully active. Live managers cluster within a few percent of each
+# other; the threshold only has to separate them from an abandoned roster.
+_FULL_PARTICIPATION: float = 0.85
+
+
+def _participation_scale(
+    banked: dict[str, float] | None,
+    ros: dict[str, float],
+    fraction_remaining: float,
+    volume_key: str,
+) -> float:
+    """How much of a normal remaining schedule this team is on pace to actually play.
+
+    A rest-of-season projection assumes an owner fields a full optimal lineup
+    every day. An abandoned team will not, and its banked volume says so: play
+    accrued over the elapsed (1 − f) of the season implies remaining volume of
+    banked · f/(1 − f). Dividing by the projected remaining volume gives the
+    team's participation rate.
+
+    Returns the raw (un-normalized) rate; the caller divides by the league
+    median so that a systematic offset shared by every team — the AB→PA
+    constant, ordinary lineup slippage — cancels instead of shrinking everyone.
+
+    Args:
+        banked: Banked YTD totals, or None if unavailable for this team.
+        ros: Rest-of-season totals for the team's solved lineup.
+        fraction_remaining: f, the fraction of the season still to be played.
+        volume_key: 'PA' (hitting) or 'IP' (pitching).
+
+    Returns:
+        Participation rate > 0. Returns 1.0 when it cannot be measured
+        (no banked data, or zero projected remaining volume).
+    """
+    if banked is None or fraction_remaining >= 1.0:
+        return 1.0
+    projected = float(ros[volume_key])
+    if projected <= 0.0:
+        return 1.0
+    implied = float(banked[volume_key]) * fraction_remaining / (1.0 - fraction_remaining)
+    return implied / projected
+
+
+def _scale_ros_volume(ros: dict[str, float], scale_pa: float, scale_ip: float) -> dict:
+    """Shrink a rest-of-season totals dict to a team's real participation rate.
+
+    Counting stats and the PA/IP volume weights scale; rate stats (OPS, ERA,
+    WHIP) do not — a team that plays two thirds as often still hits and pitches
+    at the same rate while it plays.
+
+    Args:
+        ros: Rest-of-season totals from compute_totals_for_starters.
+        scale_pa: Hitting participation scale in (0, 1].
+        scale_ip: Pitching participation scale in (0, 1].
+
+    Returns:
+        A new totals dict; ros is not mutated.
+    """
+    assert 0.0 < scale_pa <= 1.0 and 0.0 < scale_ip <= 1.0, (
+        f"_scale_ros_volume: scales must be in (0, 1]; got "
+        f"scale_pa={scale_pa}, scale_ip={scale_ip}."
+    )
+    out = dict(ros)
+    for cat in ("R", "HR", "RBI", "SB", "PA"):
+        out[cat] = ros[cat] * scale_pa
+    for cat in ("W", "SV", "K", "IP"):
+        out[cat] = ros[cat] * scale_ip
+    return out
+
 
 def _complete_banked_volume(
     banked: dict[str, float] | None,
@@ -184,7 +253,11 @@ def compute_league_state(
         opp_id = i + 1
         opp_roster = get_main_roster(work, team)
         opponent_rosters[opp_id] = opp_roster
-        opp_lineup = solve_lineup(opp_roster, work, "FV")
+        # Opponent solves exist only to project their season totals, so an IL
+        # player with a live RoS projection still counts (see solve_lineup).
+        opp_lineup = solve_lineup(
+            opp_roster, work, "FV", count_injured_with_projection=True
+        )
         opponent_lineups[opp_id] = opp_lineup
         opp_ros = compute_totals_for_starters(set(opp_lineup.keys()), work)
         opp_banked_raw = banked_totals.get(team) if banked_totals is not None else None
@@ -215,6 +288,51 @@ def compute_league_state(
         f"compute_league_state: my lineup has {len(my_starters)} starters, "
         f"expected {N_STARTER_SLOTS}"
     )
+
+    # --- 3b. Rescale opponent rest-of-season volume to observed participation ---
+    # A rest-of-season projection credits every team with a full optimal lineup
+    # for the rest of the year. An abandoned roster will not play that schedule,
+    # and crediting it with one leaves a phantom contender whose near-miss
+    # z-scores dominate the gradient (φ(z) is maximal near z = 0, so the ONE
+    # category a dead team is still close in can supply most of g_c).
+    # Normalizing by the league median keeps live teams untouched.
+    if banked_totals is not None:
+        rates_pa = [
+            _participation_scale(my_banked, my_ros, season_fraction_remaining, "PA")
+        ] + [
+            _participation_scale(
+                opponent_banked[o], opponent_ros_totals[o], season_fraction_remaining, "PA"
+            )
+            for o in opponent_totals
+        ]
+        rates_ip = [
+            _participation_scale(my_banked, my_ros, season_fraction_remaining, "IP")
+        ] + [
+            _participation_scale(
+                opponent_banked[o], opponent_ros_totals[o], season_fraction_remaining, "IP"
+            )
+            for o in opponent_totals
+        ]
+        median_pa = float(pd.Series(rates_pa).median())
+        median_ip = float(pd.Series(rates_ip).median())
+        assert median_pa > 0.0 and median_ip > 0.0, (
+            f"compute_league_state: median participation must be positive; got "
+            f"PA={median_pa}, IP={median_ip}. Check the standings AB/IP columns."
+        )
+        for idx, o in enumerate(opponent_totals):
+            scale_pa = min(1.0, rates_pa[idx + 1] / median_pa)
+            scale_ip = min(1.0, rates_ip[idx + 1] / median_ip)
+            if scale_pa >= _FULL_PARTICIPATION and scale_ip >= _FULL_PARTICIPATION:
+                continue
+            print(
+                f"  {opponent_teams[o - 1]}: reduced participation "
+                f"(hitting {scale_pa:.0%}, pitching {scale_ip:.0%} of league pace) — "
+                f"scaling their rest-of-season projection to match."
+            )
+            opponent_ros_totals[o] = _scale_ros_volume(
+                opponent_ros_totals[o], scale_pa, scale_ip
+            )
+            opponent_totals[o] = maybe_blend(opponent_banked[o], opponent_ros_totals[o])
 
     # --- 4. MEW-lineup iteration with best-EW selection ---
     # Each candidate lineup gets its full state evaluated (totals, σ, gradient,

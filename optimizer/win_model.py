@@ -101,6 +101,66 @@ def compute_win_probability(
     return ew, diagnostics
 
 
+# A pairing this far from even is settled: no single roster move moves a
+# category by anything close to 1.5σ of the two-team gap.
+_DECIDED_Z: float = 1.5
+
+
+def category_race_board(
+    my_totals: dict[str, float],
+    opponent_totals: dict[int, dict[str, float]],
+    category_sigmas: dict[str, float],
+) -> "pd.DataFrame":
+    """Per-category roto standing: where points are, and where they can still move.
+
+    EW answers "how many category-wins do I expect" but not the question a roto
+    manager actually acts on: *which* categories are worth spending a roster
+    move on. A category can carry a large gradient and still be worthless if
+    every pairing in it is settled — the gradient is a per-unit derivative, so
+    its magnitude is not comparable across categories with different units.
+    Points-still-winnable is comparable, because it is denominated in the thing
+    being maximized.
+
+    Args:
+        my_totals: My projected season totals per category.
+        opponent_totals: {opp_id: {cat: total}} for each opponent.
+        category_sigmas: σ_c per category.
+
+    Returns:
+        One row per category, most-winnable first:
+            cat, my_total, rank (1-7), pts_now (deterministic roto points),
+            pts_expected (model expectation), live_races (contested pairings),
+            pts_winnable (upside still available), pts_at_risk (currently
+            favoured but contested).
+    """
+    import pandas as pd
+
+    rows = []
+    for cat in ALL_CATEGORIES:
+        denom = max(category_sigmas[cat], MIN_STAT_STANDARD_DEVIATION) * np.sqrt(2)
+        zs, wins = [], 0
+        for opp in opponent_totals.values():
+            mine, theirs = my_totals[cat], opp[cat]
+            gap = (theirs - mine) if cat in NEGATIVE_CATEGORIES else (mine - theirs)
+            zs.append(gap / denom)
+            wins += int(gap > 0)
+        probs = [float(stats.norm.cdf(z)) for z in zs]
+        live = [p for z, p in zip(zs, probs, strict=True) if abs(z) < _DECIDED_Z]
+        rows.append(
+            {
+                "cat": cat,
+                "my_total": my_totals[cat],
+                "rank": len(opponent_totals) + 1 - wins,
+                "pts_now": 1 + wins,
+                "pts_expected": 1 + sum(probs),
+                "live_races": len(live),
+                "pts_winnable": len(live) - sum(live),
+                "pts_at_risk": sum(live),
+            }
+        )
+    return pd.DataFrame(rows).sort_values("pts_winnable", ascending=False)
+
+
 # ============================================================================
 # EW GRADIENT
 # ============================================================================
