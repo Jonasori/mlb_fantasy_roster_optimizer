@@ -10,6 +10,7 @@ leaderboard, so any split date costs two requests.
 
 import datetime
 
+import numpy as np
 import pandas as pd
 
 from data_prep.skills import HITTING_SKILLS, PITCHING_SKILLS, add_skill_rates
@@ -192,3 +193,153 @@ def assemble_backtest_frame(
         f"(projection {len(proj)}, evidence {len(evid)}, outcome {len(out)})"
     )
     return frame
+
+
+def _mew_contribution(
+    frame: pd.DataFrame, prefix: str, my_totals: dict, gradient: dict, group: str
+) -> pd.Series:
+    """MEW for each player from one column family (proj_, pred_, or actual_).
+
+    Mirrors optimizer.player_scoring.add_mew exactly: counting stats enter
+    linearly, ratio stats enter volume-weighted against the team's own rate.
+    """
+    if group == "hitting":
+        volume = frame[f"{prefix}PA"].astype(float)
+        mew = (
+            gradient["R"] * frame[f"{prefix}R"]
+            + gradient["HR"] * frame[f"{prefix}HR"]
+            + gradient["RBI"] * frame[f"{prefix}RBI"]
+            + gradient["SB"] * frame[f"{prefix}SB"]
+        )
+        mew = mew + gradient["OPS"] * volume * (
+            frame[f"{prefix}OPS"] - my_totals["OPS"]
+        ) / my_totals["PA"]
+        return mew.astype(float)
+
+    volume = frame[f"{prefix}IP"].astype(float)
+    mew = (
+        gradient["W"] * frame[f"{prefix}W"]
+        + gradient["SV"] * frame[f"{prefix}SV"]
+        + gradient["K"] * frame[f"{prefix}K"]
+    )
+    for cat in ("ERA", "WHIP"):
+        mew = mew + gradient[cat] * volume * (
+            frame[f"{prefix}{cat}"] - my_totals[cat]
+        ) / my_totals["IP"]
+    return mew.astype(float)
+
+
+def score_in_mew(
+    frame: pd.DataFrame, my_totals: dict, gradient: dict, group: str = "hitting"
+) -> pd.DataFrame:
+    """Score a prediction in MEW units — the only metric that decides anything.
+
+    Requires columns: pred_<stat> and actual_<stat> for every scoring category
+    of `group`.
+    Adds columns: mew_pred, mew_actual, mew_error.
+
+    Stat-unit error is reported alongside by the caller, but the spec's §3.1
+    decision rule is this column: a method that cuts OPS RMSE by 20% while
+    moving no decision has earned nothing.
+    """
+    frame = frame.copy()
+    stats = HITTING_STATS if group == "hitting" else PITCHING_STATS
+    for stat in stats:
+        for prefix in ("pred_", "actual_"):
+            col = f"{prefix}{stat}"
+            assert col in frame.columns, (
+                f"score_in_mew: missing column {col}. Every candidate must "
+                f"produce pred_<stat> for all of {stats}."
+            )
+
+    frame["mew_pred"] = _mew_contribution(frame, "pred_", my_totals, gradient, group)
+    frame["mew_actual"] = _mew_contribution(frame, "actual_", my_totals, gradient, group)
+    frame["mew_error"] = frame["mew_pred"] - frame["mew_actual"]
+    return frame
+
+
+def _baseline_atc(frame: pd.DataFrame, group: str) -> pd.DataFrame:
+    """Unadjusted projection. The thing every candidate must beat."""
+    frame = frame.copy()
+    stats = HITTING_STATS if group == "hitting" else PITCHING_STATS
+    for stat in stats:
+        frame[f"pred_{stat}"] = frame[f"proj_{stat}"]
+    return frame
+
+
+def _baseline_raw_ytd(frame: pd.DataFrame, group: str) -> pd.DataFrame:
+    """Season-to-date rates, unshrunk, projected onto the projection's volume.
+
+    Brown (2008) found this is worse than the league grand mean for batting
+    average. It is here to confirm that finding rather than to compete.
+    """
+    frame = frame.copy()
+    stats = HITTING_STATS if group == "hitting" else PITCHING_STATS
+    vol_col = "PA" if group == "hitting" else "IP"
+    frame[f"pred_{vol_col}"] = frame[f"proj_{vol_col}"]
+
+    if group == "hitting":
+        per_pa = frame["proj_PA"] / frame["n_evid"].where(frame["n_evid"] > 0)
+        for stat in ("R", "HR", "RBI", "SB"):
+            observed = frame.get(f"evid_{stat}")
+            frame[f"pred_{stat}"] = (
+                observed * per_pa if observed is not None else frame[f"proj_{stat}"]
+            )
+        frame["pred_OPS"] = frame.get("evid_OPS", frame["proj_OPS"])
+        return frame
+
+    for stat in stats:
+        if stat != vol_col:
+            frame[f"pred_{stat}"] = frame[f"proj_{stat}"]
+    return frame
+
+
+def _baseline_flat_volume(frame: pd.DataFrame, group: str) -> pd.DataFrame:
+    """Projection rates, but every player gets the pool's median volume.
+
+    Zimmerman measured ATC's preseason PA RMSE at 156 against 162 for a flat
+    510 PA. If a volume model cannot beat this, it is not a model.
+    """
+    frame = _baseline_atc(frame, group)
+    vol_col = "PA" if group == "hitting" else "IP"
+    median_volume = float(frame[f"proj_{vol_col}"].median())
+    scale = median_volume / frame[f"proj_{vol_col}"].where(
+        frame[f"proj_{vol_col}"] > 0
+    )
+    counting = ("R", "HR", "RBI", "SB") if group == "hitting" else ("W", "SV", "K")
+    frame[f"pred_{vol_col}"] = median_volume
+    for stat in counting:
+        frame[f"pred_{stat}"] = frame[f"proj_{stat}"] * scale
+    return frame
+
+
+BASELINES: dict = {
+    "atc": _baseline_atc,
+    "raw_ytd": _baseline_raw_ytd,
+    "flat_volume": _baseline_flat_volume,
+}
+
+
+def run_baselines(
+    frame: pd.DataFrame, my_totals: dict, gradient: dict, group: str = "hitting"
+) -> pd.DataFrame:
+    """Score every mandatory baseline on one backtest frame.
+
+    Returns:
+        One row per baseline: baseline, mae_mew, rmse_mew, and n.
+    """
+    rows = []
+    for name, build in BASELINES.items():
+        scored = score_in_mew(build(frame, group), my_totals, gradient, group)
+        error = scored["mew_error"].dropna()
+        rows.append(
+            {
+                "baseline": name,
+                "mae_mew": float(error.abs().mean()),
+                "rmse_mew": float(np.sqrt((error**2).mean())),
+                "n": int(len(error)),
+            }
+        )
+    result = pd.DataFrame(rows).sort_values("mae_mew").reset_index(drop=True)
+    print(f"baselines ({group}):\n{result.to_string(index=False)}")
+    return result
