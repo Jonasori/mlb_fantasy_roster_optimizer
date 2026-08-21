@@ -2181,6 +2181,162 @@ zero volume."
 
 ---
 
+## Task 7b: Held-out evaluation and refit on completed seasons
+
+**Files:**
+- Modify: `data_prep/volume_adjust.py`
+- Test: `tests/test_volume_adjust.py` (append)
+
+**Interfaces:**
+- Consumes: `assemble_backtest_frame`, `run_baselines` (Tasks 4–5); `harvest_capture`, `validate_ros_capture` (Task 6)
+- Produces: `split_train_test(frame, test_fraction=0.3) -> tuple[pd.DataFrame, pd.DataFrame]`
+
+**Why this task exists.** Task 7's first evaluation reported a 35% improvement over the unadjusted projection. Equalising the horizon fraction across all baselines showed **92.7% of that was artifact** — the fitted method was the only one correcting for a truncated outcome window. A 3.82% edge survived, but it was measured **in-sample**: the plan's own Step 5 called `fit_volume_correction(f)` and then `run_baselines(f)` on the same frame, with four parameters fit and scored on one population, R² = 0.040, and a `b_talent` coefficient whose sign contradicts the published result the model is built on.
+
+Two things have to change before any number here is trustworthy: the fit must be evaluated on data it did not see, and it must run on a **completed** season where `proj_horizon_frac` is 1.0.
+
+- [ ] **Step 1: Write the failing tests**
+
+Append to `tests/test_volume_adjust.py`:
+
+```python
+from data_prep.volume_adjust import split_train_test
+
+
+def _split_frame() -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "MLBAMID": list(range(100, 200)),
+            "proj_PA": [150.0] * 100,
+            "actual_PA": [140.0] * 100,
+        }
+    )
+
+
+def test_split_is_disjoint_and_complete():
+    train, test = split_train_test(_split_frame())
+    assert set(train["MLBAMID"]) & set(test["MLBAMID"]) == set(), (
+        "A player appears in both folds; the fit would be scored on data it saw."
+    )
+    assert len(train) + len(test) == 100, (
+        f"Split lost rows: {len(train)} + {len(test)} != 100"
+    )
+
+
+def test_split_is_deterministic():
+    """The same player must always land in the same fold, across runs and row orders."""
+    frame = _split_frame()
+    train_a, test_a = split_train_test(frame)
+    shuffled = frame.iloc[::-1].reset_index(drop=True)
+    train_b, test_b = split_train_test(shuffled)
+    assert set(test_a["MLBAMID"]) == set(test_b["MLBAMID"]), (
+        "Reordering the rows changed the split; it must key on MLBAMID alone."
+    )
+
+
+def test_split_respects_requested_fraction():
+    train, test = split_train_test(_split_frame(), test_fraction=0.3)
+    share = len(test) / 100
+    assert 0.2 <= share <= 0.4, (
+        f"Test fold is {share:.0%} of the frame, expected roughly 30%."
+    )
+
+
+def test_split_rejects_degenerate_fractions():
+    for bad in (0.0, 1.0, -0.1, 1.5):
+        try:
+            split_train_test(_split_frame(), test_fraction=bad)
+        except AssertionError:
+            continue
+        raise AssertionError(
+            f"test_fraction={bad} must be rejected; it yields an empty fold."
+        )
+```
+
+- [ ] **Step 2: Run tests to verify they fail**
+
+Run: `uv run pytest tests/test_volume_adjust.py -v`
+Expected: FAIL — `ImportError: cannot import name 'split_train_test'`
+
+- [ ] **Step 3: Write the implementation**
+
+Append to `data_prep/volume_adjust.py`:
+
+```python
+def split_train_test(
+    frame: pd.DataFrame, test_fraction: float = 0.3
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Split a backtest frame into disjoint train and test folds by player.
+
+    The split keys on MLBAMID rather than row position, so it is stable across
+    runs, row orderings, and refiltering — a player always lands in the same
+    fold. That matters because the fit is re-run as the archive grows, and a
+    split that moved players between folds would leak.
+
+    Requires columns: MLBAMID.
+
+    Returns:
+        (train, test).
+    """
+    assert 0.0 < test_fraction < 1.0, (
+        f"split_train_test: test_fraction is {test_fraction}, must be strictly "
+        f"between 0 and 1. Either fold being empty makes the evaluation "
+        f"meaningless."
+    )
+    assert "MLBAMID" in frame.columns, (
+        f"split_train_test: frame has no MLBAMID column; got "
+        f"{list(frame.columns)[:8]}. The split must key on player identity, "
+        f"not row position."
+    )
+
+    bucket = frame["MLBAMID"].astype(int) % 100
+    is_test = bucket < int(round(test_fraction * 100))
+    train, test = frame[~is_test].copy(), frame[is_test].copy()
+
+    assert len(train) > 0 and len(test) > 0, (
+        f"split_train_test: produced an empty fold ({len(train)} train, "
+        f"{len(test)} test) from {len(frame)} rows. Check that MLBAMID values "
+        f"are not all congruent modulo 100."
+    )
+    print(
+        f"split_train_test: {len(train)} train / {len(test)} test "
+        f"({len(test) / len(frame):.0%} held out)"
+    )
+    return train, test
+```
+
+- [ ] **Step 4: Run tests to verify they pass**
+
+Run: `uv run pytest tests/test_volume_adjust.py -v`
+Expected: PASS.
+
+- [ ] **Step 5: Refit and re-run the gate, properly this time**
+
+Two changes from Task 7's Step 5, and both matter:
+
+1. **Fit on train, score on test.** `fit_volume_correction(train)`, then evaluate every baseline *and* the fitted correction on `test` only.
+2. **Use a completed season.** Assemble the frame for a mid-season split date in 2023, 2024 or 2025, leaving `outcome_end` at its default so `proj_horizon_frac` is exactly 1.0. Confirm that before scoring — if it is not 1.0, the population is wrong and the run is void.
+
+Use the dated projections Task 6 recovered. If too few captures survived validation to support a fit, say so and stop; that is a real answer.
+
+Report: the fitted coefficients, `proj_horizon_frac` (must be 1.0), train and test sizes, and the four-row baseline table **scored on the held-out fold**, with all candidates on identical footing.
+
+**Decision gate.** The correction ships only if it beats the unadjusted projection **out of sample, on a completed season**. Report the margin plainly. Do not adjust coefficients, add features, or reselect the split to improve the outcome — a clean negative here is a genuine result and is worth more than a rescued positive.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add data_prep/volume_adjust.py tests/test_volume_adjust.py
+git commit -m "feat: hold-out split for the volume correction fit
+
+Task 7's in-sample evaluation could not distinguish a real edge from
+overfitting: four parameters fit and scored on one population, R2 0.040.
+Splits by MLBAMID so a player always lands in the same fold, keeping the
+split stable as the archive grows."
+```
+
+---
+
 ## Task 8: Wire the corrector into `build_players`
 
 **Files:**
