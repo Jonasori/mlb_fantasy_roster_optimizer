@@ -149,10 +149,26 @@ def joint_outcome_table(cohort: pd.DataFrame) -> pd.DataFrame:
     frame.loc[frame["tier"] == "never", "_arrive"] = -1
 
     full_keys = ["player_type", "age", "sport_id", "age_rel_bucket", "perf_bucket"]
+    # The INTERMEDIATE backoff keeps performance and drops age-relative-to-level,
+    # which is the opposite of what the prospect literature's emphasis suggests
+    # and is nevertheless right here: age_rel is nearly collinear with
+    # (age, level) by construction — a 19-year-old in A-ball has age_rel of about
+    # -1.8 whether or not anyone measures it — so conditioning on (age, level)
+    # has already absorbed almost all of it. Performance is the signal that is
+    # actually still free.
+    #
+    # Without this rung, dropping straight to (age, level) made five different
+    # 22-year-old Double-A hitters score IDENTICALLY despite spanning the <90 to
+    # 125+ performance range, which is useless for picking among prospects.
+    perf_keys = ["player_type", "age", "sport_id", "perf_bucket"]
     back_keys = ["player_type", "age", "sport_id"]
 
     tables = []
-    for keys, label in ((full_keys, "full"), (back_keys, "age_level")):
+    for keys, label in (
+        (full_keys, "full"),
+        (perf_keys, "age_level_perf"),
+        (back_keys, "age_level"),
+    ):
         counts = (
             frame.groupby(keys + ["tier", "_arrive"], dropna=False)
             .size()
@@ -163,8 +179,9 @@ def joint_outcome_table(cohort: pd.DataFrame) -> pd.DataFrame:
         counts["p"] = counts["n"] / totals
         counts["cell_n"] = totals
         counts["conditioning"] = label
-        if label == "age_level":
+        if "age_rel_bucket" not in keys:
             counts["age_rel_bucket"] = pd.NA
+        if "perf_bucket" not in keys:
             counts["perf_bucket"] = pd.NA
         tables.append(counts.rename(columns={"_arrive": "arrive"}))
 
@@ -211,24 +228,43 @@ def prospect_branches(
         & (joint["age"] == age)
         & (joint["sport_id"] == sport_id)
     ]
-    full = candidates[
-        (candidates["conditioning"] == "full")
-        & (candidates["age_rel_bucket"] == age_rel_bucket)
-        & (candidates["perf_bucket"] == perf_bucket)
-    ]
-    backoff = candidates[candidates["conditioning"] == "age_level"]
-
-    if not full.empty and int(full["cell_n"].iloc[0]) >= min_cell_n:
-        cell, conditioning = full, "full"
-    else:
-        assert not backoff.empty, (
+    # Most specific first; take the first rung with enough support. Each rung
+    # drops one conditioning variable, and the order is deliberate — see
+    # joint_outcome_table on why performance outranks age-relative-to-level.
+    rungs = (
+        (
+            "full",
+            candidates[
+                (candidates["conditioning"] == "full")
+                & (candidates["age_rel_bucket"] == age_rel_bucket)
+                & (candidates["perf_bucket"] == perf_bucket)
+            ],
+        ),
+        (
+            "age_level_perf",
+            candidates[
+                (candidates["conditioning"] == "age_level_perf")
+                & (candidates["perf_bucket"] == perf_bucket)
+            ],
+        ),
+        ("age_level", candidates[candidates["conditioning"] == "age_level"]),
+    )
+    cell, conditioning = None, None
+    for label, candidate in rungs:
+        if not candidate.empty and int(candidate["cell_n"].iloc[0]) >= min_cell_n:
+            cell, conditioning = candidate, label
+            break
+    if cell is None:
+        # Last rung regardless of size, but only if it exists at all.
+        _, coarsest = rungs[-1]
+        assert not coarsest.empty, (
             f"prospect_branches: no cohort support for {player_type} age {age} "
-            f"at sport_id {sport_id}, at either conditioning. The cohort "
+            f"at sport_id {sport_id}, at any conditioning. The cohort "
             f"(2005-2018) never observed that combination, so any prior would "
             f"be invented. Widen the level set or treat this player as "
             f"unscoreable and say so."
         )
-        cell, conditioning = backoff, "age_level"
+        cell, conditioning = coarsest, "age_level"
 
     total = float(cell["p"].sum())
     assert abs(total - 1.0) < 1e-6, (
@@ -237,6 +273,41 @@ def prospect_branches(
         f"never-arrives mass must be included or every prospect is silently "
         f"discounted."
     )
+
+    # SHRINK TOWARD THE LEVEL MARGINAL. A thin cell produces extreme
+    # probabilities, and it does so in the most damaging possible direction:
+    # measured on the live roster, 19-year-olds in Double-A came out with
+    # P(never reaches MLB) = 0.000 off a handful of observations, i.e. the model
+    # claimed a certainty of arrival for the rarest and most exciting prospects
+    # on the board. Those are precisely the players a star-hunting strategy
+    # would then overpay for.
+    #
+    # Standard empirical Bayes: weight the cell by n/(n+M) against the
+    # (player_type, level) marginal. For a well-populated cell the adjustment is
+    # negligible; for a thin one the marginal dominates. No special-casing, no
+    # threshold to tune beyond M.
+    cell_n = float(cell["cell_n"].iloc[0])
+    marginal = joint[
+        (joint["player_type"] == player_type)
+        & (joint["sport_id"] == sport_id)
+        & (joint["conditioning"] == "age_level")
+    ]
+    weight = cell_n / (cell_n + float(min_cell_n))
+    prior = (
+        marginal.groupby(["tier", "arrive"], dropna=False)["n"].sum()
+        if not marginal.empty
+        else None
+    )
+    observed = cell.set_index(["tier", "arrive"])["p"]
+    if prior is not None and float(prior.sum()) > 0:
+        prior_p = prior / float(prior.sum())
+        blended = observed.mul(weight).add(prior_p.mul(1.0 - weight), fill_value=0.0)
+        blended = blended / float(blended.sum())
+        cell = (
+            blended.rename("p")
+            .reset_index()
+            .assign(cell_n=cell_n, conditioning=conditioning)
+        )
 
     branches = []
     for _, row in cell.iterrows():

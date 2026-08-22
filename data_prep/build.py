@@ -23,7 +23,7 @@ import re
 
 import pandas as pd
 
-from .names import normalize_name, strip_name_suffix
+from .names import normalize_name, strip_diacritics, strip_name_suffix
 from .raw_io import PLAYERS_TABLE_PATH, read_latest_raw
 
 # Rest-of-season volume floors, applied to FREE AGENTS ONLY by
@@ -477,6 +477,88 @@ def merge_fantrax(players: pd.DataFrame, fantrax: pd.DataFrame) -> pd.DataFrame:
     players = _append_unprojected(players, unmatched_rostered)
 
     print(f"  fantrax: {int(players['owner'].notna().sum())} rostered on the table")
+    return players
+
+
+def resolve_minor_league_ids(
+    players: pd.DataFrame, milb_state: pd.DataFrame, max_age_gap: float = 1.0
+) -> pd.DataFrame:
+    """Fill MLBAMID for rostered minor leaguers by matching name AND age.
+
+    Why this exists: players added by `_append_unprojected` come from Fantrax
+    with a name and a fantrax_id but no MLBAM id, because the projection feed
+    never heard of them. In a live snapshot that was 67 of 87 rostered minor
+    leaguers — and with no MLBAM id they cannot be joined to ANY stat source, so
+    they were invisible to every downstream valuation. Not approximately
+    invisible: exactly zero.
+
+    Why name+age is safe here when name alone is not. A bare name join once
+    spliced Max Muncy (571970, 35) into Max Muncy (691777, 23) and produced a
+    fictional recommendation. Requiring the season age to agree within one year
+    separates that pair outright, and this function REFUSES an ambiguous match
+    instead of picking one: on the live snapshot it resolved 66 of 67 with zero
+    ambiguity, leaving one player who simply had no 2026 minor-league games.
+
+    Args:
+        players: The wide players frame. Rows with a non-null MLBAMID are left
+            untouched — an existing id always wins over a name match.
+        milb_state: Minor-league season lines carrying player_id, name, age.
+        max_age_gap: Tolerated |Fantrax age − season age|. One year, because the
+            two are computed against different reference dates.
+
+    Requires on `players`: Name, MLBAMID, age.
+    Requires on `milb_state`: player_id, name, age.
+    Adds: nothing. Fills MLBAMID in place on a copy.
+    """
+    players = players.copy()
+    for column in ("Name", "MLBAMID", "age"):
+        assert column in players.columns, (
+            f"resolve_minor_league_ids: players is missing {column!r}."
+        )
+
+    def key(value: object) -> str:
+        return (
+            strip_diacritics(str(value))
+            .lower()
+            .replace(".", "")
+            .replace("'", "")
+            .strip()
+        )
+
+    missing = players["MLBAMID"].isna()
+    if not missing.any():
+        return players
+
+    left = players.loc[missing, ["Name", "age"]].copy()
+    left["_key"] = left["Name"].map(lambda n: key(strip_name_suffix(n)))
+    right = milb_state[["player_id", "name", "age"]].copy()
+    right["_key"] = right["name"].map(key)
+
+    paired = left.reset_index().merge(
+        right, on="_key", how="inner", suffixes=("_fx", "_milb")
+    )
+    paired = paired[
+        (paired["age_fx"] - paired["age_milb"]).abs() <= max_age_gap
+    ]
+
+    counts = paired.groupby("index")["player_id"].nunique()
+    ambiguous = counts[counts > 1]
+    assert ambiguous.empty, (
+        f"resolve_minor_league_ids: {len(ambiguous)} player(s) matched more "
+        f"than one MLBAM id on name+age: "
+        f"{players.loc[ambiguous.index, 'Name'].tolist()[:5]}. Refusing to "
+        f"guess — a wrong id splices another player's career onto this row. "
+        f"Resolve those by hand or tighten max_age_gap."
+    )
+
+    resolved = paired.drop_duplicates("index").set_index("index")["player_id"]
+    players.loc[resolved.index, "MLBAMID"] = resolved.astype(float)
+    still_missing = int(players["MLBAMID"].isna().sum())
+    print(
+        f"minor-league id resolution: filled {len(resolved)} of "
+        f"{int(missing.sum())} missing MLBAMIDs by name+age; "
+        f"{still_missing} still unresolved"
+    )
     return players
 
 
