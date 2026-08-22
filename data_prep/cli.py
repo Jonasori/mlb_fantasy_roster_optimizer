@@ -21,6 +21,8 @@ from .raw_io import snapshot_ages
 SOURCES: list[str] = [
     "projections/steamer",
     "projections/atc",
+    "projections/oopsypeak",
+    "savant",
     "fantrax",
     "standings",
     "identity",

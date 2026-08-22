@@ -333,13 +333,15 @@ def player_value(payoffs: np.ndarray, beta: float) -> float:
         f"the current season and is better expressed as beta just above 0; "
         f"above 1 would value the future more than the present."
     )
-    total = 0.0
-    for season, payoff in enumerate(payoffs[:MAX_SEASONS]):
-        weighted = (beta**season) * payoff
-        if season > 0 and abs(weighted) < EPSILON:
-            break
-        total += weighted
-    return total
+    # Sum every season. Do NOT stop early on a small term: a prospect's
+    # pre-arrival seasons are exactly 0.0, so breaking at the first sub-epsilon
+    # discounted term exits at t=1 and discards his entire career. That bug
+    # zeroed every prospect -- precisely the players this model exists to value.
+    # MAX_SEASONS already bounds the work, and `survival` drives the tail to
+    # zero on its own, which is what makes beta = 1 converge.
+    horizon = min(len(payoffs), MAX_SEASONS)
+    weights = np.power(beta, np.arange(horizon, dtype=float))
+    return float(np.dot(weights, np.asarray(payoffs[:horizon], dtype=float)))
 
 
 def net_value(

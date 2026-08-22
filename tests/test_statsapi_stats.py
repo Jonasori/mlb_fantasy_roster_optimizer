@@ -187,7 +187,10 @@ def test_cli_choices_and_sources_stay_in_sync():
 
     # Commands that fetch nothing, and sources with no command of their own.
     command_only = {"status", "build", "all"}
-    source_without_command = {"standings"}  # fetched by cmd_fantrax alongside rosters
+    source_without_command = {
+        "standings",  # fetched by cmd_fantrax alongside rosters
+        "savant",  # fetched by data_prep.ceiling, which is its only consumer
+    }
 
     parser = _build_parser()
     # Find the command argument by its dest, not by index (more robust)

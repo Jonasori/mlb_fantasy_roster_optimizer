@@ -22,7 +22,20 @@ def strip_diacritics(name: str) -> str:
     """Replace accented characters with ASCII equivalents (Suárez → Suarez).
 
     Preserves casing, suffixes (Jr., III), and -H/-P tags.
+
+    Asserts on a non-string rather than letting unicodedata raise. A NaN
+    reaching here means an upstream source had a null name — StatsAPI omits
+    `fullName` for a handful of real minor leaguers — and the fix belongs at
+    that fetcher, which knows the player id and can label the row traceably.
+    The bare TypeError surfaces eleven frames deep inside pandas' map_infer,
+    which says nothing about where to look.
     """
+    assert isinstance(name, str), (
+        f"strip_diacritics: expected a string, got {type(name).__name__} "
+        f"({name!r}). A null name means the upstream fetcher let one through — "
+        f"fill it there with something traceable (e.g. 'mlbam-<id>'), do not "
+        f"loosen this guard."
+    )
     nfkd = unicodedata.normalize("NFKD", name)
     return "".join(c for c in nfkd if not unicodedata.combining(c))
 

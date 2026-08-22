@@ -53,6 +53,11 @@ cross-source joins, no derived values. `raw_io` holds the storage contract
 | `fantrax_api` | `raw/fantrax`, `raw/standings` |
 | `market` | `raw/market/{ottoneu,adp,espn,hkb}` |
 | `mlb_api` | `raw/identity` |
+| `ceiling` | `raw/projections/oopsypeak`, `raw/savant` |
+
+`ceiling` is the one fetcher that is also an analysis: it ranks dynasty players
+by TAIL upside rather than expected value and does **not** feed the `players`
+table. `uv run python -m data_prep.ceiling --help`.
 
 **The join** — `build.build_players()` is the *only* place identity is
 reconciled across sources. Keys in order of trust: `MLBAMID` (MLB's own),

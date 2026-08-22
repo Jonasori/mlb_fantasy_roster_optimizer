@@ -38,10 +38,22 @@ FANGRAPHS_API_URL = "https://www.fangraphs.com/api/projections"
 # "ratcdc" is ATC's in-season DC variant (the only working updated ATC feed —
 # the full-season "atcdc" endpoint returns HTTP 500). These return remaining
 # (rest-of-season) PA/IP and totals, not full-season projections.
+#
+# "oopsypeak" is NOT a rest-of-season feed: it is OOPSY's projected CAREER PEAK
+# season, normalised to 600 PA / 198 IP (or 70 IP for relievers) and
+# park-neutral. It is the talent input for dynasty ceiling work
+# (`data_prep.ceiling`), not for this season's lineup, which is why
+# ROS_SYSTEMS below — what `uv run fetch projections` refreshes — excludes it.
 PROJECTION_TYPES = {
     "steamer": "steamerr",
     "atc": "ratcdc",
+    "oopsypeak": "oopsypeak",
 }
+
+# The subset `scrape_projections()` refreshes by default. Keeping this separate
+# from PROJECTION_TYPES means registering a non-RoS feed (oopsypeak) cannot
+# silently change what the daily projections fetch pulls.
+ROS_SYSTEMS: list[str] = ["steamer", "atc"]
 
 # ── Columns kept in the snapshot ───────────────────────────────────────────
 
@@ -319,14 +331,15 @@ def scrape_projections(systems: list[str] | None = None) -> dict[str, Path]:
     """Scrape FanGraphs projections and write one raw snapshot per system.
 
     Args:
-        systems: Projection systems to scrape. Defaults to all of
-            PROJECTION_TYPES (steamer + atc).
+        systems: Projection systems to scrape. Defaults to ROS_SYSTEMS
+            (steamer + atc) — NOT every key of PROJECTION_TYPES, which also
+            holds the peak feed used only by the ceiling script.
 
     Returns:
         Dict mapping system name to the parquet path written.
     """
     if systems is None:
-        systems = list(PROJECTION_TYPES)
+        systems = list(ROS_SYSTEMS)
 
     session = get_fangraphs_session()
 
