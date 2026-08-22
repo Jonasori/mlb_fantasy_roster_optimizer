@@ -453,3 +453,118 @@ Each is a real hole. None is hidden.
    `V_gross` of the best available alternative is therefore higher than a
    list-based baseline implies. Conversely, list recall on genuine stars is ~92%,
    so a star-only screen is well served by lists.
+
+---
+
+# 11. What implementation changed (2026-08-22)
+
+The design above is the pre-build spec. Building it changed six things. Each was
+found by running the model on the real roster, and each is now covered by a test.
+
+## 11.1 Λ is deleted
+
+The spec called for a Taylor curvature term `Λ·Var`. Unnecessary. Evaluating `P`
+at each outcome branch (`exact_delta_p`) prices the win curve's convexity to ALL
+orders for one simulation per branch, so there is no coefficient to calibrate.
+
+Measured: the linear score understates `exact_delta_p` by 20-46% for a team at
+`p_win` = 5.3%, and the gap grows with the size of the addition. That is the
+convexity, observed directly rather than approximated.
+
+`Λ` survives only as the interpretive statement about why a trailing team is paid
+for variance.
+
+## 11.2 The baseline must be the slot-VACATED roster
+
+`exact_delta_p` against full-roster totals compares a 19-starter lineup to an
+18-starter one. It reported one shortstop lifting `p_win` from 5% to 36%.
+`vacate_slot` / `swap_delta_p` are the correct entry points.
+
+## 11.3 The whole FIELD must be nominalised, not just my roster
+
+§2.5 as written moved me to the league mean and left the opponents frozen. That
+is not a coherent league: it put a mean team's `p_win` at 2.2% instead of 1/7,
+because the frozen field still contained a 79.5% juggernaut. `nominal_league`
+places every opponent at the mean; future baselines now land at exactly 0.1422.
+
+## 11.4 Rest-of-season lines must be annualized for t >= 1
+
+Season 0 is the season's remainder; later seasons are whole. In August, missing
+this values every future season at a fifth of its production.
+
+## 11.5 The prospect side needed three fixes to work at all
+
+**Ids.** 67 of 87 rostered minor leaguers had a null `MLBAMID`, so they could not
+be joined to any stat source. Prospects were not approximately unscoreable, they
+were exactly zero. `build.resolve_minor_league_ids` matches name AND season age
+within one year, refusing ambiguity; 66 of 67 resolved with none.
+
+**Conditioning backoff.** Falling from the full cell straight to (age, level)
+made five 22-year-old Double-A hitters score identically across the <90 to 125+
+performance range. The intermediate rung keeps PERFORMANCE and drops
+age-relative-to-level — counterintuitive against the literature's emphasis, and
+correct here, because `age_rel` is nearly collinear with (age, level) by
+construction.
+
+**Thin-cell shrinkage.** 19-year-olds in Double-A came out at
+`P(never reaches MLB) = 0.000`. That error runs in the worst possible direction:
+it inflates the rarest, most exciting prospects. Empirical-Bayes shrinkage toward
+the (type, level) marginal at weight `n/(n+M)`.
+
+## 11.6 Role comes from Position, never from innings
+
+A starter's late-August rest-of-season innings (~34) are indistinguishable from a
+reliever's full season. Classifying on volume put Bieber, Kremer and Freeland on
+the reliever curve, which degrades ERA at roughly twice the starter rate — a
+large spurious penalty compounded over eight seasons.
+
+# 12. Confirmed on real data
+
+```
+ the user's team, 2026 banked+ros:  EW 30.3/60,  p_win 0.000,  p_top2 0.017
+```
+
+`p_win = 0` is not a failure. The season is decided, so `G_0` is forced to zero
+and **β cannot change the 2026 term at all** — every ranking is a statement about
+2027+. The model says "you are eliminated, act like a rebuilder," which is right.
+
+Empirical arrival rates, P(reach MLB within 8 years):
+
+```
+        hitter  pitcher
+ AAA     51.7%   45.8%
+ AA      39.7%   43.7%
+ A+      25.8%   29.3%
+ A       20.6%   23.7%
+ Rookie   7.7%    9.1%
+```
+
+Tier archetypes, one full MLB season for a member of each tier:
+
+```
+ hitter star     600 PA  84 R  25 HR  79 RBI  14 SB  .832 OPS
+ hitter regular  600 PA  77 R  20 HR  73 RBI  11 SB  .780 OPS
+ hitter fringe   600 PA  66 R  14 HR  60 RBI   9 SB  .634 OPS
+ pitcher star    180 IP  12 W  184 K  3.16 ERA  1.149 WHIP
+ pitcher fringe  180 IP   9 W  152 K  5.54 ERA  1.566 WHIP
+```
+
+Tier assignment validates: the star tier is Judge, Acuña, Betts, José Ramírez,
+Trout, Yelich, Harper, Goldschmidt, Soto.
+
+# 13. Still open
+
+```
+resolve_k / H_k   REPLACED by optimal stopping in §5, which is NOT YET BUILT.
+                  V_gross exists; net_value exists; the stopping rule that makes
+                  occupancy endogenous does not. Until it does, the doctrine's
+                  magnitude is asserted, not derived.
+lambda_MiLB       The minor-league slot pool is still absent from config.json,
+                  so net_value has no MiLB baseline to difference against.
+beta              No default. Still yours.
+v                 0.35 used throughout; never calibrated.
+27 pitchers       No Position, therefore no aging curve, therefore unscored.
+1 prospect        Aidan Miller: no 2026 minor-league games, so no state.
+5 prospects       Below the playing-time gate (incl. Sebastian Walcott).
+19yo AA perf      Even the (age, level, perf) cell is thin there, so Jesús Made
+                  and Leo De Vries still tie. An honest data limit, not a bug.
