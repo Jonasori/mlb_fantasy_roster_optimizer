@@ -542,3 +542,146 @@ def beta_sweep(
         rank_columns
     ].min(axis=1)
     return frame.sort_values(f"V@{betas[len(betas) // 2]:g}", ascending=False)
+
+
+def branch_payoff_matrix(
+    branches: list[dict],
+    gradients: list[dict[str, float]],
+    reference_totals: list[dict[str, float]],
+    decay_lookup,
+    survival_lookup,
+    n_seasons: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-branch payoffs, kept SEPARATE instead of collapsed to an expectation.
+
+    `branch_payoffs` returns the probability-weighted sum, which is all the
+    linear score needs. Optimal stopping is not linear — you abandon a player
+    once you learn WHICH branch you are in — so it has to see the branches
+    individually. Same inputs, same contract, one axis more.
+
+    Returns:
+        (probs, matrix) with probs of length n_branches and matrix of shape
+        (n_branches, n_seasons). `branch_payoffs` is exactly probs @ matrix.
+    """
+    total_probability = sum(float(b["prob"]) for b in branches)
+    assert abs(total_probability - 1.0) < 1e-6, (
+        f"branch_payoff_matrix: branch probabilities sum to "
+        f"{total_probability:.6f}, not 1.0."
+    )
+    probs = np.array([float(b["prob"]) for b in branches], dtype=float)
+    matrix = np.zeros((len(branches), n_seasons), dtype=float)
+    for index, branch in enumerate(branches):
+        if probs[index] <= 0.0:
+            continue
+        arrive, arrive_age, role = (
+            int(branch["arrive"]), int(branch["arrive_age"]), branch["role"]
+        )
+        for season in range(arrive, n_seasons):
+            projected = project_line(
+                branch["line"], arrive_age, season - arrive, role,
+                decay_lookup, survival_lookup,
+            )
+            matrix[index, season] = score_line(
+                projected, gradients[season], reference_totals[season]
+            )
+    return probs, matrix
+
+
+def stopped_value(
+    probs: np.ndarray,
+    matrix: np.ndarray,
+    beta: float,
+    alternative: np.ndarray | None = None,
+) -> float:
+    """V with the option to ABANDON, priced per branch. Spec section 5.
+
+    WHY THE PLAIN SUM IS WRONG. `player_value` charges you for every season of
+    every branch, including the ones where the player has already revealed
+    himself as a bust and you would obviously have released him. Measured on
+    the live roster, Gage Wood's expected payoffs go NEGATIVE from season 5
+    (-0.011, -0.016, -0.023) as pitcher attrition drags his fringe and never
+    mass below the reference team's rates. That negative tail is what made a
+    36-year-old Sonny Gray dominate him at every beta. But nobody rosters a
+    player at negative value — you drop him. Charging for a cost you would
+    never pay understates every high-variance young player, which is precisely
+    the population the model exists to judge.
+
+    THE RECURSION, applied inside each branch and only then averaged:
+
+        W_T     = max(alt_T, u_T)
+        W_t     = max(alt_t + beta·A_{t+1},  u_t + beta·W_{t+1})
+        V       = Σ_k prob_k · W_0(branch k)
+
+    Taking the max INSIDE the expectation is the whole point. E[max(C, 0)] >=
+    max(E[C], 0), and the gap is the option value — it grows in the dispersion
+    of the posterior AT THE DECISION TIME, not in the dispersion of the final
+    outcome. A player who stays uncertain forever has variance and earns
+    nothing for it here, which is the correct and slightly unintuitive answer.
+
+    This is also where "a prospect who becomes a mid major leaguer is the worst
+    asset" stops being doctrine: the mid branch is the one you can neither cash
+    nor abandon, so it collects a long run of near-zero payoffs that the option
+    cannot rescue.
+
+    Args:
+        probs, matrix: From `branch_payoff_matrix`.
+        beta: Impatience, in (0, 1].
+        alternative: Per-season payoff of what replaces him if you abandon.
+            None means a free slot is worth 0, so abandoning simply stops the
+            bleeding. Pass the best available alternative's payoffs to price
+            occupancy as well.
+
+    Returns:
+        V in probability units. Always >= `player_value` on the same inputs
+        with the same beta, because abandoning is optional.
+    """
+    assert 0.0 < beta <= 1.0, (
+        f"stopped_value: beta must lie in (0, 1], got {beta}."
+    )
+    assert matrix.ndim == 2 and len(probs) == matrix.shape[0], (
+        f"stopped_value: probs has length {len(probs)} but matrix has "
+        f"{matrix.shape[0]} rows. Pass both from branch_payoff_matrix."
+    )
+    n_seasons = matrix.shape[1]
+    alt = (
+        np.zeros(n_seasons, dtype=float)
+        if alternative is None
+        else np.asarray(alternative, dtype=float)[:n_seasons]
+    )
+    # Value of holding the alternative from season t onward, computed once.
+    alt_tail = np.zeros(n_seasons + 1, dtype=float)
+    for season in range(n_seasons - 1, -1, -1):
+        alt_tail[season] = alt[season] + beta * alt_tail[season + 1]
+
+    total = 0.0
+    for index in range(matrix.shape[0]):
+        if probs[index] <= 0.0:
+            continue
+        keep = 0.0
+        for season in range(n_seasons - 1, -1, -1):
+            keep = max(alt_tail[season], matrix[index, season] + beta * keep)
+        total += float(probs[index]) * keep
+    return total
+
+
+def best_available(
+    payoffs_by_name: dict[str, np.ndarray], names: list[str], beta: float
+) -> tuple[str | None, np.ndarray]:
+    """The best alternative among `names`, and its payoff stream.
+
+    `net_value` needs an alternative, and which alternative is legal depends on
+    the slot: a catcher can only be replaced by someone catcher-eligible, and
+    in a single-catcher league that pool is far thinner than the outfield's.
+    Scoring is position-blind by design — a category line does not know what
+    glove its owner wears — so eligibility has to be filtered HERE, by the
+    caller that knows the slot, rather than smuggled into the gradient.
+
+    Returns:
+        (name, payoffs). An empty pool returns (None, zeros), which prices the
+        slot as having no replacement at all — correct, and the reason a scarce
+        position commands a premium without any premium being asserted.
+    """
+    if not names:
+        return None, np.zeros(1, dtype=float)
+    best = max(names, key=lambda name: player_value(payoffs_by_name[name], beta))
+    return best, payoffs_by_name[best]

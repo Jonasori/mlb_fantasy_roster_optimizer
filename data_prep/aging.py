@@ -96,6 +96,16 @@ MAX_AGE: int = 40
 
 N_DECILES: int = 10
 
+# Longest survival horizon tabulated. This is a HARD CONSTRAINT on how many
+# seasons the valuation can score: `survival_factor` asserts rather than
+# extrapolating, so a value horizon of N seasons needs SURVIVAL_MAX_K >= N - 1.
+# It was 8 while the driver scored 8 seasons, which hid the coupling; scoring 16
+# tripped the assert immediately, which is the failure mode working as intended.
+# Raising it costs sample at the long horizons — a k=15 pair needs a base season
+# no later than LAST_COMPLETE_SEASON - 15 — so the `n` column thins out at the
+# tail and should be read before trusting a distant rate.
+SURVIVAL_MAX_K: int = 15
+
 # Output schemas. Named so an empty result still carries the right columns —
 # a bare DataFrame() would fail on column access far from the cause.
 DECAY_COLUMNS: tuple[str, ...] = (
@@ -641,7 +651,7 @@ def build_survival_table(
     frame: pd.DataFrame,
     base_floor: float,
     later_floor: float,
-    max_k: int = 8,
+    max_k: int = SURVIVAL_MAX_K,
     volume_column: str = "VOL",
 ) -> pd.DataFrame:
     """P(volume >= later_floor in t+k | volume >= base_floor at age A).
