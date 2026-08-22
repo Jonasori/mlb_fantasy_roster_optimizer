@@ -116,6 +116,13 @@ MIN_MLB_SV = 5
 # block below it means the fetch came back partial, not that baseball shrank.
 MIN_GRADEABLE_SEASON_N = 50
 
+# 2020 was 60 games. Only 16 hitters cleared MIN_MLB_PA, so it cannot be graded
+# against full-season slot counts: FV is standardized within a season and the
+# starter/star cutoffs are absolute rosterable ranks. Grading it would hand out
+# star seasons to anyone who stayed healthy for two months, and withhold them
+# from everyone else. Excluded outright, matching data_prep.aging.
+UNGRADEABLE_SEASONS: frozenset[int] = frozenset({2020})
+
 NUM_TEAMS = NUM_OPPONENTS + 1
 STARTER_SLOTS: dict[str, int] = {
     "hitter": NUM_TEAMS * sum(HITTING_SLOTS.values()),
@@ -585,6 +592,17 @@ def grade_mlb_seasons(mlb: pd.DataFrame) -> pd.DataFrame:
         f"grade_mlb_seasons: {int(mlb['rosterable'].sum()):,} rosterable "
         f"season-lines of {len(mlb):,}; standardizing FV within each season"
     )
+    ungradeable = mlb["season"].isin(UNGRADEABLE_SEASONS)
+    if ungradeable.any():
+        print(
+            f"grade_mlb_seasons: excluding {sorted(UNGRADEABLE_SEASONS)} "
+            f"({int((ungradeable & mlb['rosterable']).sum()):,} rosterable "
+            f"season-lines). A 60-game season cannot be ranked against "
+            f"full-season slot counts; those player-seasons keep FV = NaN and "
+            f"both grades False."
+        )
+    mlb.loc[ungradeable, "rosterable"] = False
+
     scored = []
     for season, block in tqdm(
         mlb.loc[mlb["rosterable"]].groupby("season"), desc="FV by MLB season"
@@ -598,9 +616,12 @@ def grade_mlb_seasons(mlb: pd.DataFrame) -> pd.DataFrame:
                 f"standardized WITHIN the season, so a block this small cannot "
                 f"be ranked against its own population. Every MLB season "
                 f"{MLB_SEASONS.start}-{MLB_SEASONS.stop - 1} has hundreds of "
-                f"rosterable players, so this means the fetch for {season} "
-                f"returned a partial payload: delete its cache under "
-                f"{SEASON_LINES_DIR} and re-run fetch_mlb_outcomes."
+                f"rosterable players, so one of two things is true. Either "
+                f"{season} was SHORTENED and belongs in UNGRADEABLE_SEASONS "
+                f"(2020 was 60 games and cleared this floor with 16 hitters), "
+                f"or its fetch returned a partial payload — in which case "
+                f"delete its cache under {SEASON_LINES_DIR} and re-run "
+                f"fetch_mlb_outcomes."
             )
         rated = block["player_type"] == "hitter"
         assert block.loc[rated, "OPS"].notna().all(), (

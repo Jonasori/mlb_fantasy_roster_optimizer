@@ -230,7 +230,7 @@ def test_survival_counts_only_observed_outcomes():
             }
         )
     table = build_survival_table(_hitter_seasons(rows), 500.0, 400.0, max_k=1)
-    row = table[(table["age"] == 27) & (table["k"] == 1)].iloc[0]
+    row = table[(table["age_band"] == "27-29") & (table["k"] == 1)].iloc[0]
     assert row["n"] == 20, f"Denominator should be all 20 base seasons, got {row['n']}"
     assert row["rate"] == pytest.approx(0.5), (
         f"Half survived, so the rate must be 0.5, got {row['rate']}"
@@ -362,7 +362,7 @@ def test_survival_factor_refuses_to_guess():
     table = pd.DataFrame(
         {
             "role": ["hitter"],
-            "age": [27],
+            "age_band": ["27-29"],
             "k": [1],
             "n": [500],
             "rate": [0.8],
@@ -372,5 +372,12 @@ def test_survival_factor_refuses_to_guess():
     )
     assert survival_factor(table, 27, 0, "hitter") == 1.0
     assert survival_factor(table, 27, 1, "hitter") == pytest.approx(0.8)
+    # Any age inside the band resolves to the same cell -- that is the point of
+    # banding, and it is explicit rather than a silent neighbour substitution.
+    assert survival_factor(table, 29, 1, "hitter") == pytest.approx(0.8)
+    # A band with no cell must refuse rather than borrow the neighbouring one.
     with pytest.raises(AssertionError, match="do not substitute"):
-        survival_factor(table, 28, 1, "hitter")
+        survival_factor(table, 31, 1, "hitter")
+    # Outside the banded range at all.
+    with pytest.raises(AssertionError, match="outside the banded range"):
+        survival_factor(table, 17, 1, "hitter")

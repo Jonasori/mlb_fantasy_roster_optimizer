@@ -64,6 +64,21 @@ LINE_STATS: tuple[str, ...] = (
     "PA", "IP", "R", "HR", "RBI", "SB", "OPS", "W", "SV", "K", "ERA", "WHIP",
 )
 
+# SV gets NO rate curve, for anyone. Two reasons, and they point the same way:
+#
+#   * It is a ROLE outcome, not a skill. The measured reliever curve has SV per
+#     65 G peaking at 29-30, but that is selection — only relievers who keep the
+#     job keep closing. Applying it to one pitcher predicts a 25-year-old closer
+#     GAINING saves through 30, which is a survivorship artifact dressed up as
+#     development.
+#   * The starter cells are sparse anyway (ages 20, 37 and 40 are empty, because
+#     starters seldom record saves), so a lookup would crash on a starter who
+#     picked one up.
+#
+# So SV carries volume and survival only: he keeps the role as long as he keeps
+# the innings. That is an assumption, and it is stated wherever SV surfaces.
+ROLE_DRIVEN: tuple[str, ...] = ("SV",)
+
 # Categories whose value scales with playing time, so survival multiplies them.
 # Ratio categories are deliberately absent: their contribution is already scaled
 # by the volume term (PA·(OPS − team_OPS)/team_PA), so multiplying the rate by
@@ -119,7 +134,7 @@ def project_line(
         # is no hitter curve for W, and asking for one is a crash.
         if value == 0.0:
             out[key] = 0.0
-        elif key in ("PA", "IP"):
+        elif key in ("PA", "IP") or key in ROLE_DRIVEN:
             out[key] = value * volume_factor * survival
         elif key in COUNTING_CATEGORIES:
             rate_factor = decay_lookup(from_age, years, key, role)
@@ -129,6 +144,40 @@ def project_line(
         else:
             out[key] = value
     return out
+
+
+def player_role(position: str | float | None, player_type: str) -> str:
+    """Which aging curve a player takes: "hitter", "starter" or "reliever".
+
+    Read from the Fantrax `Position` string, NEVER inferred from innings. A
+    starter's REST-OF-SEASON innings in late August are around 30-38, which is
+    indistinguishable from a reliever's full-season workload — classifying on
+    volume put Shane Bieber, Dean Kremer and Kyle Freeland on the reliever
+    curve, which degrades ERA at 0.2-0.3 per year against a starter's 0.12-0.21.
+    Compounded over eight seasons that is a large, entirely spurious penalty.
+
+    A pitcher eligible at SP takes the starter curve even if also RP-eligible:
+    the innings dominate his value, and it is the innings the curve prices.
+
+    Raises on a missing position rather than guessing. `Position` is null for a
+    handful of free agents, and picking a curve for them would silently apply
+    one aging model to a player who belongs on another. The caller should skip
+    those and report the count — the same treatment as a player below the
+    fitted age band.
+    """
+    if player_type == "hitter":
+        return "hitter"
+    assert player_type == "pitcher", (
+        f"player_role: player_type must be 'hitter' or 'pitcher', got "
+        f"{player_type!r}."
+    )
+    assert isinstance(position, str) and position, (
+        f"player_role: pitcher has no Position ({position!r}), so the aging "
+        f"curve is undetermined. Starter and reliever ERA curves differ by "
+        f"roughly 2x per year, so guessing is not harmless. Skip the player and "
+        f"report it, or supply a position."
+    )
+    return "starter" if "SP" in position.upper() else "reliever"
 
 
 def annualize(line: dict[str, float], season_fraction_remaining: float) -> dict:

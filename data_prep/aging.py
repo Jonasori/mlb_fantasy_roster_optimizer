@@ -102,8 +102,30 @@ DECAY_COLUMNS: tuple[str, ...] = (
     "role", "category", "age", "decile", "variant", "n", "factor", "league_factor",
 )
 SURVIVAL_COLUMNS: tuple[str, ...] = (
-    "role", "age", "k", "n", "rate", "base_floor", "later_floor",
+    "role", "age_band", "k", "n", "rate", "base_floor", "later_floor",
 )
+
+# Survival is tabulated by age BAND, not per single age. Per-age cells at the
+# extremes are noise the data cannot support: a 20-year-old with 50+ relief
+# appearances is close to nonexistent historically, and age-40 cells run to
+# n=20. Banding is the resolution the sample actually justifies, and it means a
+# lookup never has to substitute a neighbouring age behind the caller's back.
+AGE_BANDS: tuple[tuple[int, int], ...] = (
+    (20, 23), (24, 26), (27, 29), (30, 32), (33, 35), (36, 40),
+)
+
+
+def age_band(age: int) -> str:
+    """Label the band containing `age`. Asserts outside the fitted range."""
+    for low, high in AGE_BANDS:
+        if low <= age <= high:
+            return f"{low}-{high}"
+    raise AssertionError(
+        f"age_band: age {age} is outside the banded range "
+        f"{AGE_BANDS[0][0]}-{AGE_BANDS[-1][1]}. Below it, no MLB data exists "
+        f"and a prospect must be aged from his projected ARRIVAL age; above it, "
+        f"treat the player as finished."
+    )
 
 # Categories, and how each is built from raw counting columns. Computing from
 # counts avoids StatsAPI's string rate fields and their '.---' / '-.--'
@@ -162,7 +184,11 @@ def _fetch_one_season(group: str, season: int) -> pd.DataFrame:
         for split in splits:
             row = dict(split["stat"])
             row["playerId"] = int(split["player"]["id"])
-            row["name"] = split["player"]["fullName"]
+            # fullName is genuinely absent for a handful of real players; the
+            # id is the join key, so label the row traceably rather than crash.
+            row["name"] = split["player"].get(
+                "fullName", f"mlbam-{int(split['player']['id'])}"
+            )
             row["season"] = season
             rows.append(row)
         offset += _PAGE
@@ -639,10 +665,18 @@ def build_survival_table(
         f"PA/IP or 'games' for reliever appearances."
     )
     usable = frame[~frame["season"].isin(EXCLUDED_SEASONS)].copy()
+    # An outcome cannot be observed in a season the data does not cover, so the
+    # censoring bound is the EARLIER of the last complete season and the frame's
+    # own last season. Using the calendar alone silently turns every absent
+    # season into a failure, which deflates survival for any frame narrower than
+    # the full history — and reports it with no warning.
+    observable_max = min(
+        LAST_COMPLETE_SEASON, int(usable["season"].max())
+    )
     volume = usable[volume_column]
     base = usable[
         (volume >= base_floor)
-        & (usable["season"] <= LAST_COMPLETE_SEASON)
+        & (usable["season"] < observable_max)
         & usable["age"].between(MIN_AGE, MAX_AGE)
     ][["playerId", "season", "age", "role"]].copy()
 
@@ -653,7 +687,7 @@ def build_survival_table(
 
     rows = []
     for k in range(1, max_k + 1):
-        candidates = base[base["season"] + k <= LAST_COMPLETE_SEASON].copy()
+        candidates = base[base["season"] + k <= observable_max].copy()
         if (base["season"] + k).isin(EXCLUDED_SEASONS).any():
             candidates = candidates[
                 ~(candidates["season"] + k).isin(EXCLUDED_SEASONS)
@@ -663,11 +697,12 @@ def build_survival_table(
         candidates["season"] = candidates["season"] + k
         merged = candidates.merge(reached, on=["playerId", "season"], how="left")
         merged["_hit"] = merged["_hit"].fillna(False)
-        for (role, age), cell in merged.groupby(["role", "age"], sort=True):
+        merged["_band"] = merged["age"].astype(int).map(age_band)
+        for (role, band), cell in merged.groupby(["role", "_band"], sort=True):
             rows.append(
                 {
                     "role": role,
-                    "age": int(age),
+                    "age_band": band,
                     "k": k,
                     "n": len(cell),
                     "rate": float(cell["_hit"].mean()),
@@ -685,9 +720,9 @@ def build_survival_table(
         return table
     print(
         f"survival table: {len(table)} cells, k=1..{table['k'].max()}, "
-        f"ages {table['age'].min()}-{table['age'].max()}"
+        f"bands {sorted(table['age_band'].unique())}"
     )
-    return table.sort_values(["role", "age", "k"]).reset_index(drop=True)
+    return table.sort_values(["role", "age_band", "k"]).reset_index(drop=True)
 
 
 # ==========================================================================
@@ -764,16 +799,18 @@ def survival_factor(
     assert horizon >= 0, f"survival_factor: horizon must be >= 0, got {horizon}."
     if horizon == 0:
         return 1.0
+    band = age_band(age)
     subset = survival[
         (survival["role"] == role)
-        & (survival["age"] == age)
+        & (survival["age_band"] == band)
         & (survival["k"] == horizon)
     ]
     assert len(subset) == 1, (
         f"survival_factor: expected exactly one cell for role={role!r} "
-        f"age={age} k={horizon}, found {len(subset)}. An empty cell means the "
-        f"cohort was censored or below the age band; do not substitute a "
-        f"neighbouring age silently."
+        f"band={band} k={horizon}, found {len(subset)}. An empty cell means the "
+        f"whole band was censored at this horizon; do not substitute a "
+        f"neighbouring band silently. Check that build_survival_table ran with "
+        f"max_k >= {horizon}."
     )
     return float(subset["rate"].iloc[0])
 
