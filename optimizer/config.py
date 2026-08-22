@@ -34,6 +34,20 @@ NEGATIVE_CATEGORIES: set[str] = set(LEAGUE["negative_categories"])  # {'ERA', 'W
 # League structure
 NUM_OPPONENTS: int = len(LEAGUE["fantrax_team_ids"]) - 1  # 6
 ROSTER_SIZE: int = LEAGUE["roster_size"]  # 28
+# A SEPARATE pool from the 28-man roster. Minor leaguers cannot be started, so a
+# MiLB slot generates zero current-season production -- its entire value is an
+# option on future seasons. That is why opportunity cost has to be differenced at
+# the level of V and not as a per-season rent: the two pools' costs are not the
+# same kind of quantity. `optimizer/rosters.py` excludes these players from
+# get_main_roster, which is correct for lineup solving and is exactly why the
+# valuation has to model the pool itself.
+assert "minor_league_slots" in LEAGUE, (
+    "config.json is missing league.minor_league_slots. It is a SEPARATE pool "
+    "from roster_size and the dynasty valuation needs it to price the "
+    "opportunity cost of stashing a prospect. Add it (e.g. 10) next to "
+    "roster_size."
+)
+MINOR_LEAGUE_SLOTS: int = LEAGUE["minor_league_slots"]  # 10
 MIN_HITTERS: int = LEAGUE["min_hitters"]  # 12
 MAX_HITTERS: int = LEAGUE["max_hitters"]  # 18
 MIN_PITCHERS: int = LEAGUE["min_pitchers"]  # 10

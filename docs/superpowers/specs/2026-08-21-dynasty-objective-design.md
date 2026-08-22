@@ -568,3 +568,67 @@ v                 0.35 used throughout; never calibrated.
 5 prospects       Below the playing-time gate (incl. Sebastian Walcott).
 19yo AA perf      Even the (age, level, perf) cell is thin there, so Jesús Made
                   and Leo De Vries still tie. An honest data limit, not a bug.
+
+# 14. Stress-test findings (2026-08-22)
+
+Scored 1,162 of 1,190 players (90 prospect-population, 1,072 MLB-population);
+28 refused, with reasons, rather than guessed.
+
+## 14.1 The framework behaves coherently
+
+Per-season values order correctly by quality — `u_1` for Harper 0.686 > Turner
+0.584 > Bolte 0.425. Cumulative values order by longevity. Ranks move the right
+way with β: Trea Turner falls 7 places going compete-now to rebuild; Taitn Gray
+(18) and Devin Taylor (22) rise 15. Break-evens are unique and readable
+("hold Sonny Gray over Devin Taylor only if β < 0.382").
+
+The β sweep does what it should: the median age of the top-10 available free
+agent falls monotonically 27.0 → 23.0 as β goes 0.10 → 1.00.
+
+## 14.2 The one number nobody has chosen dominates everything
+
+A 23-year-old gets 2.42 effective seasons at β=0.85; a 33-year-old gets 0.94.
+That 2.6x ratio is a correct consequence of the measured survival tables — it is
+not a bug — but it means **β is not a tuning detail, it is the answer**. Nothing
+in the model should be quoted without stating β.
+
+## 14.3 Available-upgrade counts, and the residual that β does NOT explain
+
+```
+ beta   MLB slots upgradeable   MiLB slots upgradeable
+ 0.10        14/28                    9/10
+ 0.40        24/28                    9/10
+ 0.85        27/28                    9/10
+ 1.00        27/28                    8/10
+```
+
+The MLB column is β-driven and behaves sensibly. The MiLB column is FLAT at 9/10
+across every β, so time preference does not explain it. Two candidate causes,
+undistinguished:
+
+1. It may be TRUE. `owner.isna()` in a 7-team Fantrax league means "not on any
+   of 7 rosters", and 7 x 10 = 70 rostered prospects against the entire minor
+   leagues. The available pool really is nearly all of professional baseball, so
+   a mediocre held prospect really is replaceable. The top available names are
+   genuine (Carson Williams, Thomas Saggese, Tyler Locklear), not org filler.
+2. It may be an artifact of treating every unrostered minor leaguer as
+   practically claimable, which overstates λ_MiLB.
+
+Resolve before acting on any drop recommendation.
+
+## 14.4 Known bias: no development curve
+
+`decay` peaks at 24-25 and declines after, so a 23-year-old is modelled as
+holding his current rate and then decaying. Real 23-year-olds improve. The curve
+is measured on players who were ALREADY major-league regulars at 22-23, which is
+a heavily selected group, so it understates growth for the population we care
+about. Direction of the net error is not established: it understates young
+players' peaks while overstating nothing about their longevity, which is
+separately measured.
+
+## 14.5 Pitching prospects score near zero, and that is the intended behaviour
+
+The user's minor-league pitchers (Wood 0.080, Anderson 0.046, Witherspoon 0.033,
+Martinez 0.021) sit far below the hitters (Taylor 0.605, Gray 0.394, Holliday
+0.333). Consistent with the measured 0% star rate for 55 and 60 FV pitchers and
+with starter ERA degrading monotonically from age 23. Not a bug to fix.
