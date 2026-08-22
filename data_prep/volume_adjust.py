@@ -109,21 +109,62 @@ def fit_volume_correction(
 ) -> dict[str, float]:
     """Fit the volume multiplier by OLS on log(actual / projected) volume.
 
-    Requires columns on `frame`: proj_PA/proj_IP, actual_PA/actual_IP,
-    proj_OPS, evid_OPS, age, proj_horizon_frac.
+    The caller assembles the frame. There is no helper for this, deliberately —
+    what a backtest frame should contain depends on the question being asked,
+    and a premature one-size-fits-all assembler would be guessed rather than
+    derived. Build it per study; the contract below is all this function needs.
 
-    proj_horizon_frac (from assemble_backtest_frame) is the fraction of the
-    projection's full split-to-season-end horizon that the outcome window
-    actually covers. A rest-of-season projection is for the FULL horizon, so
-    when the observed window is shorter, proj_PA must be scaled down to
-    proj_PA * proj_horizon_frac before it's a fair comparison to actual_PA —
-    otherwise the fit reads the uncovered remainder of the season as players
-    losing playing time, when it is only the calendar. Dividing the raw
-    ratio by proj_horizon_frac is the same correction:
+    Requires columns on `frame`, one row per player per backtest window:
+        proj_PA or proj_IP   projected volume as of the SPLIT date, for the
+                             projection's own full horizon (split -> season end)
+        actual_PA/actual_IP  volume actually accrued during the OUTCOME window
+        proj_OPS             projected OPS as of the split date
+        evid_OPS             OPS observed BEFORE the split (the in-season
+                             evidence the correction is allowed to condition on)
+        age                  season age at the split; rows with NaN are dropped
+        proj_horizon_frac    (outcome window length) / (projection horizon
+                             length), in (0, 1]
+
+    Assemble it from two `raw_io` reads per window: a projections snapshot
+    dated at the split (`read_latest_raw("projections/<system>",
+    on_or_before=split)`) for the proj_* columns, and two
+    `statsapi_stats.fetch_stats_range` calls for evid_* (season start -> split)
+    and actual_* (split -> outcome end). `ytd` is season-partitioned, so pass
+    `season=` when reading it back.
+
+    proj_horizon_frac exists because a rest-of-season projection covers the
+    FULL remaining horizon. When the observed outcome window is shorter,
+    proj_PA must be scaled to proj_PA * proj_horizon_frac before it is a fair
+    comparison to actual_PA — otherwise the fit reads the uncovered remainder
+    of the season as players losing playing time, when it is only the calendar.
+    Dividing the raw ratio by proj_horizon_frac is the same correction:
     actual / (proj * frac) == (actual / proj) / frac.
+
+    A whole-season window is frac == 1.0; pass that rather than omitting it.
 
     Returns the coefficient dict `adjust_projection_volume` consumes.
     """
+    required = (
+        f"proj_{'PA' if group == 'hitting' else 'IP'}",
+        f"actual_{'PA' if group == 'hitting' else 'IP'}",
+        "proj_OPS",
+        "evid_OPS",
+        "age",
+        "proj_horizon_frac",
+    )
+    missing = [c for c in required if c not in frame.columns]
+    assert not missing, (
+        f"fit_volume_correction: frame is missing {missing}. See this "
+        f"function's docstring for the full column contract and how to "
+        f"assemble it from raw_io snapshots; there is no assembler helper."
+    )
+    assert frame["proj_horizon_frac"].between(0.0, 1.0).all(), (
+        f"fit_volume_correction: proj_horizon_frac must lie in (0, 1]; got "
+        f"range [{frame['proj_horizon_frac'].min()}, "
+        f"{frame['proj_horizon_frac'].max()}]. It is the ratio of the outcome "
+        f"window to the projection horizon — a value above 1 means the windows "
+        f"were swapped, which inverts the volume correction."
+    )
     vol = "PA" if group == "hitting" else "IP"
     usable = frame[
         (frame[f"proj_{vol}"] > 0)

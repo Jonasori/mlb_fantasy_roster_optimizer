@@ -163,12 +163,16 @@ def fetch_ytd_snapshot(
 ) -> pd.DataFrame:
     """Fetch season-to-date stats and write them to the raw layer.
 
-    Returns the frame; the snapshot lands at data/raw/ytd/<through>.parquet.
+    Returns the frame; the snapshot lands at
+    data/raw/ytd/<season>/<through>.parquet. `ytd` is season-partitioned
+    (raw_io.SEASONAL_SOURCES) because this function accepts any season, and a
+    past-season backfill read back without a season would be indistinguishable
+    from the current year-to-date.
     """
     if through is None:
         through = datetime.date.today()
     print(f"=== Fetching YTD stats for {season} through {through} ===")
     frame = fetch_stats_range(season, datetime.date(season, 1, 1), through)
-    path = write_raw(frame, "ytd", through)
+    path = write_raw(frame, "ytd", through, season=season)
     print(f"=== ytd snapshot written: {path} ({len(frame)} rows) ===")
     return frame
