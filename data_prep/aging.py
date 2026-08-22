@@ -783,6 +783,70 @@ def survival_factor(
 # ==========================================================================
 
 
+def load_priors(variant: str = "inclusive", decile: int = -1) -> tuple:
+    """Load the prior tables and return the two lookups `optimizer.value` calls.
+
+    Args:
+        variant: "inclusive" (default) or "strict". Inclusive retains players
+            whose next season collapsed and is the defensible choice — the
+            strict variant reports hitter playing time as not declining at all
+            (cumulative 22->33 of 1.04 against 0.64), because it conditions on
+            having kept the job.
+        decile: -1 for the unstratified curve. A talent decile requires the
+            decile tables, which cost three consecutive seasons per observation
+            and therefore exclude rookies.
+
+    Returns:
+        (decay_lookup, survival_lookup), both closures with the signatures
+        `optimizer.value.project_line` expects:
+            decay_lookup(age, years, category, role) -> float
+            survival_lookup(age, years, role) -> float
+    """
+    assert variant in ("strict", "inclusive"), (
+        f"load_priors: variant must be 'strict' or 'inclusive', got {variant!r}."
+    )
+    suffix = "_decile" if decile >= 0 else ""
+    decay = pd.concat(
+        [
+            pd.read_parquet(PRIORS_DIR / f"decay_hitters{suffix}.parquet"),
+            pd.read_parquet(PRIORS_DIR / f"decay_pitchers{suffix}.parquet"),
+        ],
+        ignore_index=True,
+    )
+    survival = pd.concat(
+        [
+            pd.read_parquet(PRIORS_DIR / "survival_hitters.parquet"),
+            pd.read_parquet(PRIORS_DIR / "survival_starters.parquet"),
+            pd.read_parquet(PRIORS_DIR / "survival_relievers.parquet"),
+        ],
+        ignore_index=True,
+    )
+    assert not decay.empty and not survival.empty, (
+        f"load_priors: empty prior tables in {PRIORS_DIR}. Run "
+        f"`uv run python -m data_prep.aging` to build them."
+    )
+
+    def decay_lookup(age: int, years: int, category: str, role: str) -> float:
+        return cumulative_decay(
+            decay, age, years, category, role, decile=decile, variant=variant
+        )
+
+    def survival_lookup(age: int, years: int, role: str) -> float:
+        # Past the fitted band the player is treated as finished, matching
+        # cumulative_decay's boundary. Returning 0.0 here rather than asserting
+        # keeps the two boundaries consistent, so a caller cannot get a live
+        # survival probability against a zeroed decay factor.
+        if age + years > MAX_AGE or age < MIN_AGE:
+            return 0.0
+        return survival_factor(survival, age, years, role)
+
+    print(
+        f"priors loaded: {len(decay)} decay cells, {len(survival)} survival "
+        f"cells (variant={variant}, decile={decile})"
+    )
+    return decay_lookup, survival_lookup
+
+
 def build_all(refresh: bool = False) -> dict[str, pd.DataFrame]:
     """Build every prior table and write them to data/priors/.
 
